@@ -181,6 +181,7 @@ stateDiagram-v2
 - **分支保护**：只有以 `branchPrefix`（默认 `ai/`）开头的分支才会被强推，人工分支永远不会被覆盖。
 - **执行边界**：所有代码改动都发生在独立克隆的工作区，不会碰你的本地开发目录；沙箱与审批策略由 Codex 配置控制（默认 `workspace-write` + `never`）。
 - **不自动合并**：评审通过只打 `ai/approved`，合并动作始终留给人工。
+- **可重置**：全部状态都在 `~/.autogit` 一个目录里，清除与迁移步骤见 [docs/RESET.md](docs/RESET.md)。
 
 环境变量见 [.env.example](.env.example)。常用项：
 
@@ -221,4 +222,4 @@ pnpm simulate     # 端到端模拟：真实 git + 假 Codex + 假 Git 平台
 
 ---
 
-架构与实现细节见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)，平台差异见 [docs/PROVIDERS.md](docs/PROVIDERS.md)。
+架构与实现细节见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)，平台差异见 [docs/PROVIDERS.md](docs/PROVIDERS.md)，清除配置与数据见 [docs/RESET.md](docs/RESET.md)。

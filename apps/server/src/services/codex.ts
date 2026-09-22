@@ -13,6 +13,7 @@ import type {
   CodexCapabilities,
   CodexConfigPayload,
   CodexInstallState,
+  CodexModelProbe,
   CodexStatus,
   LogStream,
 } from '@autogit/shared';
@@ -26,6 +27,9 @@ import type { EventBus } from './events.js';
 import type { SettingsService } from './settings.js';
 
 const CAPABILITY_TTL_MS = 5 * 60_000;
+/** A probe costs one tiny model call, so a fresh result is reused for a while. */
+const PROBE_TTL_MS = 5 * 60_000;
+const PROBE_TIMEOUT_MS = 3 * 60_000;
 const LOG_RING_SIZE = 400;
 const CONFIG_BACKUP_KEEP = 10;
 
@@ -33,6 +37,14 @@ interface CapabilityCache {
   at: number;
   capabilities: CodexCapabilities;
 }
+
+interface ProbeCache {
+  at: number;
+  probe: CodexModelProbe;
+}
+
+/** Trivial prompt: the probe only answers "can this model respond at all". */
+const PROBE_PROMPT = '这是 AutoGit 的模型连通性探测。请只回复 pong，不要调用任何工具。';
 
 export const DEFAULT_CONFIG_TEMPLATE = `# Codex CLI 配置（由 AutoGit 编辑，保存前会自动备份原文件）
 
@@ -48,6 +60,7 @@ network_access = true
 export class CodexService {
   private readonly log = childLogger('codex');
   private capabilityCache: CapabilityCache | null = null;
+  private probeCache: ProbeCache | null = null;
   private installState: CodexInstallState = {
     running: false,
     startedAt: null,
@@ -66,10 +79,6 @@ export class CodexService {
 
   get configPath(): string {
     return path.join(this.config.codexHome, 'config.toml');
-  }
-
-  get authPath(): string {
-    return path.join(this.config.codexHome, 'auth.json');
   }
 
   private get backupDir(): string {
@@ -143,27 +152,116 @@ export class CodexService {
     return capabilities;
   }
 
-  async loginStatus(): Promise<{ loggedIn: boolean | null; message: string | null }> {
+  /**
+   * Live check that the model actually answers: one minimal `codex exec` call
+   * with a trivial prompt, run in a read-only sandbox against a scratch
+   * directory. AutoGit never inspects or manages credentials — the CLI owns
+   * them, this probe only looks at whether the model replied.
+   */
+  async modelProbe(force = false): Promise<CodexModelProbe> {
+    if (!force && this.probeCache && Date.now() - this.probeCache.at < PROBE_TTL_MS) {
+      return this.probeCache.probe;
+    }
+
     const { path: binary } = this.resolveBinary();
-    if (!binary) return { loggedIn: null, message: 'Codex CLI 未安装' };
+    const checkedAt = nowIso();
+    if (!binary) {
+      return this.cacheProbe({
+        ready: null,
+        message: '未检测到 codex 命令，请安装或手动指定可执行文件路径。',
+        durationMs: null,
+        checkedAt,
+      });
+    }
 
-    const result = await runCommand(binary, ['login', 'status'], {
+    const capabilities = await this.capabilities();
+    if (capabilities && !capabilities.execCommand) {
+      return this.cacheProbe({
+        ready: false,
+        message: 'codex exec 不可用，当前版本可能过旧。',
+        durationMs: null,
+        checkedAt,
+      });
+    }
+
+    const settings = this.settings.get();
+    // `dataDir` is guaranteed to exist once the runtime is up; falling back to
+    // the install directory keeps the probe usable in bare setups.
+    const cwd = existsSync(this.config.dataDir) ? this.config.dataDir : this.config.repoRoot;
+    const args = ['exec'];
+    if (settings.codexModel && capabilities?.modelFlag) args.push('--model', settings.codexModel);
+    // Read-only: the probe must never be able to touch the user's files.
+    if (capabilities?.sandboxFlag) args.push('--sandbox', 'read-only');
+    if (capabilities?.cdFlag) args.push('--cd', cwd);
+    if (capabilities?.skipGitRepoCheck) args.push('--skip-git-repo-check');
+    if (capabilities?.ephemeral) args.push('--ephemeral');
+    if (capabilities?.configOverride) args.push('-c', 'approval_policy="never"');
+    args.push('-');
+
+    const result = await runCommand(binary, args, {
+      cwd,
       env: this.env(),
-      timeoutMs: 25_000,
+      input: PROBE_PROMPT,
+      timeoutMs: PROBE_TIMEOUT_MS,
     });
-    const output = `${result.stdout}${result.stderr}`.trim();
+    const stdout = result.stdout.trim();
+    const stderr = result.stderr.trim();
 
-    if (result.code === 0) return { loggedIn: true, message: output || '已登录' };
-    if (/not logged in|未登录/i.test(output)) return { loggedIn: false, message: output };
-    if (result.spawnError) return { loggedIn: null, message: result.spawnError };
-    return { loggedIn: null, message: output || '无法确定登录状态' };
+    if (result.spawnError) {
+      return this.cacheProbe({
+        ready: false,
+        message: excerpt(result.spawnError),
+        durationMs: result.durationMs,
+        checkedAt,
+      });
+    }
+    if (result.timedOut) {
+      return this.cacheProbe({
+        ready: false,
+        message: `探测超时（${Math.round(PROBE_TIMEOUT_MS / 1000)}s），模型没有在限定时间内响应。`,
+        durationMs: result.durationMs,
+        checkedAt,
+      });
+    }
+    if (result.code !== 0) {
+      return this.cacheProbe({
+        ready: false,
+        message: `codex exec 失败（退出码 ${result.code ?? 'null'}）：${
+          excerpt(stderr || stdout) || '没有输出'
+        }`,
+        durationMs: result.durationMs,
+        checkedAt,
+      });
+    }
+    if (stdout.length === 0) {
+      return this.cacheProbe({
+        ready: false,
+        message: 'codex exec 正常退出，但模型没有返回任何内容。',
+        durationMs: result.durationMs,
+        checkedAt,
+      });
+    }
+
+    const answer = modelAnswer(stdout);
+    this.log.info({ durationMs: result.durationMs }, 'codex model probe succeeded');
+    return this.cacheProbe({
+      ready: true,
+      message: answer ? excerpt(answer, 200) : null,
+      durationMs: result.durationMs,
+      checkedAt,
+    });
+  }
+
+  private cacheProbe(probe: CodexModelProbe): CodexModelProbe {
+    this.probeCache = { at: Date.now(), probe };
+    return probe;
   }
 
   async status(options: { force?: boolean } = {}): Promise<CodexStatus> {
     const { path: binary, source } = this.resolveBinary();
     const configExists = existsSync(this.configPath);
-    const authExists = existsSync(this.authPath);
     const checkedAt = nowIso();
+    const modelProbe = this.probeCache?.probe ?? null;
 
     if (!binary) {
       return {
@@ -173,21 +271,16 @@ export class CodexService {
         source: 'missing',
         configPath: this.configPath,
         configExists,
-        authPath: this.authPath,
-        authExists,
-        authMode: this.readAuthMode(),
-        loggedIn: null,
-        loginMessage: '未检测到 codex 命令，请安装或手动指定可执行文件路径。',
         capabilities: null,
+        modelProbe,
         checkedAt,
         warning: null,
       };
     }
 
-    const [version, capabilities, login] = await Promise.all([
+    const [version, capabilities] = await Promise.all([
       this.version(),
       this.capabilities(options.force ?? false),
-      this.loginStatus(),
     ]);
 
     let warning: string | null = null;
@@ -203,29 +296,11 @@ export class CodexService {
       source,
       configPath: this.configPath,
       configExists,
-      authPath: this.authPath,
-      authExists,
-      authMode: this.readAuthMode(),
-      loggedIn: login.loggedIn,
-      loginMessage: login.message,
       capabilities,
+      modelProbe,
       checkedAt,
       warning,
     };
-  }
-
-  private readAuthMode(): string | null {
-    if (!existsSync(this.authPath)) return null;
-    try {
-      const parsed = JSON.parse(readFileSync(this.authPath, 'utf8')) as Record<string, unknown>;
-      const mode = parsed.auth_mode ?? parsed.authMode ?? null;
-      if (typeof mode === 'string') return mode;
-      const key = parsed.OPENAI_API_KEY ?? parsed.openai_api_key;
-      if (typeof key === 'string' && key.length > 0) return 'api-key';
-      return Object.keys(parsed).length > 0 ? 'present' : null;
-    } catch {
-      return null;
-    }
   }
 
   readConfig(): CodexConfigPayload {
@@ -368,6 +443,7 @@ export class CodexService {
 
       clearExecutableCache();
       this.capabilityCache = null;
+      this.probeCache = null;
       this.installPromise = null;
       this.publishInstallState();
     })();
@@ -390,6 +466,32 @@ export class CodexService {
 
   invalidate(): void {
     this.capabilityCache = null;
+    this.probeCache = null;
     clearExecutableCache();
   }
+}
+
+/**
+ * `codex exec` prints a short footer (separators, a "tokens used" block and
+ * counters) after the agent message; skip that noise when picking the answer.
+ */
+function modelAnswer(stdout: string): string {
+  const lines = stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(
+      (line) =>
+        line.length > 0 &&
+        !/^-+$/.test(line) &&
+        !/^tokens used$/i.test(line) &&
+        !/^[\d.,\s]+$/.test(line),
+    );
+  return lines.at(-1) ?? '';
+}
+
+function excerpt(text: string, maxChars = 400): string {
+  const cleaned = text.replace(/\s+/g, ' ').trim();
+  // Keep the tail: CLI failures end with the actionable error, the head is
+  // usually just startup banner / warning noise.
+  return cleaned.length > maxChars ? `…${cleaned.slice(-maxChars)}` : cleaned;
 }

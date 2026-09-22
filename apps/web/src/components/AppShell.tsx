@@ -1,3 +1,4 @@
+import type { CodexStatus } from '@autogit/shared';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   Activity,
@@ -44,7 +45,7 @@ const PAGE_TITLES: Record<string, { title: string; subtitle: string }> = {
     subtitle: '选择账号下的仓库，初始化 ai/* 标签后即可托管流水线',
   },
   '/tasks': { title: '任务', subtitle: 'Codex 执行队列、历史记录与逐字实时日志' },
-  '/codex': { title: 'Codex CLI', subtitle: '下载安装、版本识别、登录状态与 config.toml 管理' },
+  '/codex': { title: 'Codex CLI', subtitle: '下载安装、版本识别、模型响应探测与 config.toml 管理' },
   '/labels': { title: '标签规范', subtitle: '15 个 ai/* 标签的语义、单选分组与流转规则' },
   '/settings': { title: '设置', subtitle: '调度节奏、并发、沙箱与提交身份' },
 };
@@ -224,7 +225,7 @@ function CodexChip({
   status,
   loading,
 }: {
-  status: { installed: boolean; version: string | null; loggedIn: boolean | null } | undefined;
+  status: CodexStatus | undefined;
   loading: boolean;
 }): ReactNode {
   if (loading && !status) {
@@ -243,19 +244,30 @@ function CodexChip({
       </span>
     );
   }
+
+  const ready = status.modelProbe?.ready ?? null;
+  const probeHint =
+    ready === true
+      ? 'Codex 模型响应正常'
+      : ready === false
+        ? `Codex 模型无响应：${status.modelProbe?.message ?? '未知原因'}`
+        : '尚未探测 Codex 模型响应，可前往 Codex CLI 页面执行';
+
   return (
     <span
       className={cn(
         'chip',
-        status.loggedIn
+        ready === true
           ? 'border-emerald-400/30 bg-emerald-400/10 text-emerald-200'
-          : 'border-amber-400/30 bg-amber-400/10 text-amber-200',
+          : ready === false
+            ? 'border-rose-400/30 bg-rose-400/10 text-rose-200'
+            : 'border-white/10 text-slate-300',
       )}
-      title={status.loggedIn ? 'Codex CLI 已登录' : 'Codex CLI 未登录，请先在终端执行 codex login'}
+      title={probeHint}
     >
       <Terminal className="h-3 w-3" />
       Codex {status.version ?? '未知版本'}
-      {status.loggedIn === false ? ' · 未登录' : ''}
+      {ready === true ? ' · 模型正常' : ready === false ? ' · 模型无响应' : ''}
     </span>
   );
 }

@@ -106,7 +106,7 @@ pnpm dev          # 或 pnpm build && pnpm start
 
 ## 不会被清掉的东西
 
-- **Codex 登录态**：`$CODEX_HOME/auth.json` 由 Codex CLI 自己管理，AutoGit 不代管，清掉 AutoGit 不会让你掉登录。
+- **Codex 凭证与登录态**：`$CODEX_HOME/auth.json` 由 Codex CLI 自己管理，AutoGit 不读取也不代管（只做一次模型响应探测），清掉 AutoGit 不会让你掉登录。
 - **远程仓库**：所有删除都只发生在本地，`ai/*` 分支、Issue、PR 都不受影响。
 - **Git 凭据**：Token 通过 `GIT_CONFIG_*` 环境变量注入，不写进任何 `.git/config`，没有残留需要清。
 - **你的项目源码**：AutoGit 只在 `workspaces/` 里操作克隆，不碰你打开的开发目录。

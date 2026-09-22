@@ -4,6 +4,7 @@ import type {
   AppSettings,
   CodexConfigPayload,
   CodexInstallState,
+  CodexModelProbe,
   CodexStatus,
   LabelPreviewRow,
   LabelSyncResult,
@@ -209,6 +210,7 @@ export const api = {
     install: () => request<{ state: CodexInstallState }>('/api/codex/install', { method: 'POST' }),
     installState: () => request<{ state: CodexInstallState }>('/api/codex/install'),
     invalidate: () => request<{ status: CodexStatus }>('/api/codex/invalidate', { method: 'POST' }),
+    probe: () => request<{ probe: CodexModelProbe }>('/api/codex/probe', { method: 'POST' }),
     config: () =>
       request<{
         config: CodexConfigPayload;

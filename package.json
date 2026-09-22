@@ -1,0 +1,26 @@
+{
+  "name": "autogit",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Agent-driven Git workflow automation for GitHub / Gitea / Gitee, powered by the Codex CLI",
+  "type": "module",
+  "packageManager": "pnpm@10.19.0",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "dev": "pnpm -r --parallel dev",
+    "dev:server": "pnpm --filter @autogit/server dev",
+    "dev:web": "pnpm --filter @autogit/web dev",
+    "build": "pnpm --filter @autogit/shared build && pnpm --filter @autogit/server build && pnpm --filter @autogit/web build",
+    "start": "pnpm --filter @autogit/server start",
+    "typecheck": "pnpm -r typecheck",
+    "check": "biome check .",
+    "format": "biome format --write .",
+    "simulate": "pnpm --filter @autogit/server simulate"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.14",
+    "typescript": "^7.0.2"
+  }
+}

@@ -1,0 +1,21 @@
+export function nowIso(): string {
+  return new Date().toISOString();
+}
+
+export function msBetween(start: string | null, end: string | null): number | null {
+  if (!start || !end) return null;
+  const from = Date.parse(start);
+  const to = Date.parse(end);
+  if (Number.isNaN(from) || Number.isNaN(to)) return null;
+  return Math.max(0, to - from);
+}
+
+export function slugify(input: string, maxLength = 40): string {
+  const slug = input
+    .toLowerCase()
+    .replace(/[^a-z0-9\u4e00-\u9fa5]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, maxLength)
+    .replace(/-+$/g, '');
+  return slug.length > 0 ? slug : 'task';
+}

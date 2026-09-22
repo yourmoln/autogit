@@ -2,6 +2,16 @@ export function nowIso(): string {
   return new Date().toISOString();
 }
 
+/**
+ * Same instant as `nowIso()`, with `:` and `.` replaced by `-`.
+ *
+ * Ids end up in branch names, URLs and on-disk directories, and the raw ISO
+ * form is not a legal file name on Windows, so generated ids use this variant.
+ */
+export function idStamp(): string {
+  return new Date().toISOString().replace(/[:.]/g, '-');
+}
+
 export function msBetween(start: string | null, end: string | null): number | null {
   if (!start || !end) return null;
   const from = Date.parse(start);

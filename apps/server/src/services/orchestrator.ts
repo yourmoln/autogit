@@ -1,5 +1,3 @@
-import path from 'node:path';
-
 import {
   applyStatusTransition,
   type EngineId,
@@ -24,7 +22,8 @@ import type { RuntimeConfig } from '../config.js';
 import type { RepositoryRecord, Store } from '../db/store.js';
 import type { GitProvider, RepoRef } from '../providers/index.js';
 import { childLogger } from '../util/logger.js';
-import { nowIso, slugify } from '../util/time.js';
+import { taskDirectory } from '../util/paths.js';
+import { idStamp, nowIso, slugify } from '../util/time.js';
 import type { CodexService } from './codex.js';
 import type { EventBus } from './events.js';
 import { buildGitEnv } from './git.js';
@@ -323,7 +322,7 @@ export class Orchestrator {
 
       const engine = this.resolveEngine(issue.labels, 'implement');
       const task = this.deps.store.createTask({
-        id: `${repository.id}-${nowIso()}-${issue.number}-${Math.random().toString(36).slice(2, 8)}`,
+        id: `${repository.id}-${idStamp()}-${issue.number}-${Math.random().toString(36).slice(2, 8)}`,
         repositoryId: repository.id,
         kind,
         engine,
@@ -378,7 +377,7 @@ export class Orchestrator {
             continue;
           }
           const task = this.deps.store.createTask({
-            id: `${repository.id}-${nowIso()}-pr${pr.number}-review-${Math.random().toString(36).slice(2, 8)}`,
+            id: `${repository.id}-${idStamp()}-pr${pr.number}-review-${Math.random().toString(36).slice(2, 8)}`,
             repositoryId: repository.id,
             kind: 'review',
             engine: this.resolveEngine(pr.labels, 'review'),
@@ -420,7 +419,7 @@ export class Orchestrator {
           continue;
         }
         const task = this.deps.store.createTask({
-          id: `${repository.id}-${nowIso()}-pr${pr.number}-fix-${Math.random().toString(36).slice(2, 8)}`,
+          id: `${repository.id}-${idStamp()}-pr${pr.number}-fix-${Math.random().toString(36).slice(2, 8)}`,
           repositoryId: repository.id,
           kind: 'fix',
           engine: this.resolveEngine(pr.labels, 'fix'),
@@ -517,7 +516,7 @@ export class Orchestrator {
       if (attempts >= MAX_ATTEMPTS_PER_ITEM) continue;
 
       const task = this.deps.store.createTask({
-        id: `${repository.id}-${nowIso()}-${issue.number}-resume-${Math.random().toString(36).slice(2, 8)}`,
+        id: `${repository.id}-${idStamp()}-${issue.number}-resume-${Math.random().toString(36).slice(2, 8)}`,
         repositoryId: repository.id,
         kind: 'implement',
         engine: this.resolveEngine(issue.labels, 'implement'),
@@ -567,7 +566,7 @@ export class Orchestrator {
 
     const engine = this.resolveEngine([], input.kind);
     const task = this.deps.store.createTask({
-      id: `${repository.id}-${nowIso()}-manual-${Math.random().toString(36).slice(2, 8)}`,
+      id: `${repository.id}-${idStamp()}-manual-${Math.random().toString(36).slice(2, 8)}`,
       repositoryId: repository.id,
       kind: input.kind,
       engine,
@@ -780,7 +779,7 @@ export class Orchestrator {
       signal,
       timeoutMs: settings.taskTimeoutMinutes * 60_000,
       env: buildGitEnv(provider.gitAuthorizationHeader()),
-      taskDir: path.join(config.dataDir, 'tasks', entry.taskId),
+      taskDir: taskDirectory(config.dataDir, entry.taskId),
     });
 
     if (!result.ok) throw new Error(result.error ?? 'Codex 执行失败');
@@ -889,7 +888,7 @@ export class Orchestrator {
       timeoutMs: Math.min(settings.taskTimeoutMinutes, 30) * 60_000,
       outputSchema: REVIEW_SCHEMA as unknown as Record<string, unknown>,
       env: buildGitEnv(provider.gitAuthorizationHeader()),
-      taskDir: path.join(config.dataDir, 'tasks', entry.taskId),
+      taskDir: taskDirectory(config.dataDir, entry.taskId),
     });
 
     if (!result.ok) throw new Error(result.error ?? 'Codex 评审执行失败');
@@ -995,7 +994,7 @@ export class Orchestrator {
       signal,
       timeoutMs: settings.taskTimeoutMinutes * 60_000,
       env: buildGitEnv(provider.gitAuthorizationHeader()),
-      taskDir: path.join(config.dataDir, 'tasks', entry.taskId),
+      taskDir: taskDirectory(config.dataDir, entry.taskId),
     });
 
     if (!result.ok) throw new Error(result.error ?? 'Codex 修复执行失败');

@@ -77,10 +77,19 @@ ${WORK_RULES}
 ${tips}`;
 }
 
+/**
+ * JSON Schema handed to `codex exec --output-schema`.
+ *
+ * The CLI submits this as a *strict* response schema, and strict mode rejects
+ * any object whose `required` list does not name every key in `properties`
+ * ("Required properties must match all properties in the object"). Fields that
+ * are genuinely optional are therefore `required` + nullable instead of
+ * omitted; `EngineRunner.parseVerdict` already maps `null` back to "absent".
+ */
 export const REVIEW_SCHEMA = {
   type: 'object',
   additionalProperties: false,
-  required: ['verdict', 'summary', 'issues'],
+  required: ['verdict', 'summary', 'issues', 'tests'],
   properties: {
     verdict: {
       type: 'string',
@@ -94,18 +103,21 @@ export const REVIEW_SCHEMA = {
       items: {
         type: 'object',
         additionalProperties: false,
-        required: ['severity', 'title', 'detail'],
+        required: ['severity', 'title', 'detail', 'file', 'line', 'suggestion'],
         properties: {
           severity: { type: 'string', enum: ['blocker', 'major', 'minor'] },
           title: { type: 'string' },
           detail: { type: 'string' },
-          file: { type: 'string' },
-          line: { type: 'integer' },
-          suggestion: { type: 'string' },
+          file: { type: ['string', 'null'], description: '相关文件路径；不适用时填 null。' },
+          line: { type: ['integer', 'null'], description: '相关行号；不适用时填 null。' },
+          suggestion: { type: ['string', 'null'], description: '修复建议；不适用时填 null。' },
         },
       },
     },
-    tests: { type: 'string', description: '为验证本次改动而运行的命令与结果。' },
+    tests: {
+      type: ['string', 'null'],
+      description: '为验证本次改动而运行的命令与结果；没有运行测试时填 null。',
+    },
   },
 } as const;
 

@@ -38,7 +38,7 @@
 | Codex CLI 管理 | 版本识别、能力探测、安装/自更新、config.toml 编辑与自动备份、模型响应探测 |
 | 代理配置 | 全局 HTTP(S) 与 SOCKS5 两个通道，支持账号级单独代理，一键测试 GitHub API + `git ls-remote` 连通性 |
 | 实时可观测 | WebSocket 推送任务状态与逐行日志（AI 输出、命令、Git、错误分流），可筛选与导出 |
-| 任务编排 | 全局并发上限、仓库级串行、队列去重、超时与取消、失败重试 |
+| 任务编排 | 全局并发上限、单仓库并发上限、队列去重、超时与取消、失败重试 |
 
 ## 技术栈
 
@@ -206,6 +206,7 @@ stateDiagram-v2
 AUTOGIT_PORT=4711
 AUTOGIT_POLL_SECONDS=45
 AUTOGIT_MAX_CONCURRENT=2
+AUTOGIT_MAX_CONCURRENT_PER_REPO=1
 # AUTOGIT_CODEX_PATH=C:\Users\me\AppData\Roaming\npm\codex.cmd
 ```
 

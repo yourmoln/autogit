@@ -6,6 +6,7 @@ import { type LogStream, maskProxyUrl } from '@autogit/shared';
 import type { RuntimeConfig } from '../config.js';
 import type { RepositoryRecord } from '../db/store.js';
 import type { GitProvider } from '../providers/index.js';
+import { safePathSegment } from '../util/paths.js';
 import type { RunResult } from '../util/subprocess.js';
 import { type GitProxyOption, git } from './git.js';
 import type { SettingsService } from './settings.js';
@@ -76,8 +77,16 @@ function isTransientGitFailure(result: RunResult): boolean {
 }
 
 /**
- * Owns the on-disk clones AutoGit works in. Every repository gets exactly one
- * workspace directory; branches are switched with a hard reset so the agent
+ * Owns the on-disk clones AutoGit works in.
+ *
+ * Every repository keeps one *base* clone, which is only fetched and never
+ * edited, plus one disposable clone per task. Task clones are created from the
+ * base clone with `git clone --local` (the object database is hardlinked, so
+ * this is a directory walk instead of a second download) and deleted when the
+ * task ends. That per-task isolation is what makes more than one concurrent
+ * task per repository safe: two runs never share a checked-out branch.
+ *
+ * Inside a task clone branches are switched with a hard reset so the agent
  * always starts from a clean, predictable tree.
  */
 export class WorkspaceManager {
@@ -88,6 +97,16 @@ export class WorkspaceManager {
 
   pathFor(repositoryId: string): string {
     return path.join(this.config.workspacesDir, repositoryId);
+  }
+
+  /** Directory that holds one repository's task clones. */
+  private pathForTasks(repositoryId: string): string {
+    return path.join(this.config.workspacesDir, 'tasks', repositoryId);
+  }
+
+  /** Clone a single task works in; removed again by `releaseTaskWorkspace`. */
+  pathForTask(repositoryId: string, taskId: string): string {
+    return path.join(this.pathForTasks(repositoryId), safePathSegment(taskId, 'task'));
   }
 
   private authHeaderFor(provider: GitProvider): string | null {
@@ -106,6 +125,18 @@ export class WorkspaceManager {
   }
 
   async ensureClone(
+    repository: RepositoryRecord,
+    provider: GitProvider,
+    log: WorkspaceLog,
+    options: { taskId?: string } = {},
+  ): Promise<string> {
+    const base = await this.ensureBaseClone(repository, provider, log);
+    if (!options.taskId) return base;
+    return this.ensureTaskClone(base, repository, provider, log, options.taskId);
+  }
+
+  /** Clone (first time) or fetch (afterwards) the shared base clone of a repository. */
+  private async ensureBaseClone(
     repository: RepositoryRecord,
     provider: GitProvider,
     log: WorkspaceLog,
@@ -147,6 +178,73 @@ export class WorkspaceManager {
 
     await this.configureIdentity(dir, net);
     return dir;
+  }
+
+  /**
+   * Creates a task-scoped working copy out of the base clone.
+   *
+   * The local clone inherits the base clone as `origin`; pointing the remote
+   * back at the provider afterwards keeps every later `fetch` / `push` on the
+   * real repository instead of the local cache.
+   */
+  private async ensureTaskClone(
+    base: string,
+    repository: RepositoryRecord,
+    provider: GitProvider,
+    log: WorkspaceLog,
+    taskId: string,
+  ): Promise<string> {
+    const dir = this.pathForTask(repository.id, taskId);
+    const net = this.netFor(provider);
+    const env = { GIT_LFS_SKIP_SMUDGE: '1' };
+
+    if (!existsSync(path.join(dir, '.git'))) {
+      // A clone that died halfway leaves a directory the retry cannot use.
+      if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
+      mkdirSync(path.dirname(dir), { recursive: true });
+      log('git', `准备任务工作区（本地克隆 ${repository.fullName}）→ ${dir}`);
+      const clone = await git(['clone', '--local', base, dir], {
+        cwd: path.dirname(dir),
+        ...net,
+        env,
+        onLine: (line) => log('git', line.message),
+      });
+      if (clone.code !== 0) {
+        rmSync(dir, { recursive: true, force: true });
+        throw new Error(
+          `准备任务工作区失败：${clone.stderr.trim() || clone.stdout.trim() || '未知错误'}`,
+        );
+      }
+      const remote = await git(['remote', 'set-url', 'origin', repository.cloneUrl], {
+        cwd: dir,
+        ...net,
+      });
+      if (remote.code !== 0) {
+        throw new Error(`设置任务工作区远端失败：${remote.stderr.trim() || '未知错误'}`);
+      }
+    }
+
+    await this.configureIdentity(dir, net);
+    return dir;
+  }
+
+  /**
+   * Deletes the clone a finished task worked in.
+   *
+   * Best effort: on Windows a directory stays busy while a killed git process
+   * still holds a handle. Leftovers are swept on the next service start, where
+   * `reconcileInterruptedTasks()` releases the workspaces of dead tasks.
+   */
+  releaseTaskWorkspace(repositoryId: string, taskId: string, log?: WorkspaceLog): void {
+    const dir = this.pathForTask(repositoryId, taskId);
+    if (!existsSync(dir)) return;
+    try {
+      rmSync(dir, { recursive: true, force: true });
+      log?.('system', `已清理任务工作区 ${dir}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      log?.('system', `任务工作区未能删除（${message}），将在下次启动时清理`);
+    }
   }
 
   private async configureIdentity(dir: string, net: GitNet): Promise<void> {
@@ -477,6 +575,8 @@ export class WorkspaceManager {
   removeWorkspace(repositoryId: string): void {
     const dir = this.pathFor(repositoryId);
     if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
+    const tasks = this.pathForTasks(repositoryId);
+    if (existsSync(tasks)) rmSync(tasks, { recursive: true, force: true });
   }
 }
 

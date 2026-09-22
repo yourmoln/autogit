@@ -191,6 +191,16 @@ const REPOSITORY_SELECT = `
   JOIN accounts a ON a.id = r.account_id
 `;
 
+/**
+ * Identity of the Issue / PR a task belongs to.
+ *
+ * Implement tasks are keyed by Issue number, review and fix tasks by PR
+ * number — a review of PR #5 linked to Issue #3 must never be looked up by
+ * `3`, which previously made every poll enqueue another copy of the same
+ * review.
+ */
+export type TaskLookup = { by: 'issue'; number: number } | { by: 'pr'; number: number };
+
 const TASK_SELECT = `
   SELECT t.*, r.full_name AS repository_full_name
   FROM tasks t
@@ -705,16 +715,13 @@ export class Store {
     return rows.map(mapTask);
   }
 
-  findOpenTask(
-    repositoryId: string,
-    kind: TaskKind,
-    issueNumber: number | null,
-  ): TaskRecord | null {
+  findOpenTask(repositoryId: string, kind: TaskKind, lookup: TaskLookup): TaskRecord | null {
+    const column = lookup.by === 'issue' ? 't.issue_number' : 't.pr_number';
     const row = this.db.get<TaskDbRow>(
       `${TASK_SELECT} WHERE t.repository_id = ? AND t.kind = ? AND t.status IN ('queued', 'running')
-         AND (t.issue_number = ? OR (? IS NULL AND t.issue_number IS NULL))
+         AND ${column} = ?
        ORDER BY t.queued_at DESC LIMIT 1`,
-      [repositoryId, kind, issueNumber, issueNumber],
+      [repositoryId, kind, lookup.number],
     );
     return row ? mapTask(row) : null;
   }

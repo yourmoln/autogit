@@ -7,6 +7,7 @@ export function defaultSettings(config: RuntimeConfig): AppSettings {
   return {
     pollSeconds: config.defaultPollSeconds,
     maxConcurrentTasks: config.defaultMaxConcurrent,
+    maxConcurrentPerRepo: config.defaultMaxConcurrentPerRepo,
     // Label creation is explicitly triggered from the UI ("初始化"), but users
     // who manage many repositories can switch this on and let polling do it.
     autoInitializeLabels: false,
@@ -30,6 +31,7 @@ export function defaultSettings(config: RuntimeConfig): AppSettings {
 const NUMBER_RANGES: Partial<Record<keyof AppSettings, [number, number]>> = {
   pollSeconds: [10, 3600],
   maxConcurrentTasks: [1, 8],
+  maxConcurrentPerRepo: [1, 8],
   taskTimeoutMinutes: [5, 240],
 };
 

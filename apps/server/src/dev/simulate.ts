@@ -260,9 +260,40 @@ class SimulationRunner extends EngineRunner {
   reviewRounds = 0;
   /** How often a review had to be asked to re-output its verdict. */
   verdictRepairs = 0;
+  /** Wall-clock deadline every following run waits for before doing its work. */
+  private holdUntil = 0;
+
+  /**
+   * Keeps the next runs inside the `running` state for `ms` milliseconds.
+   *
+   * The concurrency scenario needs tasks that are still running while the
+   * orchestrator ticks again; without a hold the fake agent finishes instantly
+   * and the queue would always be empty.
+   */
+  hold(ms: number): void {
+    this.holdUntil = Date.now() + ms;
+  }
 
   override async run(input: EngineRunInput): Promise<EngineRunResult> {
     const started = Date.now();
+    const remaining = this.holdUntil - Date.now();
+    if (remaining > 0) {
+      input.log('agent', `模拟：保持任务运行 ${Math.ceil(remaining / 1000)}s`);
+      await new Promise((resolve) => setTimeout(resolve, remaining));
+    }
+    if (input.signal?.aborted) {
+      return {
+        ok: false,
+        exitCode: null,
+        summary: '',
+        output: '',
+        durationMs: Date.now() - started,
+        timedOut: false,
+        aborted: true,
+        error: '任务已取消',
+        usage: null,
+      };
+    }
     mkdirSyncIfNeeded(input.cwd);
 
     // The first review answers in prose, so the parser cannot read a verdict and
@@ -534,6 +565,119 @@ async function main(): Promise<void> {
   const succeeded = tasks.filter((task) => task.status === 'succeeded').length;
   assert(succeeded >= 4, `期望至少 4 个成功任务（实现/评审/修复/复审），实际 ${succeeded}`);
 
+  // ---- 场景 2：同一仓库并发 + 评审去重 ---------------------------------
+  //
+  // 两个 implement 任务在同一仓库同时运行，期间反复轮询，验证：
+  //   1. `maxConcurrentPerRepo` 放开的并发任务各自拿到独立工作区；
+  //   2. 同一个 PR 的评审任务不会因为「PR 号 ≠ 关联 Issue 号」被重复入队。
+  settings.update({ maxConcurrentPerRepo: 2, maxConcurrentTasks: 4 });
+  provider.seedIssue({
+    number: 3,
+    title: '并发任务 A',
+    body: '用于验证同一仓库的并发执行。',
+    labels: ['ai/todo'],
+  });
+  provider.seedIssue({
+    number: 4,
+    title: '并发任务 B',
+    body: '用于验证同一仓库的并发执行。',
+    labels: ['ai/todo'],
+  });
+
+  // 一个 PR 号与关联 Issue 号不同的评审：分支名指向 Issue #3，PR 号却是另一个。
+  // 这正是重复入队的触发条件（旧代码按 Issue 号去重，永远匹配不上）。
+  const decoyBranch = 'ai/issue-3-dedupe-regression';
+  git(['branch', decoyBranch, 'main'], bareRepo);
+  const decoy = await provider.createPullRequest(
+    { owner: 'sim', name: 'demo' },
+    {
+      title: '评审去重回归',
+      body: '关联 Issue #3，但 PR 号与 Issue 号不同。',
+      head: decoyBranch,
+      base: 'main',
+    },
+  );
+  await provider.setLabels(
+    { owner: 'sim', name: 'demo' },
+    { number: decoy.number, labels: ['ai/needs-review'], isPullRequest: true },
+  );
+
+  runner.hold(10_000);
+  await orchestrator.tick('concurrency');
+
+  // 工作区是在调用模型之前准备的，两个任务都拿到自己的目录后才继续断言。
+  await waitFor(
+    () =>
+      store.listActiveTasks().filter((task) => task.status === 'running' && task.workspace !== null)
+        .length === 2,
+    20_000,
+    '两个并发任务应当各自准备好工作区',
+  );
+
+  const parallel = orchestrator.status();
+  log.warn(
+    `并发运行中的任务：${parallel.runningTaskIds.length}，排队中：${parallel.queuedTaskIds.length}`,
+  );
+  assert(
+    parallel.runningTaskIds.length === 2,
+    `期望同一仓库并行运行 2 个任务，实际 ${parallel.runningTaskIds.length}`,
+  );
+  assert(
+    parallel.queuedTaskIds.length === 1,
+    `期望 1 个评审任务在排队（仓库并发已满），实际 ${parallel.queuedTaskIds.length}`,
+  );
+
+  const runningWorkspaces = store
+    .listActiveTasks()
+    .filter((task) => task.status === 'running')
+    .map((task) => task.workspace);
+  assert(
+    runningWorkspaces.every((dir) => dir !== null && existsSync(dir)),
+    '并发任务的独立工作区应当真实存在',
+  );
+  assert(new Set(runningWorkspaces).size === 2, '同一仓库的并发任务不应共享工作区目录');
+
+  // 评审还在排队（标签没变），重复轮询不得再入队一份。
+  await orchestrator.tick('concurrency-dedupe-1');
+  await orchestrator.tick('concurrency-dedupe-2');
+  const queuedReviews = store
+    .listTasks({ repositoryId: repository.id, limit: 200 })
+    .filter((task) => task.kind === 'review' && task.prNumber === decoy.number);
+  assert(queuedReviews.length === 1, `同一 PR 只应入队一条评审任务，实际 ${queuedReviews.length}`);
+
+  await runUntilQuiet(orchestrator, store, repository.id, 8);
+  const concurrentImpl = store
+    .listTasks({ repositoryId: repository.id, limit: 200 })
+    .filter(
+      (task) => task.kind === 'implement' && (task.issueNumber === 3 || task.issueNumber === 4),
+    );
+  assert(
+    concurrentImpl.length === 2,
+    `并发场景应当只有 2 个实现任务，实际 ${concurrentImpl.length}`,
+  );
+  assert(
+    concurrentImpl.every((task) => task.status === 'succeeded'),
+    '同一仓库并发的实现任务应当全部成功',
+  );
+  const remoteBranches = git(['branch', '--list', '--format=%(refname:short)'], bareRepo).split(
+    /\r?\n/,
+  );
+  for (const task of concurrentImpl) {
+    assert(
+      task.branch !== null && remoteBranches.includes(task.branch),
+      `并发任务的远端分支应当存在：${task.branch}`,
+    );
+  }
+
+  const reviewTasks = store
+    .listTasks({ repositoryId: repository.id, limit: 200 })
+    .filter((task) => task.kind === 'review' && task.prNumber === decoy.number);
+  assert(reviewTasks.length === 1, `评审任务应当只执行一次，实际 ${reviewTasks.length}`);
+  assert(reviewTasks[0]?.status === 'succeeded', '去重后的评审任务应当成功完成');
+  const reviewedPr = await provider.getPullRequest({ owner: 'sim', name: 'demo' }, decoy.number);
+  assert(reviewedPr.labels.includes('ai/approved'), '评审通过后 PR 应当转为 ai/approved');
+  log.warn('并发与去重场景通过：同仓库并行 2 个任务，同一 PR 只评审一次 ✅');
+
   orchestrator.stop();
   db.close();
   rmSync(root, { recursive: true, force: true });
@@ -562,6 +706,20 @@ async function waitForIdle(
     await new Promise((resolve) => setTimeout(resolve, 150));
   }
   throw new Error('等待任务完成超时');
+}
+
+/** Polls a synchronous condition, so assertions can wait for async git work. */
+async function waitFor(
+  condition: () => boolean,
+  timeoutMs: number,
+  message: string,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (condition()) return;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`等待超时：${message}`);
 }
 
 /**

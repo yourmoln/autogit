@@ -100,7 +100,7 @@ pnpm dev          # 或 pnpm build && pnpm start
 
 ## 运行参数不落库
 
-端口、绑定地址、轮询间隔、并发数等全部来自环境变量，`.env` 只是本机载入方式（已被 `.gitignore` 忽略）：`AUTOGIT_HOME`、`AUTOGIT_SECRET_KEY`、`AUTOGIT_PORT`、`AUTOGIT_HOST`、`AUTOGIT_WEB_DIST`、`AUTOGIT_POLL_SECONDS`、`AUTOGIT_MAX_CONCURRENT`、`AUTOGIT_LOG_LEVEL`、`AUTOGIT_CODEX_PATH`、`CODEX_HOME`。
+端口、绑定地址、轮询间隔、并发数等全部来自环境变量，`.env` 只是本机载入方式（已被 `.gitignore` 忽略）：`AUTOGIT_HOME`、`AUTOGIT_SECRET_KEY`、`AUTOGIT_PORT`、`AUTOGIT_HOST`、`AUTOGIT_WEB_DIST`、`AUTOGIT_POLL_SECONDS`、`AUTOGIT_MAX_CONCURRENT`、`AUTOGIT_MAX_CONCURRENT_PER_REPO`、`AUTOGIT_LOG_LEVEL`、`AUTOGIT_CODEX_PATH`、`CODEX_HOME`。
 
 要重置它们：删掉 `.env`（回到默认值），或从 [.env.example](../.env.example) 重新复制一份。
 

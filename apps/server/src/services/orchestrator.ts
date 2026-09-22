@@ -22,7 +22,7 @@ import {
 } from '@autogit/shared';
 
 import type { RuntimeConfig } from '../config.js';
-import type { RepositoryRecord, Store } from '../db/store.js';
+import type { RepositoryRecord, Store, TaskLookup } from '../db/store.js';
 import { isApiError } from '../providers/http.js';
 import type { GitProvider, RepoRef } from '../providers/index.js';
 import { childLogger } from '../util/logger.js';
@@ -156,6 +156,8 @@ export class Orchestrator {
         error: message,
         finishedAt: nowIso(),
       });
+      // The worker is gone, so anything it left in a task workspace is dead weight.
+      this.deps.workspace.releaseTaskWorkspace(task.repositoryId, task.id);
       this.appendLog(task.id, 'system', message);
       this.emitTask(task.id);
       this.deps.store.addActivity({
@@ -185,6 +187,7 @@ export class Orchestrator {
       running: this.started,
       pollSeconds: this.deps.settings.get().pollSeconds,
       maxConcurrent: this.deps.settings.get().maxConcurrentTasks,
+      maxConcurrentPerRepo: this.deps.settings.get().maxConcurrentPerRepo,
       runningTaskIds: [...this.running.keys()],
       queuedTaskIds: this.queue.map((entry) => entry.taskId),
       lastTickAt: this.lastTickAt,
@@ -488,7 +491,7 @@ export class Orchestrator {
       if (!hasTodo && !hasDoing) continue;
 
       const kind: TaskKind = 'implement';
-      if (this.hasOpenTask(repository.id, kind, issue.number)) continue;
+      if (this.hasOpenTask(repository.id, kind, { by: 'issue', number: issue.number })) continue;
 
       const attempts = this.deps.store.countFailedTasks(repository.id, 'implement', {
         issueNumber: issue.number,
@@ -546,7 +549,7 @@ export class Orchestrator {
       if (isPaused(pr.labels) || isStuck(pr.labels)) continue;
 
       if (settings.autoReview && pr.labels.includes('ai/needs-review')) {
-        if (!this.hasOpenTask(repository.id, 'review', pr.number)) {
+        if (!this.hasOpenTask(repository.id, 'review', { by: 'pr', number: pr.number })) {
           const attempts = this.deps.store.countFailedTasks(repository.id, 'review', {
             prNumber: pr.number,
           });
@@ -588,7 +591,7 @@ export class Orchestrator {
       }
 
       if (settings.autoFix && pr.labels.includes('ai/needs-fix')) {
-        if (this.hasOpenTask(repository.id, 'fix', pr.number)) continue;
+        if (this.hasOpenTask(repository.id, 'fix', { by: 'pr', number: pr.number })) continue;
         const attempts = this.deps.store.countFailedTasks(repository.id, 'fix', {
           prNumber: pr.number,
         });
@@ -684,8 +687,9 @@ export class Orchestrator {
     for (const issue of issues) {
       if (!issue.labels.includes('ai/doing')) continue;
       if (isPaused(issue.labels) || isStuck(issue.labels)) continue;
-      if (this.hasOpenTask(repository.id, 'implement', issue.number)) continue;
-      if (this.deps.store.findOpenTask(repository.id, 'implement', issue.number)) continue;
+      const lookup: TaskLookup = { by: 'issue', number: issue.number };
+      if (this.hasOpenTask(repository.id, 'implement', lookup)) continue;
+      if (this.deps.store.findOpenTask(repository.id, 'implement', lookup)) continue;
 
       const last = this.deps.store
         .listRecentTaskByIssue(repository.id, issue.number)
@@ -896,20 +900,25 @@ export class Orchestrator {
     return false;
   }
 
-  private hasOpenTask(repositoryId: string, kind: TaskKind, number: number | null): boolean {
+  /**
+   * Whether the same Issue/PR already has a queued or running task of this
+   * kind. The lookup is field-specific: a review of PR #5 must be matched on
+   * `pr_number`, even when the PR is linked to Issue #3 — comparing the linked
+   * Issue number instead made every poll enqueue another copy of the review.
+   */
+  private hasOpenTask(repositoryId: string, kind: TaskKind, lookup: TaskLookup): boolean {
+    const matches = (entry: QueueEntry): boolean =>
+      lookup.by === 'pr' ? entry.prNumber === lookup.number : entry.issueNumber === lookup.number;
+
     const inQueue = this.queue.some(
-      (entry) =>
-        entry.repositoryId === repositoryId && entry.kind === kind && entry.issueNumber === number,
+      (entry) => entry.repositoryId === repositoryId && entry.kind === kind && matches(entry),
     );
     if (inQueue) return true;
     for (const runningTask of this.running.values()) {
-      if (runningTask.entry.repositoryId === repositoryId && runningTask.entry.kind === kind) {
-        if (kind === 'review' || kind === 'fix') {
-          if (runningTask.entry.prNumber === number) return true;
-        } else if (runningTask.entry.issueNumber === number) return true;
-      }
+      const { entry } = runningTask;
+      if (entry.repositoryId === repositoryId && entry.kind === kind && matches(entry)) return true;
     }
-    return this.deps.store.findOpenTask(repositoryId, kind, number) !== null;
+    return this.deps.store.findOpenTask(repositoryId, kind, lookup) !== null;
   }
 
   private async processQueue(): Promise<void> {
@@ -917,22 +926,29 @@ export class Orchestrator {
     if (this.queue.length === 0) return;
     if (this.running.size >= settings.maxConcurrentTasks) return;
 
-    const busyRepositories = new Set(
-      [...this.running.values()].map((task) => task.entry.repositoryId),
-    );
+    // `maxConcurrentPerRepo` caps how many tasks one repository may run at the
+    // same time. Every task works in its own clone (see `WorkspaceManager`),
+    // so two tasks of one repository no longer fight over the same branches.
+    const perRepoLimit = Math.max(1, settings.maxConcurrentPerRepo);
+    const runningPerRepo = new Map<string, number>();
+    for (const task of this.running.values()) {
+      const { repositoryId } = task.entry;
+      runningPerRepo.set(repositoryId, (runningPerRepo.get(repositoryId) ?? 0) + 1);
+    }
 
     for (let index = 0; index < this.queue.length; index += 1) {
       if (this.running.size >= settings.maxConcurrentTasks) break;
       const entry = this.queue[index];
       if (!entry) continue;
-      if (busyRepositories.has(entry.repositoryId)) continue;
+      const inRepository = runningPerRepo.get(entry.repositoryId) ?? 0;
+      if (inRepository >= perRepoLimit) continue;
 
       this.queue.splice(index, 1);
       index -= 1;
 
       const controller = new AbortController();
       this.running.set(entry.taskId, { entry, controller });
-      busyRepositories.add(entry.repositoryId);
+      runningPerRepo.set(entry.repositoryId, inRepository + 1);
 
       void this.execute(entry, controller)
         .catch((error: unknown) => {
@@ -993,6 +1009,11 @@ export class Orchestrator {
       }
     } finally {
       this.deps.store.pruneLogs(entry.taskId);
+      this.deps.workspace.releaseTaskWorkspace(
+        entry.repositoryId,
+        entry.taskId,
+        this.taskLogger(entry.taskId),
+      );
     }
   }
 
@@ -1042,8 +1063,9 @@ export class Orchestrator {
       createdAt: comment.createdAt,
     }));
 
-    const cwd = await workspace.ensureClone(repository, provider, log);
+    const cwd = await workspace.ensureClone(repository, provider, log, { taskId: entry.taskId });
     await workspace.prepareBranchFromBase(cwd, repository, branch, provider, log);
+    this.deps.store.updateTask(entry.taskId, { workspace: cwd });
 
     const prompt = buildImplementPrompt({
       repository: {
@@ -1148,8 +1170,9 @@ export class Orchestrator {
     }
 
     const issue = await this.fetchLinkedIssue(repository, provider, ref, pullRequest);
-    const cwd = await workspace.ensureClone(repository, provider, log);
+    const cwd = await workspace.ensureClone(repository, provider, log, { taskId: entry.taskId });
     await workspace.checkoutRemoteBranch(cwd, pullRequest.headRef, provider, log);
+    this.deps.store.updateTask(entry.taskId, { workspace: cwd });
     const diff = await workspace.diffAgainstBase(cwd, `origin/${pullRequest.baseRef}`, provider);
     const comments = await provider.listComments(ref, prNumber);
 
@@ -1356,8 +1379,9 @@ export class Orchestrator {
     const comments = await provider.listComments(ref, prNumber);
     const reviewComment = findLatestReviewComment(comments);
 
-    const cwd = await workspace.ensureClone(repository, provider, log);
+    const cwd = await workspace.ensureClone(repository, provider, log, { taskId: entry.taskId });
     await workspace.checkoutRemoteBranch(cwd, pullRequest.headRef, provider, log);
+    this.deps.store.updateTask(entry.taskId, { workspace: cwd });
     const diffStat = await workspace.diffStat(cwd, `origin/${pullRequest.baseRef}`, provider);
 
     const prompt = buildFixPrompt({
@@ -1636,6 +1660,7 @@ function buildStatus(input: {
   running: boolean;
   pollSeconds: number;
   maxConcurrent: number;
+  maxConcurrentPerRepo: number;
   runningTaskIds: string[];
   queuedTaskIds: string[];
   lastTickAt: string | null;

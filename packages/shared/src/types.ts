@@ -363,6 +363,7 @@ export interface OrchestratorStatus {
   running: boolean;
   pollSeconds: number;
   maxConcurrent: number;
+  maxConcurrentPerRepo: number;
   runningTaskIds: string[];
   queuedTaskIds: string[];
   lastTickAt: string | null;
@@ -381,6 +382,8 @@ export interface OrchestratorStatus {
 export interface AppSettings {
   pollSeconds: number;
   maxConcurrentTasks: number;
+  /** How many tasks a single repository may run at the same time. */
+  maxConcurrentPerRepo: number;
   autoInitializeLabels: boolean;
   autoReview: boolean;
   autoFix: boolean;

@@ -91,6 +91,9 @@ export function DashboardPage(): ReactNode {
             并发上限 {overview.data?.orchestrator.maxConcurrent}
           </span>
           <span className="chip border-white/10 text-slate-400">
+            单仓库并发 {overview.data?.orchestrator.maxConcurrentPerRepo}
+          </span>
+          <span className="chip border-white/10 text-slate-400">
             上次轮询 {formatRelative(overview.data?.orchestrator.lastTickAt ?? null)}
           </span>
         </div>

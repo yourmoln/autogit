@@ -7,6 +7,7 @@ import { parseOrThrow } from '../util/http.js';
 const settingsSchema = z.object({
   pollSeconds: z.number().int().min(10).max(3600).optional(),
   maxConcurrentTasks: z.number().int().min(1).max(8).optional(),
+  maxConcurrentPerRepo: z.number().int().min(1).max(8).optional(),
   autoInitializeLabels: z.boolean().optional(),
   autoReview: z.boolean().optional(),
   autoFix: z.boolean().optional(),
@@ -49,7 +50,7 @@ export function registerSettingsRoutes(app: FastifyInstance, ctx: AppContext): v
       level: 'info',
       scope: 'settings',
       repositoryId: null,
-      message: `更新全局设置（轮询 ${settings.pollSeconds}s / 并发 ${settings.maxConcurrentTasks}）`,
+      message: `更新全局设置（轮询 ${settings.pollSeconds}s / 并发 ${settings.maxConcurrentTasks} / 单仓库并发 ${settings.maxConcurrentPerRepo}）`,
     });
     return { settings };
   });

@@ -65,7 +65,7 @@ export function SettingsPage(): ReactNode {
     <div className="space-y-4">
       <SectionCard
         title="调度设置"
-        description="轮询节奏与并发上限。修改后点击保存，必要时重启调度器立即生效。"
+        description="轮询节奏与并发上限：全局并发决定同时运行的任务总数，单仓库并发决定同一个仓库能同时跑几个任务（每个任务有独立工作区）。修改后点击保存，必要时重启调度器立即生效。"
         actions={
           <>
             <button
@@ -115,6 +115,16 @@ export function SettingsPage(): ReactNode {
               max={8}
               value={form.maxConcurrentTasks}
               onChange={(event) => patch({ maxConcurrentTasks: Number(event.target.value) })}
+            />
+          </Field>
+          <Field label="单仓库并发任务数" hint="1 - 8，默认 1；每个仓库可同时运行的任务数">
+            <input
+              type="number"
+              className="input"
+              min={1}
+              max={8}
+              value={form.maxConcurrentPerRepo}
+              onChange={(event) => patch({ maxConcurrentPerRepo: Number(event.target.value) })}
             />
           </Field>
           <Field label="单任务超时（分钟）" hint="5 - 240">

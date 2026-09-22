@@ -27,6 +27,7 @@ export interface RuntimeConfig {
   codexPathOverride: string | null;
   defaultPollSeconds: number;
   defaultMaxConcurrent: number;
+  defaultMaxConcurrentPerRepo: number;
   isDev: boolean;
   repoRoot: string;
 }
@@ -70,6 +71,7 @@ export function loadRuntimeConfig(): RuntimeConfig {
     codexPathOverride: process.env.AUTOGIT_CODEX_PATH?.trim() || null,
     defaultPollSeconds: asNumber(process.env.AUTOGIT_POLL_SECONDS, 45),
     defaultMaxConcurrent: asNumber(process.env.AUTOGIT_MAX_CONCURRENT, 2),
+    defaultMaxConcurrentPerRepo: asNumber(process.env.AUTOGIT_MAX_CONCURRENT_PER_REPO, 1),
     isDev: process.env.NODE_ENV !== 'production',
     repoRoot,
   };

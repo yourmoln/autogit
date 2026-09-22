@@ -9,7 +9,7 @@ import {
   Sparkles,
 } from 'lucide-react';
 import { motion } from 'motion/react';
-import type { ReactNode } from 'react';
+import type { CSSProperties, ReactNode } from 'react';
 
 import { cn, colorWithAlpha, formatRelative, truncate } from '../lib/utils.js';
 import { LabelChip, PriorityBadge } from './badges.js';
@@ -66,8 +66,13 @@ export function PipelineBoard({
                 </p>
               </div>
               <span
-                className="shrink-0 rounded-md px-1.5 py-0.5 font-mono text-[10px]"
-                style={{ background: colorWithAlpha(hex, 0.18), color: hex }}
+                className="label-tint shrink-0 rounded-md px-1.5 py-0.5 font-mono text-[10px]"
+                style={
+                  {
+                    background: colorWithAlpha(hex, 0.18),
+                    '--label-color': hex,
+                  } as CSSProperties
+                }
               >
                 {column.label}
               </span>

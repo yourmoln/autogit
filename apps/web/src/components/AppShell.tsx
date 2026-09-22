@@ -23,6 +23,7 @@ import { useRealtimeBridge, useRealtimeConnection } from '../hooks/useRealtime.j
 import { api, errorMessage } from '../lib/api.js';
 import { cn, formatRelative } from '../lib/utils.js';
 import { Spinner } from './primitives.js';
+import { ThemeToggle } from './ThemeToggle.js';
 
 const NAV_ITEMS = [
   { to: '/', label: '总览', icon: LayoutDashboard, end: true, hint: '流水线状态与实时动态' },
@@ -89,10 +90,10 @@ export function AppShell(): ReactNode {
 
   return (
     <div className="flex min-h-screen">
-      <aside className="fixed inset-y-0 left-0 z-30 hidden w-60 flex-col border-r border-white/6 bg-[#080a0f]/85 backdrop-blur-xl lg:flex">
+      <aside className="fixed inset-y-0 left-0 z-30 hidden w-60 flex-col border-r border-white/6 bg-surface/85 backdrop-blur-xl lg:flex">
         <div className="flex items-center gap-2.5 px-5 py-5">
           <span className="grid h-9 w-9 place-items-center rounded-xl bg-gradient-to-br from-indigo-500 via-violet-500 to-fuchsia-500 shadow-lg shadow-indigo-500/30">
-            <Bot className="h-5 w-5 text-white" />
+            <Bot className="h-5 w-5 text-[#f8fafc]" />
           </span>
           <div className="leading-tight">
             <p className="text-sm font-semibold tracking-tight text-slate-100">AutoGit</p>
@@ -189,7 +190,7 @@ export function AppShell(): ReactNode {
       </aside>
 
       <div className="flex min-h-screen w-full flex-col lg:pl-60">
-        <header className="sticky top-0 z-20 border-b border-white/6 bg-[#07090d]/80 px-4 py-3.5 backdrop-blur-xl sm:px-6">
+        <header className="sticky top-0 z-20 border-b border-white/6 bg-canvas/80 px-4 py-3.5 backdrop-blur-xl sm:px-6">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div className="min-w-0">
               <h1 className="truncate text-[15px] font-semibold tracking-tight text-slate-100">
@@ -205,6 +206,7 @@ export function AppShell(): ReactNode {
                   轮询异常
                 </span>
               )}
+              <ThemeToggle />
             </div>
           </div>
         </header>

@@ -225,7 +225,7 @@ export function Modal({
           <button
             type="button"
             aria-label="关闭对话框"
-            className="absolute inset-0 cursor-default bg-black/65 backdrop-blur-sm"
+            className="scrim absolute inset-0 cursor-default backdrop-blur-sm"
             onClick={onClose}
           />
           <motion.div

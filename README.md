@@ -35,7 +35,7 @@
 | 阻塞与暂停 | 失败自动打 `ai/stuck` 并留言原因；`ai/paused` 人工暂停，轮询器跳过 |
 | 优先级调度 | `ai/priority-high` 全局插队，`ai/priority-low` 后置，默认普通 |
 | 引擎偏好 | `ai/prefer-codex` / `ai/prefer-claude`、`ai/review-codex` / `ai/review-claude` |
-| Codex CLI 管理 | 版本识别、能力探测、安装/自更新、config.toml 编辑与自动备份、登录状态检测 |
+| Codex CLI 管理 | 版本识别、能力探测、安装/自更新、config.toml 编辑与自动备份、模型响应探测 |
 | 实时可观测 | WebSocket 推送任务状态与逐行日志（AI 输出、命令、Git、错误分流），可筛选与导出 |
 | 任务编排 | 全局并发上限、仓库级串行、队列去重、超时与取消、失败重试 |
 
@@ -75,10 +75,10 @@ pnpm start          # http://127.0.0.1:4711
 
 ```bash
 codex --version        # 期望输出 codex-cli x.y.z
-codex login            # 未登录时执行一次设备授权
+codex login            # 首次使用或凭证失效时执行一次设备授权
 ```
 
-在网页的 **Codex CLI** 页面可以查看版本、能力探测结果与登录状态，也可以直接触发安装/更新和编辑 `config.toml`。
+在网页的 **Codex CLI** 页面可以查看版本、能力探测结果与模型响应探测结果，也可以直接触发安装/更新、测试模型响应和编辑 `config.toml`。AutoGit 不读取也不代管凭证，只用一次最小的 `codex exec` 探针判断模型能否响应。
 
 ## 使用流程
 
@@ -151,7 +151,7 @@ stateDiagram-v2
 | 版本识别 | 执行 `codex --version`，从 `codex-cli x.y.z` 中解析版本号 |
 | 能力探测 | 解析 `codex exec --help` 与 `codex --help`，只在支持时追加 `--json`、`--sandbox`、`--cd`、`--output-last-message`、`--output-schema`、`-c` 等参数 |
 | 安装 / 更新 | 已安装且支持 `codex update` 时执行自更新，否则回退到 `npm install -g @openai/codex@latest`；输出实时推送前端 |
-| 登录状态 | `codex login status` + `$CODEX_HOME/auth.json` 探测，未登录时给出 `codex login` 指引（AutoGit 不代管凭证） |
+| 模型响应 | 用固定提示词执行一次最小的 `codex exec`（只读沙箱、AutoGit 数据目录内运行），按退出码与输出判断模型能否响应；结果缓存 5 分钟，凭证始终由 Codex CLI 自己管理 |
 | 配置管理 | 直接编辑 `$CODEX_HOME/config.toml`，保存前做 TOML 校验，自动备份并保留最近 10 份 |
 | 执行方式 | `codex exec --json -` 从 stdin 读取提示词；评审任务额外使用 `--output-schema` 强制结构化结论 |
 | 隔离 | 每个仓库一个工作区（`~/.autogit/workspaces/<repoId>`），任务级目录存放提示词、JSON Schema 与最后一条消息 |
@@ -170,7 +170,7 @@ stateDiagram-v2
 | 仓库 | `GET/POST /api/repositories`、`PATCH/DELETE /api/repositories/:id`、`GET /api/repositories/:id/overview` |
 | 标签 | `GET /api/repositories/:id/labels/preview`、`POST /api/repositories/:id/labels/initialize` |
 | 任务 | `POST /api/repositories/:id/sync`、`POST /api/repositories/:id/tasks`、`GET /api/tasks`、`GET /api/tasks/:id`、`POST /api/tasks/:id/cancel`、`POST /api/tasks/:id/retry` |
-| Codex | `GET /api/codex/status`、`POST /api/codex/install`、`POST /api/codex/invalidate`、`GET/PUT /api/codex/config`、`GET /api/codex/prompt-preview` |
+| Codex | `GET /api/codex/status`、`POST /api/codex/install`、`POST /api/codex/invalidate`、`POST /api/codex/probe`、`GET/PUT /api/codex/config`、`GET /api/codex/prompt-preview` |
 | 设置 | `GET/PUT /api/settings` |
 
 ## 数据与安全
@@ -209,7 +209,7 @@ pnpm simulate     # 端到端模拟：真实 git + 假 Codex + 假 Git 平台
 确认仓库「轮询已启用」、Issue 是 open 状态且带有 `ai/todo`，并且没有 `ai/paused` / `ai/stuck`。可在总览页点「立即轮询」手动触发一次，任务页会显示日志。
 
 **任务失败并打上 `ai/stuck`？**
-任务日志（任务页 → 选中任务）会显示 Codex 的输出与错误。常见原因是 Codex CLI 未登录、模型权限不足、Issue 描述信息不够。处理后移除 `ai/stuck`，再打回 `ai/todo` 或 `ai/needs-review` 即可继续。
+任务日志（任务页 → 选中任务）会显示 Codex 的输出与错误。常见原因是模型响应探测未通过（凭证失效、模型权限不足）、Issue 描述信息不够。可先在 Codex CLI 页面点「测试模型响应」确认模型能回答，再移除 `ai/stuck`，打回 `ai/todo` 或 `ai/needs-review` 继续。
 
 **自动标签初始化一直失败？**
 检查 Token 是否具备仓库的 `issues`/`labels` 管理权限；自建 Gitea 请确认实例地址能被本机访问，并且版本 >= 1.20。

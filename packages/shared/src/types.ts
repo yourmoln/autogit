@@ -252,15 +252,26 @@ export interface CodexStatus {
   source: 'configured' | 'path' | 'missing';
   configPath: string;
   configExists: boolean;
-  authPath: string;
-  authExists: boolean;
-  authMode: string | null;
-  loggedIn: boolean | null;
-  loginMessage: string | null;
   capabilities: CodexCapabilities | null;
+  /** Result of the last model probe, `null` means no probe ran yet. */
+  modelProbe: CodexModelProbe | null;
   checkedAt: string;
   /** Populated when the CLI is present but a probe failed. */
   warning: string | null;
+}
+
+/**
+ * Outcome of the model probe: a minimal `codex exec` run that only checks
+ * whether the configured model answers. AutoGit never inspects credentials.
+ */
+export interface CodexModelProbe {
+  /** `true` when the model answered, `false` when the call failed, `null` when it could not run. */
+  ready: boolean | null;
+  /** Answer excerpt or failure reason, shown in the UI. */
+  message: string | null;
+  /** Wall clock duration of the probe command in milliseconds. */
+  durationMs: number | null;
+  checkedAt: string;
 }
 
 export interface CodexConfigPayload {

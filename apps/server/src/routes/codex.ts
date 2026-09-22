@@ -35,7 +35,23 @@ export function registerCodexRoutes(app: FastifyInstance, ctx: AppContext): void
 
   app.post('/api/codex/invalidate', async () => {
     ctx.codex.invalidate();
+    // "重新检测" also refreshes the model probe, so the UI never shows a stale
+    // answer right after the user asked for a re-check.
+    await ctx.codex.modelProbe(true);
     return { status: await ctx.codex.status({ force: true }) };
+  });
+
+  app.post('/api/codex/probe', async () => {
+    const probe = await ctx.codex.modelProbe(true);
+    ctx.store.addActivity({
+      level: probe.ready ? 'success' : 'warning',
+      scope: 'codex',
+      repositoryId: null,
+      message: probe.ready
+        ? `Codex 模型响应正常（${probe.durationMs ?? 0}ms）`
+        : `Codex 模型无响应：${probe.message ?? '未知原因'}`,
+    });
+    return { probe };
   });
 
   app.get('/api/codex/config', async () => {

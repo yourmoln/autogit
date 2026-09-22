@@ -1,18 +1,46 @@
+import type { CodexModelProbe, CodexStatus } from '@autogit/shared';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   CircleCheck,
   Download,
-  KeyRound,
+  Gauge,
+  RadioTower,
   RefreshCw,
   Save,
   Terminal,
   TriangleAlert,
 } from 'lucide-react';
-import { type ReactNode, useEffect, useState } from 'react';
+import { type ReactNode, useEffect, useRef, useState } from 'react';
 import { toast } from 'sonner';
 import { CodeBlock, InfoRow, SectionCard, Skeleton, Spinner } from '../components/primitives.js';
 import { api, errorMessage } from '../lib/api.js';
-import { cn, formatDateTime, formatRelative } from '../lib/utils.js';
+import { cn, formatDateTime, formatDuration, formatRelative } from '../lib/utils.js';
+
+/** Mirror of the server side probe TTL: a newer result is reused, older is re-run. */
+const PROBE_TTL_MS = 5 * 60_000;
+
+const PROBE_TONE: Record<'ok' | 'bad' | 'unknown', string> = {
+  ok: 'border-emerald-400/30 bg-emerald-400/10 text-emerald-200',
+  bad: 'border-rose-400/30 bg-rose-400/10 text-rose-200',
+  unknown: 'border-amber-400/30 bg-amber-400/10 text-amber-200',
+};
+
+function probeSummary(
+  probe: CodexModelProbe | null | undefined,
+  pending: boolean,
+): { tone: 'ok' | 'bad' | 'unknown'; label: string } {
+  if (pending) return { tone: 'unknown', label: '模型探测中…' };
+  if (probe?.ready === true) return { tone: 'ok', label: '模型响应正常' };
+  if (probe?.ready === false) return { tone: 'bad', label: '模型无响应' };
+  return { tone: 'unknown', label: '模型未探测' };
+}
+
+function isProbeStale(probe: CodexModelProbe | null | undefined): boolean {
+  if (!probe) return true;
+  const checkedAt = Date.parse(probe.checkedAt);
+  if (Number.isNaN(checkedAt)) return true;
+  return Date.now() - checkedAt >= PROBE_TTL_MS;
+}
 
 export function CodexPage(): ReactNode {
   const queryClient = useQueryClient();
@@ -33,6 +61,34 @@ export function CodexPage(): ReactNode {
 
   const config = useQuery({ queryKey: ['codex-config'], queryFn: api.codex.config });
 
+  const codexStatus = status.data?.status;
+  const installState = install.data?.state;
+
+  const probe = useMutation({
+    mutationFn: api.codex.probe,
+    onSuccess: (data) => {
+      queryClient.setQueryData<{ status: CodexStatus }>(['codex-status'], (previous) =>
+        previous ? { status: { ...previous.status, modelProbe: data.probe } } : previous,
+      );
+      toast[data.probe.ready ? 'success' : 'error'](
+        data.probe.ready
+          ? `模型响应正常（${formatDuration(data.probe.durationMs)}）`
+          : `模型无响应：${data.probe.message ?? '未知原因'}`,
+      );
+    },
+    onError: (error) => toast.error(errorMessage(error)),
+  });
+
+  // The login chip used to tell users whether the CLI was usable. Probing the
+  // model is what actually matters, so run it once when the page opens and no
+  // fresh result is available.
+  const autoProbed = useRef(false);
+  useEffect(() => {
+    if (!codexStatus?.installed || autoProbed.current) return;
+    autoProbed.current = true;
+    if (isProbeStale(codexStatus.modelProbe)) probe.mutate();
+  }, [codexStatus, probe]);
+
   useEffect(() => {
     if (config.data && !dirty) setDraft(config.data.config.content);
   }, [config.data, dirty]);
@@ -46,6 +102,8 @@ export function CodexPage(): ReactNode {
           : `安装失败（退出码 ${data.state.exitCode}）`,
       );
       void queryClient.invalidateQueries({ queryKey: ['codex-install'] });
+      // A fresh binary may answer differently, so allow the probe to run again.
+      if (data.state.exitCode === 0) autoProbed.current = false;
       void queryClient.invalidateQueries({ queryKey: ['codex-status'] });
     },
     onError: (error) => toast.error(errorMessage(error)),
@@ -71,16 +129,34 @@ export function CodexPage(): ReactNode {
     onError: (error) => toast.error(errorMessage(error)),
   });
 
-  const codexStatus = status.data?.status;
-  const installState = install.data?.state;
+  const modelProbe = codexStatus?.modelProbe ?? null;
+  const probeChip = probeSummary(modelProbe, probe.isPending);
 
   return (
     <div className="space-y-4">
       <SectionCard
         title="Codex CLI 状态"
-        description="AutoGit 的所有 AI 能力（实现 / 评审 / 修复）都通过本机 Codex CLI 执行。"
+        description="AutoGit 的所有 AI 能力（实现 / 评审 / 修复）都通过本机 Codex CLI 执行；这里只探测模型能否响应，不读取也不代管任何凭证。"
         actions={
           <>
+            <button
+              type="button"
+              className="btn text-[11.5px]"
+              onClick={() => probe.mutate()}
+              disabled={probe.isPending || !codexStatus?.installed}
+              title={
+                codexStatus?.installed
+                  ? '执行一次最小的 codex exec，确认模型能否响应'
+                  : '安装 Codex CLI 后才能探测模型'
+              }
+            >
+              {probe.isPending ? (
+                <Spinner className="h-3.5 w-3.5" />
+              ) : (
+                <RadioTower className="h-3.5 w-3.5" />
+              )}
+              测试模型响应
+            </button>
             <button
               type="button"
               className="btn text-[11.5px]"
@@ -143,20 +219,9 @@ export function CodexPage(): ReactNode {
                       ? 'PATH 检测'
                       : '未找到'}
                 </span>
-                <span
-                  className={cn(
-                    'chip',
-                    codexStatus?.loggedIn
-                      ? 'border-emerald-400/30 bg-emerald-400/10 text-emerald-200'
-                      : 'border-amber-400/30 bg-amber-400/10 text-amber-200',
-                  )}
-                >
-                  <KeyRound className="h-3 w-3" />
-                  {codexStatus?.loggedIn === null
-                    ? '登录状态未知'
-                    : codexStatus?.loggedIn
-                      ? '已登录'
-                      : '未登录'}
+                <span className={cn('chip', PROBE_TONE[probeChip.tone])}>
+                  <Gauge className="h-3 w-3" />
+                  {probeChip.label}
                 </span>
               </div>
 
@@ -166,13 +231,24 @@ export function CodexPage(): ReactNode {
                 </p>
               )}
 
-              {codexStatus?.loggedIn === false && (
-                <div className="mt-3 rounded-xl border border-amber-400/25 bg-amber-400/8 px-3 py-2.5 text-[11.5px] leading-relaxed text-amber-100">
-                  检测到 Codex CLI 尚未登录。AutoGit 不会代管账号凭证，请在终端执行一次
-                  <code className="mx-1 rounded bg-black/40 px-1.5 py-0.5 font-mono text-[11px]">
-                    codex login
-                  </code>
-                  完成设备授权，然后点击「重新检测」。
+              {modelProbe?.ready === false && (
+                <div className="mt-3 rounded-xl border border-rose-400/25 bg-rose-400/8 px-3 py-2.5 text-[11.5px] leading-relaxed text-rose-100">
+                  <span className="font-medium">模型探测未通过，AutoGit 暂时无法执行任务。</span>
+                  返回信息：
+                  <span className="mt-1 block font-mono text-[10.5px] break-all text-rose-200/80">
+                    {modelProbe.message ?? '未返回具体原因'}
+                  </span>
+                  <span className="mt-1.5 block">
+                    若提示未授权，请在终端执行一次
+                    <code className="mx-1 rounded bg-black/40 px-1.5 py-0.5 font-mono text-[11px]">
+                      codex login
+                    </code>
+                    完成设备授权；若提示模型不可用，请检查 config.toml 中的
+                    <code className="mx-1 rounded bg-black/40 px-1.5 py-0.5 font-mono text-[11px]">
+                      model
+                    </code>
+                    配置，然后点击「测试模型响应」。
+                  </span>
                 </div>
               )}
 
@@ -194,12 +270,14 @@ export function CodexPage(): ReactNode {
                   }
                 />
                 <InfoRow
-                  label="凭证文件"
+                  label="模型响应耗时"
                   value={
-                    <span className="font-mono text-[10.5px]">{codexStatus?.authPath ?? '—'}</span>
+                    <span className="font-mono text-[10.5px]">
+                      {formatDuration(modelProbe?.durationMs)}
+                    </span>
                   }
                 />
-                <InfoRow label="认证方式" value={codexStatus?.authMode ?? '—'} />
+                <InfoRow label="模型探测时间" value={formatDateTime(modelProbe?.checkedAt)} />
                 <InfoRow label="检测时间" value={formatDateTime(codexStatus?.checkedAt)} />
               </div>
             </div>

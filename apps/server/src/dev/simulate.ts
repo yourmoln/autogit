@@ -260,6 +260,8 @@ class SimulationRunner extends EngineRunner {
   reviewRounds = 0;
   /** How often a review had to be asked to re-output its verdict. */
   verdictRepairs = 0;
+  /** How many following implement runs fail, to exercise the retry budget. */
+  failImplementTimes = 0;
   /** Wall-clock deadline every following run waits for before doing its work. */
   private holdUntil = 0;
 
@@ -347,6 +349,21 @@ class SimulationRunner extends EngineRunner {
     }
 
     input.log('command', '$ write src/feature.txt');
+    if (this.failImplementTimes > 0) {
+      this.failImplementTimes -= 1;
+      input.log('stderr', '模拟：实现代理执行失败');
+      return {
+        ok: false,
+        exitCode: 1,
+        summary: '模拟失败',
+        output: '模拟失败',
+        durationMs: Date.now() - started,
+        timedOut: false,
+        aborted: false,
+        error: '模拟：实现代理执行失败',
+        usage: null,
+      };
+    }
     writeFileSync(path.join(input.cwd, 'src', 'feature.txt'), 'feature work in progress\n', 'utf8');
     input.log('agent', '已实现 Issue 描述的功能');
     return success('新增 src/feature.txt，实现 Issue 要求。', started);
@@ -677,6 +694,47 @@ async function main(): Promise<void> {
   const reviewedPr = await provider.getPullRequest({ owner: 'sim', name: 'demo' }, decoy.number);
   assert(reviewedPr.labels.includes('ai/approved'), '评审通过后 PR 应当转为 ai/approved');
   log.warn('并发与去重场景通过：同仓库并行 2 个任务，同一 PR 只评审一次 ✅');
+
+  // ---- 场景 3：人工重试重置失败额度 -------------------------------------
+  //
+  // 旧行为：失败计数终身累计，人工移除 ai/stuck 后下一个 tick 会立刻再次判定
+  // 「已连续失败 N 次」，流水线永远无法恢复。现在以最近一次 ai/stuck 为基线，
+  // 人工重试即重新获得完整额度。
+  settings.update({ maxConcurrentPerRepo: 1 });
+  const retryIssue = provider.seedIssue({
+    number: 5,
+    title: '失败重试额度',
+    body: '用于验证人工重试会重置失败计数。',
+    labels: ['ai/todo'],
+  });
+  runner.failImplementTimes = 3;
+
+  for (let round = 1; round <= 4; round += 1) {
+    // 每一轮都模拟人工重试：移除 ai/stuck 并重新打上 ai/todo。
+    await provider.setLabels(
+      { owner: 'sim', name: 'demo' },
+      { number: retryIssue.number, labels: ['ai/todo'], isPullRequest: false },
+    );
+    await orchestrator.tick(`manual-retry-${round}`);
+    await waitForIdle(orchestrator, store, 60_000);
+    const current = await provider.getIssue({ owner: 'sim', name: 'demo' }, retryIssue.number);
+    if (!current.labels.includes('ai/stuck')) break;
+  }
+
+  const retried = await provider.getIssue({ owner: 'sim', name: 'demo' }, retryIssue.number);
+  assert(!retried.labels.includes('ai/stuck'), '人工重试后不应再次被判为阻塞');
+  const retryTasks = store
+    .listTasks({ repositoryId: repository.id, limit: 300 })
+    .filter((task) => task.kind === 'implement' && task.issueNumber === retryIssue.number);
+  assert(
+    retryTasks.filter((task) => task.status === 'failed').length === 3,
+    '前三次尝试应当失败并累计到额度上限',
+  );
+  assert(
+    retryTasks.some((task) => task.status === 'succeeded'),
+    '人工重试后应当真正执行任务，而不是立刻重新阻塞',
+  );
+  log.warn('重试额度场景通过：连续失败 3 次阻塞后，人工重试仍能重新执行 ✅');
 
   orchestrator.stop();
   db.close();

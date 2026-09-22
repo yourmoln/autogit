@@ -70,7 +70,7 @@ SQLite 通过 Node 内置的 `node:sqlite`（`DatabaseSync`）访问，启用 WA
 - **单仓库并发**：`maxConcurrentPerRepo` 控制同一仓库同时运行的任务数（默认 1）。每个任务在 `workspaces/tasks/<repositoryId>/<taskId>` 下有独立克隆，所以同一仓库的并发任务不会共享分支或工作区。
 - **优先级**：`ai/priority-high` → 0，普通 → 1，`ai/priority-low` → 2；同级按入队时间。
 
-失败处理：任务异常 → 记录错误日志 → 在对应 Issue/PR 上打 `ai/stuck` 并留言说明如何恢复；同一目标连续失败 3 次后不再自动重试。用户主动取消的任务不会打阻塞标签。
+失败处理：任务异常 → 记录错误日志 → 在对应 Issue/PR 上打 `ai/stuck` 并留言说明如何恢复；同一目标连续失败 3 次后不再自动重试。重试额度以最近一次 `ai/stuck` 为基线（`issues.stuck_at` / `pull_requests.stuck_at`，迁移 `003_stuck_baseline`），人工移除该标签后的重试会重新获得完整额度——否则计数终身累计，人一旦重试就会被立刻再次阻塞。用户主动取消的任务不会打阻塞标签。
 
 进程重启时，数据库里残留的 `queued` / `running` 任务会先被记为 `cancelled`（不算失败，不消耗 3 次额度）：它们在内存队列里的位置和 AbortController 已随进程消失，继续留在库里会让 `hasOpenTask()` 永久认为该 Issue/PR 忙碌。释放后的条目由下一次轮询按其远端标签重新入队，它们遗留的任务工作区也在同一步删除。
 

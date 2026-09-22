@@ -145,6 +145,27 @@ const MIGRATIONS: Migration[] = [
       ALTER TABLE accounts ADD COLUMN proxy_url_enc TEXT;
     `,
   },
+  {
+    // Retry budget baseline.
+    //
+    // `stuck_at` records the moment AutoGit parked an item on `ai/stuck`.
+    // Failures that finished before that mark no longer count towards the
+    // "连续失败 3 次" budget, so removing `ai/stuck` and retrying always starts
+    // from a fresh budget instead of being parked again on the next tick (the
+    // pipeline used to be unrecoverable once the lifetime counter passed 3).
+    //
+    // Items that already carry `ai/stuck` when this migration runs are
+    // backfilled, so they become retryable as well.
+    id: '003_stuck_baseline',
+    sql: `
+      ALTER TABLE issues ADD COLUMN stuck_at TEXT;
+      ALTER TABLE pull_requests ADD COLUMN stuck_at TEXT;
+      UPDATE issues SET stuck_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        WHERE labels LIKE '%ai/stuck%';
+      UPDATE pull_requests SET stuck_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        WHERE labels LIKE '%ai/stuck%';
+    `,
+  },
 ];
 
 export function migrate(db: Db): { applied: string[]; current: string } {

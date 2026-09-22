@@ -101,6 +101,8 @@ export interface IssueRowRecord {
   htmlUrl: string | null;
   updatedAt: string;
   isPullRequest: boolean;
+  /** When AutoGit last parked this item on `ai/stuck`; the retry-budget baseline. */
+  stuckAt: string | null;
 }
 
 export interface PullRequestRowRecord {
@@ -119,6 +121,8 @@ export interface PullRequestRowRecord {
   issueNumber: number | null;
   mergedAt: string | null;
   updatedAt: string;
+  /** When AutoGit last parked this PR on `ai/stuck`; the retry-budget baseline. */
+  stuckAt: string | null;
 }
 
 interface AccountDbRow {
@@ -486,6 +490,7 @@ export class Store {
       html_url: string | null;
       updated_at: string;
       is_pull_request: number;
+      stuck_at: string | null;
     }>(`SELECT * FROM issues WHERE ${clauses.join(' AND ')} ORDER BY number DESC`, params);
 
     return rows.map((row) => ({
@@ -499,6 +504,7 @@ export class Store {
       htmlUrl: row.html_url,
       updatedAt: row.updated_at,
       isPullRequest: fromBool(row.is_pull_request),
+      stuckAt: row.stuck_at,
     }));
   }
 
@@ -582,6 +588,7 @@ export class Store {
       issue_number: number | null;
       merged_at: string | null;
       updated_at: string;
+      stuck_at: string | null;
     }>(`SELECT * FROM pull_requests WHERE ${clauses.join(' AND ')} ORDER BY number DESC`, params);
 
     return rows.map((row) => ({
@@ -600,6 +607,7 @@ export class Store {
       issueNumber: row.issue_number,
       mergedAt: row.merged_at,
       updatedAt: row.updated_at,
+      stuckAt: row.stuck_at,
     }));
   }
 
@@ -611,6 +619,31 @@ export class Store {
   findPullRequestByHead(repositoryId: string, headRef: string): PullRequestRowRecord | null {
     const rows = this.listPullRequests(repositoryId);
     return rows.find((row) => row.headRef === headRef) ?? null;
+  }
+
+  /**
+   * Marks the moment AutoGit parked an item on `ai/stuck`.
+   *
+   * Failed tasks that finished before this mark stop counting towards the
+   * retry budget, so a human who removes `ai/stuck` gets the full budget again.
+   */
+  markItemStuck(repositoryId: string, number: number, isPullRequest: boolean, at: string): void {
+    const table = isPullRequest ? 'pull_requests' : 'issues';
+    this.db.run(`UPDATE ${table} SET stuck_at = ? WHERE repository_id = ? AND number = ?`, [
+      at,
+      repositoryId,
+      number,
+    ]);
+  }
+
+  /** `null` when the item was never parked, which means every failure still counts. */
+  stuckAtFor(repositoryId: string, number: number, isPullRequest: boolean): string | null {
+    const table = isPullRequest ? 'pull_requests' : 'issues';
+    const row = this.db.get<{ stuck_at: string | null }>(
+      `SELECT stuck_at FROM ${table} WHERE repository_id = ? AND number = ?`,
+      [repositoryId, number],
+    );
+    return row?.stuck_at ?? null;
   }
 
   setPullRequestIssueNumber(repositoryId: string, number: number, issueNumber: number): void {
@@ -864,6 +897,7 @@ export class Store {
     repositoryId: string,
     kind: TaskKind,
     options: { issueNumber?: number | null; prNumber?: number | null } = {},
+    budget: { since?: string | null } = {},
   ): number {
     const clauses = ['repository_id = ?', 'kind = ?', "status = 'failed'"];
     const params: SqlValue[] = [repositoryId, kind];
@@ -875,6 +909,13 @@ export class Store {
     if (options.prNumber !== undefined && options.prNumber !== null) {
       clauses.push('pr_number = ?');
       params.push(options.prNumber);
+    }
+    if (budget.since) {
+      // Second precision on purpose: the task that caused a park finishes in
+      // the same second as the park itself, and that failure must not consume
+      // the fresh budget a human gets when they remove `ai/stuck`.
+      clauses.push('substr(COALESCE(finished_at, queued_at), 1, 19) > substr(?, 1, 19)');
+      params.push(budget.since);
     }
 
     const row = this.db.get<{ count: number }>(

@@ -493,15 +493,17 @@ export class Orchestrator {
       const kind: TaskKind = 'implement';
       if (this.hasOpenTask(repository.id, kind, { by: 'issue', number: issue.number })) continue;
 
-      const attempts = this.deps.store.countFailedTasks(repository.id, 'implement', {
-        issueNumber: issue.number,
+      const attempts = this.attemptsFor(repository.id, 'implement', {
+        by: 'issue',
+        number: issue.number,
       });
       if (attempts >= MAX_ATTEMPTS_PER_ITEM) {
         await this.markStuck(
+          repository.id,
           provider,
           ref,
           { number: issue.number, labels: issue.labels, isPullRequest: false },
-          `已连续失败 ${attempts} 次，自动流水线暂停。请检查 Issue 描述或补充上下文后移除 ${'ai/stuck'} 标签重试。`,
+          `已连续失败 ${attempts} 次，自动流水线暂停。请检查 Issue 描述或补充上下文后移除 \`ai/stuck\` 标签重试；移除后重试额度会重置。`,
         );
         continue;
       }
@@ -550,15 +552,17 @@ export class Orchestrator {
 
       if (settings.autoReview && pr.labels.includes('ai/needs-review')) {
         if (!this.hasOpenTask(repository.id, 'review', { by: 'pr', number: pr.number })) {
-          const attempts = this.deps.store.countFailedTasks(repository.id, 'review', {
-            prNumber: pr.number,
+          const attempts = this.attemptsFor(repository.id, 'review', {
+            by: 'pr',
+            number: pr.number,
           });
           if (attempts >= MAX_ATTEMPTS_PER_ITEM) {
             await this.markStuck(
+              repository.id,
               provider,
               ref,
               { number: pr.number, labels: pr.labels, isPullRequest: true },
-              `评审连续失败 ${attempts} 次，请人工介入。`,
+              `评审连续失败 ${attempts} 次，请人工介入；移除 \`ai/stuck\` 后重试额度会重置。`,
             );
             continue;
           }
@@ -592,15 +596,17 @@ export class Orchestrator {
 
       if (settings.autoFix && pr.labels.includes('ai/needs-fix')) {
         if (this.hasOpenTask(repository.id, 'fix', { by: 'pr', number: pr.number })) continue;
-        const attempts = this.deps.store.countFailedTasks(repository.id, 'fix', {
-          prNumber: pr.number,
+        const attempts = this.attemptsFor(repository.id, 'fix', {
+          by: 'pr',
+          number: pr.number,
         });
         if (attempts >= MAX_ATTEMPTS_PER_ITEM) {
           await this.markStuck(
+            repository.id,
             provider,
             ref,
             { number: pr.number, labels: pr.labels, isPullRequest: true },
-            `修复连续失败 ${attempts} 次，请人工介入。`,
+            `修复连续失败 ${attempts} 次，请人工介入；移除 \`ai/stuck\` 后重试额度会重置。`,
           );
           continue;
         }
@@ -668,6 +674,7 @@ export class Orchestrator {
         });
       } else if (pr.state === 'closed') {
         await this.markStuck(
+          repository.id,
           provider,
           ref,
           { number: issue.number, labels: issue.labels, isPullRequest: false },
@@ -697,9 +704,7 @@ export class Orchestrator {
       const unfinished = !last || last.status === 'failed' || last.status === 'cancelled';
       if (!unfinished) continue;
 
-      const attempts = this.deps.store.countFailedTasks(repository.id, 'implement', {
-        issueNumber: issue.number,
-      });
+      const attempts = this.attemptsFor(repository.id, 'implement', lookup);
       if (attempts >= MAX_ATTEMPTS_PER_ITEM) continue;
 
       const task = this.deps.store.createTask({
@@ -898,6 +903,23 @@ export class Orchestrator {
       return true;
     }
     return false;
+  }
+
+  /**
+   * Failed attempts that still count against an item's retry budget.
+   *
+   * The budget is measured from the last time AutoGit parked the item on
+   * `ai/stuck`: removing that label is an explicit human retry, and it must not
+   * be consumed again by failures from earlier attempts.
+   */
+  private attemptsFor(repositoryId: string, kind: TaskKind, lookup: TaskLookup): number {
+    const isPullRequest = lookup.by === 'pr';
+    return this.deps.store.countFailedTasks(
+      repositoryId,
+      kind,
+      isPullRequest ? { prNumber: lookup.number } : { issueNumber: lookup.number },
+      { since: this.deps.store.stuckAtFor(repositoryId, lookup.number, isPullRequest) },
+    );
   }
 
   /**
@@ -1515,6 +1537,7 @@ export class Orchestrator {
   }
 
   private async markStuck(
+    repositoryId: string,
     provider: GitProvider,
     ref: RepoRef,
     target: { number: number; labels: string[]; isPullRequest: boolean },
@@ -1530,6 +1553,10 @@ export class Orchestrator {
       labels: finalLabels,
       isPullRequest: target.isPullRequest,
     });
+    // Retry budget baseline: failures before this mark stop counting, so a
+    // human who removes `ai/stuck` gets a full budget instead of being parked
+    // again by the accumulated count of earlier attempts.
+    this.deps.store.markItemStuck(repositoryId, target.number, target.isPullRequest, nowIso());
     await provider.createComment(
       ref,
       target.number,
@@ -1558,6 +1585,7 @@ export class Orchestrator {
 
     if (!target) return;
     await this.markStuck(
+      repository.id,
       provider,
       ref,
       target,

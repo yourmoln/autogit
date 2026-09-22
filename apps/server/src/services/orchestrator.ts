@@ -13,6 +13,7 @@ import {
   priorityRank,
   type RemoteIssue,
   type RemotePullRequest,
+  STUCK_LABEL,
   type Task,
   type TaskKind,
   type TaskPriority,
@@ -586,6 +587,108 @@ export class Orchestrator {
     this.emitTask(task.id);
     void this.processQueue();
     return task;
+  }
+
+  /**
+   * Re-runs a task that previously failed.
+   *
+   * The failed run parked its target on `ai/stuck`, and retrying *consumes*
+   * that label: it is cleared before the new task is queued so a single failure
+   * can be handed back to the agent exactly once, and the scheduler is free to
+   * move the item on again. Anything without that label (already retried, or
+   * never stuck) is rejected instead of silently queueing a duplicate.
+   */
+  async retryTask(
+    taskId: string,
+  ): Promise<{ ok: true; task: Task } | { ok: false; status: 404 | 409; reason: string }> {
+    const task = this.deps.store.getTask(taskId);
+    if (!task) return { ok: false, status: 404, reason: '任务不存在' };
+    if (task.status === 'running' || task.status === 'queued') {
+      return { ok: false, status: 409, reason: '任务仍在进行中，无法重试' };
+    }
+
+    const repository = this.deps.store.getRepository(task.repositoryId);
+    if (!repository) return { ok: false, status: 409, reason: '仓库不存在，无法重试' };
+
+    const provider = this.deps.providers.forAccount(repository.accountId);
+    const ref: RepoRef = { owner: repository.owner, name: repository.name };
+    const isPullRequest = task.kind !== 'implement';
+    const number = isPullRequest ? task.prNumber : task.issueNumber;
+    if (number === null) {
+      return { ok: false, status: 409, reason: '任务没有关联的 Issue/PR，无法重试' };
+    }
+
+    const target = await this.loadRetryTarget(provider, ref, number, isPullRequest);
+    if (!target) return { ok: false, status: 409, reason: '无法读取目标 Issue/PR，请稍后重试' };
+    if (!isStuck(target.labels)) {
+      return {
+        ok: false,
+        status: 409,
+        reason: `目标当前没有 ${STUCK_LABEL} 标签，无法重试（每次失败只能重试一次）`,
+      };
+    }
+
+    // Clearing the label first makes the UI's retry gate and the scheduler see
+    // the same state as the remote: no stuck label, no second retry.
+    const next = target.labels.filter((label) => label !== STUCK_LABEL);
+    await provider.setLabels(ref, { number, labels: next, isPullRequest });
+    if ('headRef' in target) {
+      this.upsertPullRequest(repository, { ...target, labels: next });
+    } else {
+      this.deps.store.upsertIssue({
+        repositoryId: repository.id,
+        number: target.number,
+        title: target.title,
+        state: target.state,
+        labels: next,
+        author: target.author,
+        htmlUrl: target.htmlUrl,
+        updatedAt: nowIso(),
+        isPullRequest: false,
+      });
+    }
+
+    const retried = await this.enqueueManual({
+      repositoryId: repository.id,
+      kind: task.kind,
+      issueNumber: task.issueNumber,
+      prNumber: task.prNumber,
+      priority: 'high',
+    });
+
+    try {
+      await provider.createComment(
+        ref,
+        number,
+        `${AI_MARKER}\n## 🔁 已人工触发重试\n\n已移除 \`${STUCK_LABEL}\` 并重新入队（${task.kind}）。`,
+      );
+    } catch (error) {
+      this.log.warn({ err: error, taskId }, 'failed to comment on retry');
+    }
+
+    this.deps.store.addActivity({
+      level: 'info',
+      scope: 'queue',
+      repositoryId: repository.id,
+      message: `重试任务：已移除 ${STUCK_LABEL} 并重新入队（${task.kind}）`,
+    });
+    return { ok: true, task: retried };
+  }
+
+  private async loadRetryTarget(
+    provider: GitProvider,
+    ref: RepoRef,
+    number: number,
+    isPullRequest: boolean,
+  ): Promise<RemoteIssue | RemotePullRequest | null> {
+    try {
+      return isPullRequest
+        ? await provider.getPullRequest(ref, number)
+        : await provider.getIssue(ref, number);
+    } catch (error) {
+      this.log.warn({ err: error, number, isPullRequest }, 'failed to load retry target');
+      return null;
+    }
   }
 
   cancelTask(taskId: string): boolean {

@@ -199,6 +199,12 @@ export interface Task {
   startedAt: string | null;
   finishedAt: string | null;
   durationMs: number | null;
+  /**
+   * Filled in by the API layer: the task may be re-enqueued because it is
+   * failed/cancelled *and* its Issue/PR is still parked on `ai/stuck`.
+   * Retrying consumes that label, so it can be done exactly once per failure.
+   */
+  retryable?: boolean;
 }
 
 export type LogStream = 'system' | 'stdout' | 'stderr' | 'agent' | 'command' | 'git';

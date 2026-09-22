@@ -38,8 +38,10 @@ export function TaskList({
   const retry = useMutation({
     mutationFn: (id: string) => api.tasks.retry(id),
     onSuccess: () => {
-      toast.success('已重新入队');
+      toast.success('已重新入队，ai/stuck 标签已移除');
       void queryClient.invalidateQueries({ queryKey: ['tasks'] });
+      void queryClient.invalidateQueries({ queryKey: ['repository-overview'] });
+      void queryClient.invalidateQueries({ queryKey: ['overview'] });
     },
     onError: (error) => toast.error(errorMessage(error)),
   });
@@ -134,22 +136,47 @@ export function TaskList({
               </button>
             )}
             {(task.status === 'failed' || task.status === 'cancelled') && (
-              <button
-                type="button"
-                className="btn btn-ghost px-2 py-1 text-[11px]"
-                onClick={(event) => {
-                  event.stopPropagation();
-                  retry.mutate(task.id);
-                }}
-                disabled={retry.isPending}
-              >
-                <RotateCcw className="h-3.5 w-3.5" />
-                重试
-              </button>
+              <RetryButton task={task} pending={retry.isPending} onRetry={retry.mutate} />
             )}
           </div>
         </motion.div>
       ))}
     </div>
+  );
+}
+
+/**
+ * Retry is a one-shot action: re-running the task consumes the `ai/stuck`
+ * label the failure left on the Issue/PR, so the button is only enabled while
+ * the server says that label is still there.
+ */
+function RetryButton({
+  task,
+  pending,
+  onRetry,
+}: {
+  task: Task;
+  pending: boolean;
+  onRetry: (id: string) => void;
+}): ReactNode {
+  const retryable = task.retryable === true;
+  return (
+    <button
+      type="button"
+      className="btn btn-ghost px-2 py-1 text-[11px]"
+      title={
+        retryable
+          ? '重新入队执行，并移除 ai/stuck 标签（每个失败只能重试一次）'
+          : '目标当前不在 ai/stuck 状态（可能已重试过），无法重试'
+      }
+      onClick={(event) => {
+        event.stopPropagation();
+        onRetry(task.id);
+      }}
+      disabled={!retryable || pending}
+    >
+      <RotateCcw className="h-3.5 w-3.5" />
+      重试
+    </button>
   );
 }

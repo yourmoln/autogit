@@ -135,6 +135,16 @@ const MIGRATIONS: Migration[] = [
       CREATE INDEX IF NOT EXISTS idx_activity_ts ON activity (ts);
     `,
   },
+  {
+    // Per account proxy selection: the mode decides which channel is used and
+    // `proxy_url_enc` only carries the address of a `custom` account. The value
+    // is encrypted with the same key as the Git token.
+    id: '002_account_proxy',
+    sql: `
+      ALTER TABLE accounts ADD COLUMN proxy_mode TEXT NOT NULL DEFAULT 'inherit';
+      ALTER TABLE accounts ADD COLUMN proxy_url_enc TEXT;
+    `,
+  },
 ];
 
 export function migrate(db: Db): { applied: string[]; current: string } {

@@ -1,5 +1,5 @@
-import type { ProviderKind } from '@autogit/shared';
-import type { Store } from '../db/store.js';
+import type { ProviderKind, ResolvedProxySummary } from '@autogit/shared';
+import type { AccountRecord, Store } from '../db/store.js';
 import type { GitProvider } from '../providers/index.js';
 import { ApiError, createProvider } from '../providers/index.js';
 import { decryptSecret, encryptSecret } from '../util/crypto.js';
@@ -9,6 +9,12 @@ export interface ConnectionInput {
   baseUrl: string;
   username: string | null;
   token: string;
+  proxyUrl?: string | null;
+}
+
+/** Resolves the proxy an account has to use; implemented by `ProxyService`. */
+export interface ProxyResolver {
+  resolveForAccount(account: AccountRecord): { url: string | null; summary: ResolvedProxySummary };
 }
 
 /**
@@ -21,6 +27,7 @@ export class ProviderFactory {
   constructor(
     private readonly store: Store,
     private readonly secretKey: Buffer,
+    private readonly proxy: ProxyResolver,
   ) {}
 
   create(input: ConnectionInput): GitProvider {
@@ -29,6 +36,7 @@ export class ProviderFactory {
       baseUrl: input.baseUrl,
       username: input.username,
       token: input.token,
+      proxyUrl: input.proxyUrl ?? null,
     });
   }
 
@@ -58,6 +66,7 @@ export class ProviderFactory {
       baseUrl: account.baseUrl,
       username: account.username,
       token: this.decrypt(account.tokenEnc),
+      proxyUrl: this.proxy.resolveForAccount(account).url,
     });
     this.cache.set(accountId, provider);
     return provider;

@@ -1,4 +1,11 @@
 import type { AiLabelDefinition } from './labels.js';
+import type {
+  ProxyEndpointSummary,
+  ProxyMode,
+  ProxySettings,
+  ProxySlot,
+  ResolvedProxySummary,
+} from './proxy.js';
 
 export type ProviderKind = 'github' | 'gitea' | 'gitee';
 
@@ -45,6 +52,25 @@ export const PROVIDER_META: Readonly<Record<ProviderKind, ProviderMeta>> = {
 
 export type AccountStatus = 'unknown' | 'ok' | 'error';
 
+/** Per account proxy state as shown on the proxy page. */
+export interface ProxyAccountSummary {
+  id: string;
+  name: string;
+  provider: ProviderKind;
+  proxyMode: ProxyMode;
+  proxyMaskedUrl: string | null;
+  effective: ResolvedProxySummary;
+}
+
+export interface ProxyConfigPayload {
+  settings: ProxySettings;
+  endpoints: Record<ProxySlot, ProxyEndpointSummary>;
+  /** Result of the global default channel, shown as a preview. */
+  defaultProxy: ResolvedProxySummary;
+  updatedAt: string | null;
+  accounts: ProxyAccountSummary[];
+}
+
 export interface Account {
   id: string;
   name: string;
@@ -61,6 +87,11 @@ export interface Account {
   /** Masked representation of the stored token, e.g. `ghp_…9f2c`. */
   tokenPreview: string | null;
   repositoryCount: number;
+  /** Which proxy this account uses (see `ProxyMode`). */
+  proxyMode: ProxyMode;
+  /** Masked account level proxy address, `null` when none is stored. */
+  proxyUrl: string | null;
+  proxyConfigured: boolean;
 }
 
 export interface Repository {

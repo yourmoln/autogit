@@ -18,6 +18,8 @@ export interface ProviderAccount {
   baseUrl: string;
   username: string | null;
   token: string;
+  /** Proxy address resolved for this account, `null` means direct. */
+  proxyUrl?: string | null;
 }
 
 export interface ListRepositoryOptions {
@@ -71,6 +73,8 @@ export interface LabelTargetInput {
 export interface GitProvider {
   readonly kind: ProviderKind;
   readonly baseUrl: string;
+  /** Proxy used by git / REST calls of this account, `null` means direct. */
+  readonly proxyUrl: string | null;
 
   getCurrentUser(): Promise<RemoteUser>;
   listRepositories(options?: ListRepositoryOptions): Promise<ListRepositoryResult>;

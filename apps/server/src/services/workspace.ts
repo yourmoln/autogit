@@ -1,16 +1,25 @@
 import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import path from 'node:path';
 
-import type { LogStream } from '@autogit/shared';
+import { type LogStream, maskProxyUrl } from '@autogit/shared';
 
 import type { RuntimeConfig } from '../config.js';
 import type { RepositoryRecord } from '../db/store.js';
 import type { GitProvider } from '../providers/index.js';
 import type { RunResult } from '../util/subprocess.js';
-import { git } from './git.js';
+import { type GitProxyOption, git } from './git.js';
 import type { SettingsService } from './settings.js';
 
 export type WorkspaceLog = (stream: LogStream, message: string) => void;
+
+/**
+ * Everything `git` needs to reach the remote of one account: the token based
+ * authorization header and the proxy AutoGit resolved for that account.
+ */
+interface GitNet {
+  authHeader: string | null;
+  proxy: GitProxyOption;
+}
 
 export interface CommitResult {
   committed: boolean;
@@ -89,24 +98,32 @@ export class WorkspaceManager {
     }
   }
 
+  private netFor(provider: GitProvider): GitNet {
+    return {
+      authHeader: this.authHeaderFor(provider),
+      proxy: { url: provider.proxyUrl },
+    };
+  }
+
   async ensureClone(
     repository: RepositoryRecord,
     provider: GitProvider,
     log: WorkspaceLog,
   ): Promise<string> {
     const dir = this.pathFor(repository.id);
-    const authHeader = this.authHeaderFor(provider);
+    const net = this.netFor(provider);
     const env = { GIT_LFS_SKIP_SMUDGE: '1' };
 
     if (!existsSync(path.join(dir, '.git'))) {
       if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
       mkdirSync(path.dirname(dir), { recursive: true });
       log('git', `克隆仓库 ${repository.fullName} → ${dir}`);
+      log('git', `代理：${describeGitProxy(net.proxy.url)}`);
       const result = await this.runNetworkGit(
         ['clone', '--origin', 'origin', repository.cloneUrl, dir],
         {
           cwd: path.dirname(dir),
-          authHeader,
+          net,
           env,
           // A clone that died halfway leaves a directory the retry cannot use.
           beforeRetry: () => rmSync(dir, { recursive: true, force: true }),
@@ -120,7 +137,7 @@ export class WorkspaceManager {
       log('git', `更新远端引用 ${repository.fullName}`);
       const fetch = await this.runNetworkGit(
         ['fetch', '--all', '--prune', '--tags'],
-        { cwd: dir, authHeader, env },
+        { cwd: dir, net, env },
         log,
       );
       if (fetch.code !== 0) {
@@ -128,16 +145,16 @@ export class WorkspaceManager {
       }
     }
 
-    await this.configureIdentity(dir, authHeader);
+    await this.configureIdentity(dir, net);
     return dir;
   }
 
-  private async configureIdentity(dir: string, authHeader: string | null): Promise<void> {
+  private async configureIdentity(dir: string, net: GitNet): Promise<void> {
     const settings = this.settings.get();
-    await git(['config', 'user.name', settings.commitAuthorName], { cwd: dir, authHeader });
-    await git(['config', 'user.email', settings.commitAuthorEmail], { cwd: dir, authHeader });
-    await git(['config', 'commit.gpgsign', 'false'], { cwd: dir, authHeader });
-    await git(['config', 'core.longpaths', 'true'], { cwd: dir, authHeader });
+    await git(['config', 'user.name', settings.commitAuthorName], { cwd: dir, ...net });
+    await git(['config', 'user.email', settings.commitAuthorEmail], { cwd: dir, ...net });
+    await git(['config', 'commit.gpgsign', 'false'], { cwd: dir, ...net });
+    await git(['config', 'core.longpaths', 'true'], { cwd: dir, ...net });
   }
 
   /**
@@ -152,7 +169,7 @@ export class WorkspaceManager {
     args: string[],
     options: {
       cwd: string;
-      authHeader: string | null;
+      net: GitNet;
       env?: NodeJS.ProcessEnv;
       beforeRetry?: () => void;
     },
@@ -161,7 +178,7 @@ export class WorkspaceManager {
     const run = (): Promise<RunResult> =>
       git(args, {
         cwd: options.cwd,
-        authHeader: options.authHeader,
+        ...options.net,
         env: options.env,
         onLine: (line) => log('git', line.message),
       });
@@ -200,12 +217,12 @@ export class WorkspaceManager {
     dir: string,
     branch: string,
     startPoint: string,
-    authHeader: string | null,
+    net: GitNet,
     log: WorkspaceLog,
   ): Promise<void> {
     let failure = '';
-    if (await this.cleanWorkingTree(dir, authHeader, log, { aggressive: false })) {
-      const checkout = await this.checkoutBranch(dir, branch, startPoint, authHeader, log);
+    if (await this.cleanWorkingTree(dir, net, log, { aggressive: false })) {
+      const checkout = await this.checkoutBranch(dir, branch, startPoint, net, log);
       if (checkout.ok) return;
       failure = checkout.message;
       log('system', `切换分支失败，改用强制清理工作区后重试：${failure}`);
@@ -213,10 +230,10 @@ export class WorkspaceManager {
       log('system', '常规清理工作区失败，改用强制清理工作区后重试');
     }
 
-    if (!(await this.cleanWorkingTree(dir, authHeader, log, { aggressive: true }))) {
+    if (!(await this.cleanWorkingTree(dir, net, log, { aggressive: true }))) {
       throw new Error(`切换分支失败：工作区无法清理（${failure || 'git reset/clean 执行失败'}）`);
     }
-    const retry = await this.checkoutBranch(dir, branch, startPoint, authHeader, log);
+    const retry = await this.checkoutBranch(dir, branch, startPoint, net, log);
     if (!retry.ok) throw new Error(`切换分支失败：${retry.message}`);
   }
 
@@ -224,12 +241,12 @@ export class WorkspaceManager {
     dir: string,
     branch: string,
     startPoint: string,
-    authHeader: string | null,
+    net: GitNet,
     log: WorkspaceLog,
   ): Promise<{ ok: true } | { ok: false; message: string }> {
     const result = await git(['checkout', '--force', '-B', branch, startPoint], {
       cwd: dir,
-      authHeader,
+      ...net,
       onLine: (line) => log('git', line.message),
     });
     if (result.code === 0) return { ok: true };
@@ -239,12 +256,12 @@ export class WorkspaceManager {
   /** Returns `false` when the tree could not be cleaned, so callers can escalate. */
   private async cleanWorkingTree(
     dir: string,
-    authHeader: string | null,
+    net: GitNet,
     log: WorkspaceLog,
     options: { aggressive: boolean },
   ): Promise<boolean> {
     if (options.aggressive) {
-      await this.abortInterruptedOperations(dir, authHeader, log);
+      await this.abortInterruptedOperations(dir, net, log);
       this.removeStaleLockFiles(dir, log);
     }
 
@@ -252,7 +269,7 @@ export class WorkspaceManager {
     // belongs makes `reset --hard` fail as well.
     const clean = await git(options.aggressive ? ['clean', '-fdx'] : ['clean', '-fd'], {
       cwd: dir,
-      authHeader,
+      ...net,
       onLine: (line) => log('git', line.message),
     });
     if (clean.code !== 0) {
@@ -262,7 +279,7 @@ export class WorkspaceManager {
 
     const reset = await git(['reset', '--hard'], {
       cwd: dir,
-      authHeader,
+      ...net,
       onLine: (line) => log('git', line.message),
     });
     if (reset.code !== 0) {
@@ -275,7 +292,7 @@ export class WorkspaceManager {
   /** Rolls back a merge / rebase / cherry-pick that a killed run left behind. */
   private async abortInterruptedOperations(
     dir: string,
-    authHeader: string | null,
+    net: GitNet,
     log: WorkspaceLog,
   ): Promise<void> {
     const gitDir = this.gitDir(dir);
@@ -290,7 +307,7 @@ export class WorkspaceManager {
 
     for (const args of INTERRUPTED_OPERATIONS) {
       // Best effort: git exits non-zero when there is nothing left to abort.
-      await git(args, { cwd: dir, authHeader });
+      await git(args, { cwd: dir, ...net });
     }
     log('system', '已回滚工作区中未完成的 git 操作（merge / rebase / cherry-pick）');
   }
@@ -325,17 +342,17 @@ export class WorkspaceManager {
     provider: GitProvider,
     log: WorkspaceLog,
   ): Promise<void> {
-    const authHeader = this.authHeaderFor(provider);
+    const net = this.netFor(provider);
     const base = repository.defaultBranch;
     const fetch = await this.runNetworkGit(
       ['fetch', 'origin', base, '--prune'],
-      { cwd: dir, authHeader },
+      { cwd: dir, net },
       log,
     );
     if (fetch.code !== 0) {
       throw new Error(`拉取分支 ${base} 失败：${fetch.stderr.trim() || '未知错误'}`);
     }
-    await this.switchBranch(dir, branch, `origin/${base}`, authHeader, log);
+    await this.switchBranch(dir, branch, `origin/${base}`, net, log);
   }
 
   /** Checks out an existing remote branch (used for review / fix tasks). */
@@ -345,22 +362,22 @@ export class WorkspaceManager {
     provider: GitProvider,
     log: WorkspaceLog,
   ): Promise<void> {
-    const authHeader = this.authHeaderFor(provider);
+    const net = this.netFor(provider);
     const fetch = await this.runNetworkGit(
       ['fetch', 'origin', branch, '--prune'],
-      { cwd: dir, authHeader },
+      { cwd: dir, net },
       log,
     );
     if (fetch.code !== 0) {
       throw new Error(`拉取分支 ${branch} 失败：${fetch.stderr.trim() || '未知错误'}`);
     }
-    await this.switchBranch(dir, branch, `origin/${branch}`, authHeader, log);
+    await this.switchBranch(dir, branch, `origin/${branch}`, net, log);
   }
 
   async changedFiles(dir: string, provider: GitProvider): Promise<string[]> {
     const result = await git(['status', '--porcelain'], {
       cwd: dir,
-      authHeader: this.authHeaderFor(provider),
+      ...this.netFor(provider),
     });
     return result.stdout
       .split(/\r?\n/)
@@ -374,8 +391,8 @@ export class WorkspaceManager {
     provider: GitProvider,
     log: WorkspaceLog,
   ): Promise<CommitResult> {
-    const authHeader = this.authHeaderFor(provider);
-    const status = await git(['status', '--porcelain'], { cwd: dir, authHeader });
+    const net = this.netFor(provider);
+    const status = await git(['status', '--porcelain'], { cwd: dir, ...net });
     const files = status.stdout
       .split(/\r?\n/)
       .map((line) => line.trim())
@@ -385,16 +402,16 @@ export class WorkspaceManager {
       return { committed: false, files: [], sha: null };
     }
 
-    await git(['add', '-A'], { cwd: dir, authHeader });
+    await git(['add', '-A'], { cwd: dir, ...net });
     const commit = await git(['commit', '-m', message], {
       cwd: dir,
-      authHeader,
+      ...net,
       onLine: (line) => log('git', line.message),
     });
     if (commit.code !== 0) {
       throw new Error(`git commit 失败：${commit.stderr.trim() || commit.stdout.trim()}`);
     }
-    const sha = await git(['rev-parse', 'HEAD'], { cwd: dir, authHeader });
+    const sha = await git(['rev-parse', 'HEAD'], { cwd: dir, ...net });
     return { committed: true, files, sha: sha.stdout.trim() || null };
   }
 
@@ -405,13 +422,13 @@ export class WorkspaceManager {
     log: WorkspaceLog,
     options: { force?: boolean } = {},
   ): Promise<void> {
-    const authHeader = this.authHeaderFor(provider);
+    const net = this.netFor(provider);
     const args = ['push', '--set-upstream', 'origin', `HEAD:refs/heads/${branch}`];
     if (options.force) args.splice(1, 0, '--force-with-lease');
 
     const result = await git(args, {
       cwd: dir,
-      authHeader,
+      ...net,
       onLine: (line) => log('git', line.message),
       timeoutMs: 15 * 60_000,
     });
@@ -426,23 +443,25 @@ export class WorkspaceManager {
     provider: GitProvider,
     maxChars = 60_000,
   ): Promise<string> {
-    const authHeader = this.authHeaderFor(provider);
-    const stat = await git(['diff', '--stat', `${baseRef}...HEAD`], { cwd: dir, authHeader });
-    const diff = await git(['diff', `${baseRef}...HEAD`], { cwd: dir, authHeader });
+    const net = this.netFor(provider);
+    const stat = await git(['diff', '--stat', `${baseRef}...HEAD`], { cwd: dir, ...net });
+    const diff = await git(['diff', `${baseRef}...HEAD`], { cwd: dir, ...net });
     const text = `${stat.stdout.trim()}\n\n${diff.stdout.trim()}`.trim();
     return text.length > maxChars ? `${text.slice(0, maxChars)}\n…（diff 已截断）` : text;
   }
 
   async diffStat(dir: string, baseRef: string, provider: GitProvider): Promise<string> {
-    const authHeader = this.authHeaderFor(provider);
-    const result = await git(['diff', '--stat', `${baseRef}...HEAD`], { cwd: dir, authHeader });
+    const result = await git(['diff', '--stat', `${baseRef}...HEAD`], {
+      cwd: dir,
+      ...this.netFor(provider),
+    });
     return result.stdout.trim();
   }
 
   async currentBranch(dir: string, provider: GitProvider): Promise<string> {
     const result = await git(['rev-parse', '--abbrev-ref', 'HEAD'], {
       cwd: dir,
-      authHeader: this.authHeaderFor(provider),
+      ...this.netFor(provider),
     });
     return result.stdout.trim();
   }
@@ -450,7 +469,7 @@ export class WorkspaceManager {
   async headSha(dir: string, provider: GitProvider): Promise<string | null> {
     const result = await git(['rev-parse', 'HEAD'], {
       cwd: dir,
-      authHeader: this.authHeaderFor(provider),
+      ...this.netFor(provider),
     });
     return result.stdout.trim() || null;
   }
@@ -459,4 +478,8 @@ export class WorkspaceManager {
     const dir = this.pathFor(repositoryId);
     if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
   }
+}
+
+function describeGitProxy(url: string | null): string {
+  return url ? (maskProxyUrl(url) ?? url) : '直连（不使用代理）';
 }

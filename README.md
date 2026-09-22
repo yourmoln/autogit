@@ -36,6 +36,7 @@
 | 优先级调度 | `ai/priority-high` 全局插队，`ai/priority-low` 后置，默认普通 |
 | 引擎偏好 | `ai/prefer-codex` / `ai/prefer-claude`、`ai/review-codex` / `ai/review-claude` |
 | Codex CLI 管理 | 版本识别、能力探测、安装/自更新、config.toml 编辑与自动备份、模型响应探测 |
+| 代理配置 | 全局 HTTP(S) 与 SOCKS5 两个通道，支持账号级单独代理，一键测试 GitHub API + `git ls-remote` 连通性 |
 | 实时可观测 | WebSocket 推送任务状态与逐行日志（AI 输出、命令、Git、错误分流），可筛选与导出 |
 | 任务编排 | 全局并发上限、仓库级串行、队列去重、超时与取消、失败重试 |
 
@@ -88,6 +89,19 @@ codex login            # 首次使用或凭证失效时执行一次设备授权
 4. **启动流水线** — 在 Issue 上打 `ai/todo`，等待一个轮询周期（默认 45 秒），或在总览页点「立即轮询」。
 5. **观察执行** — 「任务」页面可看到实现/评审/修复任务与逐行实时日志；仓库工作台显示 Issue/PR 看板。
 6. **人工收尾** — PR 变成 `ai/approved` 后由人工合并；合并后 Issue 转 `ai/verify`，验证完成手动关闭。
+
+### 访问 GitHub 失败？先配置代理
+
+如果本机直连 GitHub 不稳定（`git fetch` 报 `Failed to connect to github.com port 443`），在左侧 **代理配置** 页面：
+
+1. 打开「启用代理」，确认「默认通道」为 HTTP(S) 代理（账号选择「继承全局默认」时用它）。
+2. 在「代理服务器」的 **HTTP(S) 代理** 里填入本地代理地址（例如 Clash / v2ray 的混合端口 `http://127.0.0.1:7890`）——明文 http 走绝对地址转发，https 走 CONNECT 隧道；只填 **SOCKS5 代理**（如 `socks5h://127.0.0.1:1080`）也可以，留空的通道会自动回退到另一个。
+3. 点「测试全部通道」：会分别测「直连」「HTTP(S) 代理」「SOCKS5 代理」，每项都包含一次 GitHub REST API 请求和一次真实的 `git ls-remote`，可以直接看出哪条链路可用。
+4. 需要给某个账号换出口（例如自建 Gitea 直连、GitHub 走代理），在「账号代理」区域或账号编辑弹窗里单独指定。
+
+代理会作用于该账号的 Issue/PR 读写、`git clone/fetch/push`，以及执行任务时 `codex exec` 子进程的 `HTTP(S)_PROXY`、`ALL_PROXY` 环境变量（模型请求同样受益）。地址以 AES-256-GCM 加密保存，页面与接口只回显掩码。
+
+> 从早期版本升级：原来的「HTTP 代理 / HTTPS 代理」两个通道会自动合并为 HTTP(S) 通道（优先采用原 HTTPS 代理地址，它已验证过 CONNECT），账号上原来选「HTTPS 代理 / 按目标协议自动」的会落到 HTTP(S) 通道。
 
 ### 最小权限建议
 
@@ -172,6 +186,7 @@ stateDiagram-v2
 | 标签 | `GET /api/repositories/:id/labels/preview`、`POST /api/repositories/:id/labels/initialize` |
 | 任务 | `POST /api/repositories/:id/sync`、`POST /api/repositories/:id/tasks`、`GET /api/tasks`、`GET /api/tasks/:id`、`POST /api/tasks/:id/cancel`、`POST /api/tasks/:id/retry` |
 | Codex | `GET /api/codex/status`、`POST /api/codex/install`、`POST /api/codex/invalidate`、`POST /api/codex/probe`、`GET/PUT /api/codex/config`、`GET /api/codex/prompt-preview` |
+| 代理 | `GET/PUT /api/proxy`、`POST /api/proxy/test` |
 | 设置 | `GET/PUT /api/settings` |
 
 ## 数据与安全
@@ -179,6 +194,7 @@ stateDiagram-v2
 - **数据目录**：`~/.autogit`（可用 `AUTOGIT_HOME` 覆盖），包含 `data/autogit.sqlite`、`workspaces/`、`secret.key`、`logs/`。
 - **Token 加密**：使用 AES-256-GCM 加密后落库，密钥来自 `AUTOGIT_SECRET_KEY` 或自动生成的 `secret.key`；接口返回的只是掩码预览。
 - **Git 认证**：推送/拉取通过 `GIT_CONFIG_*` 环境变量注入 `http.extraheader`，Token 不会写进 `.git/config`，也不会出现在命令行参数里。
+- **代理地址**：HTTP(S) 与 SOCKS5 两个通道和账号级代理同样加密落库，接口只返回掩码；仅在配置了代理时注入 `http.proxy` 与代理环境变量，并清空凭据助手避免 Git Credential Manager 探测代理主机。
 - **分支保护**：只有以 `branchPrefix`（默认 `ai/`）开头的分支才会被强推，人工分支永远不会被覆盖。
 - **执行边界**：所有代码改动都发生在独立克隆的工作区，不会碰你的本地开发目录；沙箱与审批策略由 Codex 配置控制（默认 `workspace-write` + `never`）。
 - **不自动合并**：评审通过只打 `ai/approved`，合并动作始终留给人工。
@@ -200,9 +216,13 @@ pnpm typecheck    # 三个包全量类型检查
 pnpm check        # Biome lint + 格式校验
 pnpm build        # shared → server → web
 pnpm simulate     # 端到端模拟：真实 git + 假 Codex + 假 Git 平台
+pnpm --filter @autogit/server proxy:check          # 代理链路自检（本地起 HTTP/SOCKS5 代理）
+pnpm --filter @autogit/server proxy:check -- --online  # 额外验证真实 HTTPS 隧道
 ```
 
 `pnpm simulate` 会在临时目录中创建裸仓库，跑完整链路（初始化 15 个标签 → 实现 → 建 PR → 评审不通过 → 修复 → 复审通过 → 合并 → `ai/verify`），并断言每一步的标签与产物，最后自动清理。
+
+`proxy:check` 会启动一次性本地代理并断言 11 项行为（绝对形式转发、CONNECT 隧道、SOCKS5 用户名密码、认证失败提示、远程 DNS、重定向、gzip、错误码映射等），`--online` 会再追加两项真实 `https://api.github.com/` 隧道检查。
 
 ## 常见问题
 
@@ -220,6 +240,9 @@ pnpm simulate     # 端到端模拟：真实 git + 假 Codex + 假 Git 平台
 
 **能改成用 Claude 吗？**
 可以，但需要本机安装 `claude` 命令，并在「设置」中开启 Claude 回退；带 `ai/prefer-claude` / `ai/review-claude` 的条目会优先使用它。默认全部走 Codex CLI。
+
+**配了代理还是连不上 GitHub？**
+先看「代理配置」页的测试结果：`git ls-remote` 失败一般说明代理本身拒绝 CONNECT 或需要认证（把地址写成 `http://用户名:密码@主机:端口`）；如果代理通道都不通而直连可用，把「默认通道」改成「直连」或给该账号单独指定直连。也可以在仓库里跑 `pnpm --filter @autogit/server proxy:check` 自检代理客户端（加 `-- --online` 会额外验证真实 HTTPS 隧道）。
 
 ---
 

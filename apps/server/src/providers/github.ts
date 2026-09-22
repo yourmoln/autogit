@@ -122,14 +122,17 @@ function labelNames(labels: Array<GitHubLabel | string> | undefined): string[] {
 export class GitHubProvider implements GitProvider {
   readonly kind: ProviderKind = 'github';
   readonly baseUrl: string;
+  readonly proxyUrl: string | null;
   private readonly client: ApiClient;
 
   constructor(private readonly account: ProviderAccount) {
     this.baseUrl = normalizeBaseUrlFor(account.baseUrl);
+    this.proxyUrl = account.proxyUrl ?? null;
     this.client = new ApiClient({
       baseUrl: this.baseUrl,
       auth: { scheme: 'bearer', token: account.token },
       headers: { 'X-GitHub-Api-Version': API_VERSION },
+      proxyUrl: this.proxyUrl,
     });
   }
 

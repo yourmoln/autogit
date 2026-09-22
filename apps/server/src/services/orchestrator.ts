@@ -1067,7 +1067,7 @@ export class Orchestrator {
       log,
       signal,
       timeoutMs: settings.taskTimeoutMinutes * 60_000,
-      env: buildGitEnv(provider.gitAuthorizationHeader()),
+      env: this.engineEnv(provider),
       taskDir: taskDirectory(config.dataDir, entry.taskId),
     });
 
@@ -1180,7 +1180,7 @@ export class Orchestrator {
       signal,
       timeoutMs: Math.min(settings.taskTimeoutMinutes, 30) * 60_000,
       outputSchema: REVIEW_SCHEMA as unknown as Record<string, unknown>,
-      env: buildGitEnv(provider.gitAuthorizationHeader()),
+      env: this.engineEnv(provider),
       taskDir: taskDirectory(config.dataDir, entry.taskId),
     });
 
@@ -1287,7 +1287,7 @@ export class Orchestrator {
         signal: input.signal,
         timeoutMs: REVIEW_VERDICT_REPAIR_TIMEOUT_MS,
         outputSchema: REVIEW_SCHEMA as unknown as Record<string, unknown>,
-        env: buildGitEnv(input.provider.gitAuthorizationHeader()),
+        env: this.engineEnv(input.provider),
         // Every re-ask gets its own scratch directory so `prompt.md` and
         // `last-message.md` of earlier attempts stay on disk for inspection.
         taskDir: path.join(
@@ -1382,7 +1382,7 @@ export class Orchestrator {
       log,
       signal,
       timeoutMs: settings.taskTimeoutMinutes * 60_000,
-      env: buildGitEnv(provider.gitAuthorizationHeader()),
+      env: this.engineEnv(provider),
       taskDir: taskDirectory(config.dataDir, entry.taskId),
     });
 
@@ -1548,6 +1548,20 @@ export class Orchestrator {
   }
 
   // ----------------------------------------------------------------- helpers
+
+  /**
+   * Environment for a `codex exec` run: it carries the account token for git
+   * and, when the account has a proxy, the proxy variables so anything the
+   * agent runs (including its own model traffic) can reach the network too.
+   * Without a proxy the inherited environment stays untouched.
+   */
+  private engineEnv(provider: GitProvider): NodeJS.ProcessEnv {
+    const proxy = provider.proxyUrl;
+    return buildGitEnv({
+      authHeader: provider.gitAuthorizationHeader(),
+      proxy: proxy ? { url: proxy } : undefined,
+    });
+  }
 
   private currentEngine(taskId: string): EngineId {
     return this.deps.store.getTask(taskId)?.engine ?? 'codex';

@@ -11,7 +11,7 @@ autogit/
 │       ├── providers/        # GitHub / Gitea / Gitee 适配层
 │       ├── services/         # 编排、标签、工作区、Codex、设置、事件总线
 │       ├── routes/           # HTTP 接口
-│       ├── dev/simulate.ts   # 端到端模拟脚本
+│       ├── dev/              # 端到端模拟脚本、代理链路自检脚本
 │       └── index.ts          # 服务入口（含生产环境前端托管）
 └── apps/web/                 # React 控制台
 ```
@@ -36,14 +36,14 @@ flowchart LR
 
 | 表 | 用途 | 关键字段 |
 | --- | --- | --- |
-| `accounts` | Git 账号 | `provider`、`base_url`、`token_enc`（AES-256-GCM）、`status` |
+| `accounts` | Git 账号 | `provider`、`base_url`、`token_enc`（AES-256-GCM）、`status`、`proxy_mode`、`proxy_url_enc` |
 | `repositories` | 已导入仓库 | `full_name`、`default_branch`、`clone_url`、`enabled`、`labels_initialized` |
 | `issues` | Issue 快照 | `number`、`labels`(JSON)、`state`、`updated_at`（远端时间） |
 | `pull_requests` | PR 快照 | `number`、`merged`、`head_ref`、`issue_number`（由分支名/正文推导） |
 | `tasks` | 任务与结果 | `kind`(implement/review/fix)、`status`、`engine`、`priority`、`branch`、`pr_url` |
 | `task_logs` | 逐行日志 | `task_id`、`stream`(system/stdout/stderr/agent/command/git)、`message` |
 | `activity` | 操作流水 | `level`、`scope`、`repository_id`、`message` |
-| `settings` | 全局设置 | JSON 值，键与 `AppSettings` 字段一一对应 |
+| `settings` | 全局设置 | JSON 值，键与 `AppSettings` 字段一一对应；`proxy` 键存代理通道（地址加密） |
 | `schema_migrations` | 迁移版本 | 迁移在事务中执行，启动时自动补齐 |
 
 SQLite 通过 Node 内置的 `node:sqlite`（`DatabaseSync`）访问，启用 WAL 与外键约束，所有写入都在 `Store` 内集中处理，避免 SQL 散落。
@@ -79,6 +79,7 @@ SQLite 通过 Node 内置的 `node:sqlite`（`DatabaseSync`）访问，启用 WA
 `GitProvider` 接口把三个平台的差异收敛成 16 个方法（用户、仓库、标签、Issue、评论、PR、Git 认证头）。共同点：
 
 - 使用 `fetch` + 统一重试（429/5xx，最多 3 次），超时 30s；
+- 未配置代理时走平台 `fetch`；配置了代理则改走 `util/proxy-http.ts` 的代理客户端（HTTP 绝对形式 / CONNECT 隧道 / SOCKS5），行为与重试策略一致；
 - 分页统一走 `ApiClient.paginate()`，兼容 `per_page` 与 `limit` 两种参数名；
 - 标签写入统一使用「替换语义」的接口（`PUT .../labels`），避免增量操作产生的竞态；
 - Git 认证头由 Provider 提供（GitHub 用 `x-access-token`、Gitea/Gitee 用 `用户名:Token` 的 Basic 认证）。
@@ -104,12 +105,37 @@ SQLite 通过 Node 内置的 `node:sqlite`（`DatabaseSync`）访问，启用 WA
 
 ## 6. 前端
 
-- 路由：`/`（总览）、`/accounts`、`/repositories`、`/repositories/:id`、`/tasks`、`/codex`、`/labels`、`/settings`。
+- 路由：`/`（总览）、`/accounts`、`/repositories`、`/repositories/:id`、`/tasks`、`/codex`、`/proxy`、`/labels`、`/settings`。
 - 数据：TanStack Query 负责缓存与失效，WebSocket 事件到达时精确失效对应 query key。
 - 日志：`logStore` 用 `useSyncExternalStore` 维护按任务分桶的环形缓冲（4000 行），高频日志不会引起整页重渲染。
 - 设计系统：`styles.css` 中的 `panel` / `btn` / `chip` / `input` 等基础类 + Tailwind 工具类；暗色主题，动效集中在面板进场与状态切换。
 
-## 7. 扩展点
+## 7. 代理链路
+
+网络出口在 AutoGit 里是一条独立链路，目标是「不依赖任何第三方代理库，也能让 git 与 REST 请求走同一个出口」。
+
+```mermaid
+flowchart LR
+    CFG[ProxyService 全局双通道] --> RES{账号 proxy_mode 解析}
+    ACC[账号自定义代理] --> RES
+    RES -->|解析出代理地址| CLI[util/http-request.ts]
+    CLI -->|无代理| FETCH[平台 fetch]
+    CLI -->|http 目标| ABS[绝对形式转发]
+    CLI -->|https 目标| CONNECT[CONNECT 隧道]
+    CLI -->|socks5 / socks5h| SOCKS[SOCKS5 握手 + 隧道]
+    RES --> GENV[buildGitEnv]
+    GENV -->|http.proxy + 代理环境变量| GIT[git clone / fetch / push]
+    GENV -->|HTTP_PROXY 等| CODEX[codex exec 子进程]
+```
+
+- **双通道**：`http` 是合并后的 HTTP(S) 通道——明文 http 目标用绝对形式转发，https 目标用它做 `CONNECT` 隧道；`socks5` 同样覆盖两种目标，`socks5h://` 表示由代理解析域名。通道地址接受 `http://`、`https://`、`socks5://`、`socks5h://`，允许内嵌 `用户名:密码`（`https://` 表示到代理本身也走 TLS）。
+- **解析顺序**：账号 `proxy_mode` 决定通道（`inherit` 跟随全局默认，`http`/`socks5` 固定走某个通道，`direct` 强制直连，`custom` 用账号自己的地址）。所选通道为空时回退到另一个（`http → socks5`，`socks5 → http`），因此只填一个地址就能让全部流量走代理。总开关关闭时一律直连，并清掉继承来的代理环境变量。旧版本的 `auto` / `https` 模式在读取时映射到 `http`，旧的 `endpoints.https` 地址合并进 HTTP(S) 通道（优先采用，因为它已验证过 CONNECT）。
+- **git**：通过 `GIT_CONFIG_*` 注入 `http.proxy`，同时写入 `HTTP_PROXY/HTTPS_PROXY/ALL_PROXY` 及小写变体；因为代理地址可能带凭据，注入时会追加一条空的 `credential.helper`，避免 Git Credential Manager 去探测代理主机（实测会挂起数分钟）。
+- **Codex CLI**：配置了代理的账号会把代理变量传给 `codex exec`，让模型请求也走同一出口；没配置代理时不改动继承的环境变量。
+- **连通性测试**：`POST /api/proxy/test` 对「直连 + 各通道」或单个账号并发执行两项检查——`GET github api`（跟随重定向、解压 gzip、超时可控）与真实 `git ls-remote`，结果按检查项返回状态码、耗时与可读错误；测试支持使用未保存的草稿地址。
+- **自检脚本**：`pnpm --filter @autogit/server proxy:check` 会在本机起「源站 + HTTP 代理 + 需认证的 HTTP 代理 + SOCKS5（含账号密码）」，覆盖绝对形式、CONNECT 隧道、认证失败、重定向、gzip、错误码映射等断言；加 `-- --online` 还会用真实 `https://api.github.com/` 验证 TLS 隧道。
+
+## 8. 扩展点
 
 **新增一个 Git 平台**：实现 `GitProvider`（可继承 `ApiClient` 复用重试与分页）→ 在 `providers/index.ts` 的工厂中注册 → 在 `packages/shared/src/types.ts` 的 `PROVIDER_KINDS` / `PROVIDER_META` 中补充元数据。前端会自动出现该平台选项。
 

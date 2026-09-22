@@ -1,7 +1,9 @@
 import {
   type Account,
   PROVIDER_META,
+  PROXY_MODE_LABELS,
   type ProviderKind,
+  type ProxyMode,
   type RemoteRepositorySummary,
 } from '@autogit/shared';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
@@ -43,6 +45,8 @@ interface FormState {
   baseUrl: string;
   token: string;
   verify: boolean;
+  proxyMode: ProxyMode;
+  proxyUrl: string;
 }
 
 const EMPTY_FORM: FormState = {
@@ -51,6 +55,8 @@ const EMPTY_FORM: FormState = {
   baseUrl: '',
   token: '',
   verify: true,
+  proxyMode: 'inherit',
+  proxyUrl: '',
 };
 
 export function AccountsPage(): ReactNode {
@@ -70,6 +76,10 @@ export function AccountsPage(): ReactNode {
         baseUrl: form.baseUrl.trim() || undefined,
         token: form.token.trim(),
         verify: form.verify,
+        proxyMode: form.proxyMode,
+        ...(form.proxyMode === 'custom' && form.proxyUrl.trim()
+          ? { proxyUrl: form.proxyUrl.trim() }
+          : {}),
       }),
     onSuccess: () => {
       toast.success('账号已添加');
@@ -88,6 +98,10 @@ export function AccountsPage(): ReactNode {
         baseUrl: form.baseUrl.trim() || undefined,
         token: form.token.trim() || undefined,
         verify: form.verify,
+        proxyMode: form.proxyMode,
+        ...(form.proxyMode === 'custom' && form.proxyUrl.trim()
+          ? { proxyUrl: form.proxyUrl.trim() }
+          : {}),
       }),
     onSuccess: () => {
       toast.success('账号已更新');
@@ -210,6 +224,7 @@ export function AccountsPage(): ReactNode {
                     value={<span className="font-mono">{account.tokenPreview ?? '—'}</span>}
                   />
                   <InfoRow label="仓库" value={`${account.repositoryCount} 个已导入`} />
+                  <InfoRow label="代理" value={describeAccountProxy(account)} />
                   <InfoRow label="最近校验" value={formatRelative(account.lastCheckedAt)} />
                 </div>
 
@@ -266,6 +281,8 @@ export function AccountsPage(): ReactNode {
                         baseUrl: account.baseUrl,
                         token: '',
                         verify: true,
+                        proxyMode: account.proxyMode,
+                        proxyUrl: '',
                       });
                     }}
                     title="编辑"
@@ -429,12 +446,57 @@ export function AccountsPage(): ReactNode {
             label="保存前验证连接"
             description="会调用 /user 接口确认 Token 有效，并记录账号头像与用户名。"
           />
+
+          <Field label="代理" hint="默认跟随「代理配置」页面的全局设置">
+            <select
+              className="select"
+              value={form.proxyMode}
+              onChange={(event) => setForm({ ...form, proxyMode: event.target.value as ProxyMode })}
+            >
+              {(Object.keys(PROXY_MODE_LABELS) as ProxyMode[]).map((mode) => (
+                <option key={mode} value={mode}>
+                  {PROXY_MODE_LABELS[mode]}
+                </option>
+              ))}
+            </select>
+          </Field>
+
+          {form.proxyMode === 'custom' && (
+            <Field
+              label="账号专用代理地址"
+              hint={
+                editing?.proxyConfigured
+                  ? `已保存：${editing.proxyUrl ?? '（已配置）'}，留空表示不修改`
+                  : '例如 socks5h://127.0.0.1:1080'
+              }
+            >
+              <input
+                className="input font-mono text-xs"
+                placeholder="http://127.0.0.1:7890"
+                value={form.proxyUrl}
+                onChange={(event) => setForm({ ...form, proxyUrl: event.target.value })}
+              />
+            </Field>
+          )}
+
+          <p className="text-[11px] leading-relaxed text-slate-500">
+            代理会影响该账号的 Issue / PR 读取、git fetch / push，以及执行任务的 Codex CLI
+            环境变量。未配置代理时使用本机直连。
+          </p>
         </div>
       </Modal>
 
       <RepositoryBrowserModal account={browsing} onClose={() => setBrowsing(null)} />
     </div>
   );
+}
+
+function describeAccountProxy(account: Account): string {
+  if (account.proxyMode === 'custom') {
+    return account.proxyUrl ? `单独代理 ${account.proxyUrl}` : '单独代理（未填写地址）';
+  }
+  if (account.proxyMode === 'inherit') return '跟随全局配置';
+  return PROXY_MODE_LABELS[account.proxyMode];
 }
 
 function RepositoryBrowserModal({

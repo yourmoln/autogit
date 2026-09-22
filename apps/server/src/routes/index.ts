@@ -3,6 +3,7 @@ import type { FastifyInstance } from 'fastify';
 import type { AppContext } from '../context.js';
 import { registerAccountRoutes } from './accounts.js';
 import { registerCodexRoutes } from './codex.js';
+import { registerProxyRoutes } from './proxy.js';
 import { registerRepositoryRoutes } from './repositories.js';
 import { registerSettingsRoutes } from './settings.js';
 import { registerSystemRoutes } from './system.js';
@@ -14,5 +15,6 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
   registerRepositoryRoutes(app, ctx);
   registerTaskRoutes(app, ctx);
   registerCodexRoutes(app, ctx);
+  registerProxyRoutes(app, ctx);
   registerSettingsRoutes(app, ctx);
 }

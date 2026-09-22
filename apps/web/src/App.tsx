@@ -6,6 +6,7 @@ import { AccountsPage } from './pages/AccountsPage.js';
 import { CodexPage } from './pages/CodexPage.js';
 import { DashboardPage } from './pages/DashboardPage.js';
 import { LabelsPage } from './pages/LabelsPage.js';
+import { ProxyPage } from './pages/ProxyPage.js';
 import { RepositoriesPage } from './pages/RepositoriesPage.js';
 import { RepositoryDetailPage } from './pages/RepositoryDetailPage.js';
 import { SettingsPage } from './pages/SettingsPage.js';
@@ -21,6 +22,7 @@ export function App(): ReactNode {
         <Route path="/repositories/:id" element={<RepositoryDetailPage />} />
         <Route path="/tasks" element={<TasksPage />} />
         <Route path="/codex" element={<CodexPage />} />
+        <Route path="/proxy" element={<ProxyPage />} />
         <Route path="/labels" element={<LabelsPage />} />
         <Route path="/settings" element={<SettingsPage />} />
         <Route path="*" element={<Navigate to="/" replace />} />

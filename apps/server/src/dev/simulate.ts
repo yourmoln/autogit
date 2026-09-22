@@ -33,6 +33,7 @@ import { EventBus } from '../services/events.js';
 import { LabelService } from '../services/labels.js';
 import { Orchestrator } from '../services/orchestrator.js';
 import { ProviderFactory } from '../services/providers.js';
+import { ProxyService } from '../services/proxy.js';
 import type { EngineRunInput, EngineRunResult } from '../services/runner.js';
 import { EngineRunner } from '../services/runner.js';
 import { SettingsService } from '../services/settings.js';
@@ -50,6 +51,7 @@ interface StubState {
 class StubProvider implements GitProvider {
   readonly kind: ProviderKind = 'github';
   readonly baseUrl = 'http://stub.local';
+  readonly proxyUrl = null;
   readonly state: StubState = {
     labels: new Set<string>(),
     issues: new Map(),
@@ -395,7 +397,9 @@ async function main(): Promise<void> {
 
   const events = new EventBus();
   const provider = new StubProvider(cloneUrl);
-  const providers = new ProviderFactory(store, Buffer.alloc(32, 7));
+  const secretKey = Buffer.alloc(32, 7);
+  const proxy = new ProxyService(store, secretKey);
+  const providers = new ProviderFactory(store, secretKey, proxy);
   Object.assign(providers, { forAccount: () => provider });
 
   const codex = new CodexService(config, settings, events);

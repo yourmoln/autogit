@@ -10,6 +10,10 @@ import type {
   LabelSyncResult,
   OrchestratorStatus,
   ProviderKind,
+  ProxyConfigPayload,
+  ProxySettings,
+  ProxySlot,
+  ProxyTestReport,
   RemoteRepositorySummary,
   Repository,
   RepositoryOverview,
@@ -115,6 +119,8 @@ export const api = {
       baseUrl?: string;
       token: string;
       verify?: boolean;
+      proxyMode?: Account['proxyMode'];
+      proxyUrl?: string | null;
     }) =>
       request<{ account: Account }>('/api/accounts', {
         method: 'POST',
@@ -122,7 +128,14 @@ export const api = {
       }),
     update: (
       id: string,
-      body: { name?: string; baseUrl?: string; token?: string; verify?: boolean },
+      body: {
+        name?: string;
+        baseUrl?: string;
+        token?: string;
+        verify?: boolean;
+        proxyMode?: Account['proxyMode'];
+        proxyUrl?: string | null;
+      },
     ) =>
       request<{ account: Account }>(`/api/accounts/${id}`, {
         method: 'PATCH',
@@ -253,6 +266,36 @@ export const api = {
     update: (body: Partial<AppSettings>) =>
       request<{ settings: AppSettings }>('/api/settings', {
         method: 'PUT',
+        body: JSON.stringify(body),
+      }),
+  },
+
+  proxy: {
+    get: () => request<{ config: ProxyConfigPayload }>('/api/proxy'),
+    update: (body: {
+      settings?: Partial<ProxySettings>;
+      /** `null` 清除通道，缺省表示保持不变。 */
+      httpProxy?: string | null;
+      socks5Proxy?: string | null;
+    }) =>
+      request<{ config: ProxyConfigPayload }>('/api/proxy', {
+        method: 'PUT',
+        body: JSON.stringify(body),
+      }),
+    test: (
+      body: {
+        slots?: ProxySlot[];
+        accountId?: string;
+        includeGit?: boolean;
+        timeoutMs?: number;
+        draft?: {
+          httpProxy?: string | null;
+          socks5Proxy?: string | null;
+        };
+      } = {},
+    ) =>
+      request<{ report: ProxyTestReport }>('/api/proxy/test', {
+        method: 'POST',
         body: JSON.stringify(body),
       }),
   },

@@ -1,16 +1,18 @@
-import type {
-  Account,
-  AccountStatus,
-  ActivityEntry,
-  EngineId,
-  LogStream,
-  ProviderKind,
-  Repository,
-  Task,
-  TaskKind,
-  TaskLogLine,
-  TaskPriority,
-  TaskStatus,
+import {
+  type Account,
+  type AccountStatus,
+  type ActivityEntry,
+  type EngineId,
+  type LogStream,
+  PROXY_MODES,
+  type ProviderKind,
+  type ProxyMode,
+  type Repository,
+  type Task,
+  type TaskKind,
+  type TaskLogLine,
+  type TaskPriority,
+  type TaskStatus,
 } from '@autogit/shared';
 
 import { msBetween, nowIso } from '../util/time.js';
@@ -18,6 +20,8 @@ import { bool, type Db, fromBool, parseJsonArray, type SqlValue } from './databa
 
 export interface AccountRecord extends Account {
   tokenEnc: string;
+  /** Encrypted account level proxy address, `null` when none is stored. */
+  proxyUrlEnc: string | null;
 }
 
 export interface RepositoryRecord extends Repository {}
@@ -126,6 +130,8 @@ interface AccountDbRow {
   display_name: string | null;
   avatar_url: string | null;
   token_enc: string;
+  proxy_mode: string | null;
+  proxy_url_enc: string | null;
   status: string;
   status_message: string | null;
   created_at: string;
@@ -207,12 +213,14 @@ export class Store {
     avatarUrl: string | null;
     status: AccountStatus;
     statusMessage: string | null;
+    proxyMode?: ProxyMode;
+    proxyUrlEnc?: string | null;
   }): AccountRecord {
     const ts = nowIso();
     this.db.run(
       `INSERT INTO accounts (id, name, provider, base_url, username, display_name, avatar_url, token_enc,
-        status, status_message, created_at, updated_at, last_checked_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+        status, status_message, created_at, updated_at, last_checked_at, proxy_mode, proxy_url_enc)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
       [
         input.id,
         input.name,
@@ -226,6 +234,8 @@ export class Store {
         input.statusMessage,
         ts,
         ts,
+        input.proxyMode ?? 'inherit',
+        input.proxyUrlEnc ?? null,
       ],
     );
     const record = this.getAccount(input.id);
@@ -244,6 +254,8 @@ export class Store {
       avatarUrl?: string | null;
       status?: AccountStatus;
       statusMessage?: string | null;
+      proxyMode?: ProxyMode;
+      proxyUrlEnc?: string | null;
     },
   ): AccountRecord | null {
     const sets: string[] = [];
@@ -262,6 +274,8 @@ export class Store {
     if (patch.avatarUrl !== undefined) assign('avatar_url', patch.avatarUrl);
     if (patch.status !== undefined) assign('status', patch.status);
     if (patch.statusMessage !== undefined) assign('status_message', patch.statusMessage);
+    if (patch.proxyMode !== undefined) assign('proxy_mode', patch.proxyMode);
+    if (patch.proxyUrlEnc !== undefined) assign('proxy_url_enc', patch.proxyUrlEnc);
 
     assign('updated_at', nowIso());
     params.push(id);
@@ -894,7 +908,18 @@ function mapAccount(row: AccountDbRow): AccountRecord {
     tokenPreview: null,
     repositoryCount: Number(row.repository_count ?? 0),
     tokenEnc: row.token_enc,
+    proxyUrlEnc: row.proxy_url_enc,
+    proxyMode: normalizeProxyMode(row.proxy_mode),
+    proxyUrl: null,
+    proxyConfigured: Boolean(row.proxy_url_enc),
   };
+}
+
+function normalizeProxyMode(value: string | null | undefined): ProxyMode {
+  // `auto` and `https` are left over from the version that had separate HTTP
+  // and HTTPS channels; both now mean "use the merged HTTP(S) proxy".
+  if (value === 'auto' || value === 'https') return 'http';
+  return PROXY_MODES.includes(value as ProxyMode) ? (value as ProxyMode) : 'inherit';
 }
 
 function mapRepository(row: RepositoryDbRow): RepositoryRecord {

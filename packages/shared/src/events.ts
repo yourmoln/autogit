@@ -30,6 +30,11 @@ export interface AccountEvent {
   accountId: string;
 }
 
+export interface ProxyEvent {
+  type: 'proxy.updated';
+  at: string;
+}
+
 export interface OrchestratorEvent {
   type: 'orchestrator.tick';
   at: string;
@@ -56,6 +61,7 @@ export type RealtimeEvent =
   | ActivityEvent
   | RepositoryEvent
   | AccountEvent
+  | ProxyEvent
   | OrchestratorEvent
   | CodexInstallEvent
   | NoticeEvent;

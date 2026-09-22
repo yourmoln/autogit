@@ -40,6 +40,10 @@ export function useRealtimeBridge(): void {
         case 'account.updated':
           void queryClient.invalidateQueries({ queryKey: ['accounts'] });
           break;
+        case 'proxy.updated':
+          void queryClient.invalidateQueries({ queryKey: ['proxy'] });
+          void queryClient.invalidateQueries({ queryKey: ['accounts'] });
+          break;
         case 'orchestrator.tick':
           void queryClient.invalidateQueries({ queryKey: ['overview'] });
           void queryClient.invalidateQueries({ queryKey: ['orchestrator'] });

@@ -1,3 +1,5 @@
+import { describeNetworkError, requestText } from '../util/http-request.js';
+
 export type AuthScheme = 'bearer' | 'token' | 'basic';
 
 export interface AuthConfig {
@@ -14,6 +16,8 @@ export interface ApiClientOptions {
   userAgent?: string;
   headers?: Record<string, string>;
   timeoutMs?: number;
+  /** Proxy resolved for the owning account, `null` means direct. */
+  proxyUrl?: string | null;
 }
 
 export interface RequestOptions {
@@ -130,22 +134,24 @@ export class ApiClient {
     let lastError: unknown = null;
     for (let attempt = 0; attempt < 3; attempt += 1) {
       try {
-        const response = await fetch(url, {
+        const response = await requestText({
+          url,
           method,
           headers,
-          body,
-          signal: AbortSignal.timeout(timeout),
+          body: body ?? null,
+          timeoutMs: timeout,
+          proxyUrl: this.options.proxyUrl ?? null,
         });
 
         if (RETRY_STATUS.has(response.status) && attempt < 2) {
-          const retryAfter = Number(response.headers.get('retry-after') ?? '0');
+          const retryAfter = Number(response.headers['retry-after'] ?? '0');
           const waitMs = retryAfter > 0 ? Math.min(retryAfter * 1000, 5000) : 500 * (attempt + 1);
           await new Promise((resolve) => setTimeout(resolve, waitMs));
           continue;
         }
 
-        const text = await response.text();
-        if (!response.ok) {
+        const text = response.body;
+        if (response.status < 200 || response.status >= 300) {
           throw new ApiError(response.status, url, text);
         }
         if (!text) return undefined as T;
@@ -161,9 +167,7 @@ export class ApiClient {
         await new Promise((resolve) => setTimeout(resolve, 400 * (attempt + 1)));
       }
     }
-    throw new Error(
-      `请求失败：${lastError instanceof Error ? lastError.message : String(lastError)} (${url})`,
-    );
+    throw new Error(`请求失败：${describeNetworkError(lastError, timeout)} (${url})`);
   }
 
   get<T>(path: string, options: RequestOptions = {}): Promise<T> {

@@ -1,4 +1,10 @@
-import { type Account, PROVIDER_META, type ProviderKind } from '@autogit/shared';
+import {
+  type Account,
+  maskProxyUrl,
+  normalizeProxyUrl,
+  PROVIDER_META,
+  type ProviderKind,
+} from '@autogit/shared';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 
@@ -8,12 +14,16 @@ import { describeProviderError } from '../services/providers.js';
 import { maskSecret, randomId } from '../util/crypto.js';
 import { HttpError, parseOrThrow } from '../util/http.js';
 
+const proxyModeSchema = z.enum(['inherit', 'direct', 'http', 'socks5', 'custom']);
+
 const createSchema = z.object({
   name: z.string().min(1, '账号名称不能为空').max(80),
   provider: z.enum(['github', 'gitea', 'gitee']),
   baseUrl: z.string().min(1).optional(),
   token: z.string().min(8, 'Token 看起来太短'),
   verify: z.boolean().optional(),
+  proxyMode: proxyModeSchema.optional(),
+  proxyUrl: z.string().max(500).nullable().optional(),
 });
 
 const updateSchema = z.object({
@@ -21,7 +31,21 @@ const updateSchema = z.object({
   baseUrl: z.string().min(1).optional(),
   token: z.string().min(8).optional(),
   verify: z.boolean().optional(),
+  proxyMode: proxyModeSchema.optional(),
+  /** `null` 清除账号级代理地址，缺省表示保持不变。 */
+  proxyUrl: z.string().max(500).nullable().optional(),
 });
+
+/** Validates an account level proxy address and returns the normalized form. */
+function accountProxyUrl(raw: string | null | undefined): string | null {
+  const trimmed = raw?.trim() ?? '';
+  if (trimmed.length === 0) return null;
+  try {
+    return normalizeProxyUrl(trimmed);
+  } catch (error) {
+    throw new HttpError(400, error instanceof Error ? error.message : String(error));
+  }
+}
 
 function defaultBaseUrl(provider: ProviderKind, baseUrl?: string): string {
   if (baseUrl && baseUrl.trim().length > 0) return baseUrl.trim();
@@ -39,8 +63,12 @@ function serializeAccount(account: AccountRecord, ctx: AppContext): Account {
   } catch {
     tokenPreview = '无法解密';
   }
-  const { tokenEnc: _tokenEnc, ...rest } = account;
-  return { ...rest, tokenPreview };
+  const { tokenEnc: _tokenEnc, proxyUrlEnc: _proxyUrlEnc, ...rest } = account;
+  return {
+    ...rest,
+    tokenPreview,
+    proxyUrl: maskProxyUrl(ctx.proxy.decryptEndpoint(account.proxyUrlEnc)),
+  };
 }
 
 export function registerAccountRoutes(app: FastifyInstance, ctx: AppContext): void {
@@ -54,11 +82,14 @@ export function registerAccountRoutes(app: FastifyInstance, ctx: AppContext): vo
   app.post('/api/accounts', async (request, reply) => {
     const body = parseOrThrow(createSchema, request.body, '账号信息');
     const baseUrl = defaultBaseUrl(body.provider, body.baseUrl);
+    const proxyMode = body.proxyMode ?? 'inherit';
+    const proxyUrl = accountProxyUrl(body.proxyUrl);
     const provider = ctx.providers.create({
       provider: body.provider,
       baseUrl,
       username: null,
       token: body.token,
+      proxyUrl: ctx.proxy.resolve(proxyMode, proxyUrl).url,
     });
 
     let username: string | null = null;
@@ -91,6 +122,8 @@ export function registerAccountRoutes(app: FastifyInstance, ctx: AppContext): vo
       avatarUrl,
       status,
       statusMessage,
+      proxyMode,
+      proxyUrlEnc: proxyUrl ? ctx.proxy.encryptEndpoint(proxyUrl) : null,
     });
     ctx.providers.invalidate(account.id);
     ctx.events.emit({ type: 'account.updated', accountId: account.id });
@@ -114,14 +147,27 @@ export function registerAccountRoutes(app: FastifyInstance, ctx: AppContext): vo
     if (body.name) patch.name = body.name;
     if (body.baseUrl) patch.baseUrl = body.baseUrl.trim();
     if (body.token) patch.tokenEnc = ctx.providers.encrypt(body.token);
+    if (body.proxyMode) patch.proxyMode = body.proxyMode;
+    if (body.proxyUrl !== undefined) {
+      const proxyUrl = accountProxyUrl(body.proxyUrl);
+      patch.proxyUrlEnc = proxyUrl ? ctx.proxy.encryptEndpoint(proxyUrl) : null;
+    }
 
-    const needsVerify = Boolean(body.token || body.baseUrl) && body.verify !== false;
+    const proxyChanged = body.proxyMode !== undefined || body.proxyUrl !== undefined;
+    const needsVerify =
+      Boolean(body.token || body.baseUrl || proxyChanged) && body.verify !== false;
     if (needsVerify) {
+      const proxyMode = patch.proxyMode ?? existing.proxyMode;
+      const proxyUrl =
+        patch.proxyUrlEnc !== undefined
+          ? ctx.proxy.decryptEndpoint(patch.proxyUrlEnc)
+          : ctx.proxy.decryptEndpoint(existing.proxyUrlEnc);
       const provider = ctx.providers.create({
         provider: existing.provider,
         baseUrl: patch.baseUrl ?? existing.baseUrl,
         username: existing.username,
         token: body.token ?? ctx.providers.decrypt(existing.tokenEnc),
+        proxyUrl: ctx.proxy.resolve(proxyMode, proxyUrl).url,
       });
       try {
         const user = await provider.getCurrentUser();
@@ -168,6 +214,7 @@ export function registerAccountRoutes(app: FastifyInstance, ctx: AppContext): vo
       baseUrl: account.baseUrl,
       username: account.username,
       token: ctx.providers.decrypt(account.tokenEnc),
+      proxyUrl: ctx.proxy.resolveForAccount(account).url,
     });
 
     try {

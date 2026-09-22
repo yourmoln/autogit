@@ -109,15 +109,18 @@ function fullNameOf(repo: GiteeRepository): string {
 export class GiteeProvider implements GitProvider {
   readonly kind: ProviderKind = 'gitee';
   readonly baseUrl: string;
+  readonly proxyUrl: string | null;
   private readonly client: ApiClient;
 
   constructor(private readonly account: ProviderAccount) {
     this.baseUrl = normalizeBaseUrlFor(account.baseUrl);
+    this.proxyUrl = account.proxyUrl ?? null;
     this.client = new ApiClient({
       baseUrl: this.baseUrl,
       // Gitee documents the `access_token` query parameter; the header is sent
       // as well so both authentication styles work.
       auth: { scheme: 'bearer', token: account.token, queryParam: 'access_token' },
+      proxyUrl: this.proxyUrl,
     });
   }
 

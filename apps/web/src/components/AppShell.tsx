@@ -6,6 +6,7 @@ import {
   GitBranch,
   LayoutDashboard,
   ListChecks,
+  Network,
   Plug,
   RefreshCw,
   Settings as SettingsIcon,
@@ -30,6 +31,7 @@ const NAV_ITEMS = [
   { to: '/repositories', label: '仓库', icon: GitBranch, hint: '导入仓库并初始化标签' },
   { to: '/tasks', label: '任务', icon: ListChecks, hint: '队列、执行历史与实时日志' },
   { to: '/codex', label: 'Codex CLI', icon: Terminal, hint: '安装、版本与配置' },
+  { to: '/proxy', label: '代理配置', icon: Network, hint: 'HTTP(S) / SOCKS5 代理与连通性' },
   { to: '/labels', label: '标签规范', icon: Tags, hint: 'ai/* 标签语义与流转' },
   { to: '/settings', label: '设置', icon: SettingsIcon, hint: '轮询、并发与提示词' },
 ] as const;
@@ -46,6 +48,10 @@ const PAGE_TITLES: Record<string, { title: string; subtitle: string }> = {
   },
   '/tasks': { title: '任务', subtitle: 'Codex 执行队列、历史记录与逐字实时日志' },
   '/codex': { title: 'Codex CLI', subtitle: '下载安装、版本识别、模型响应探测与 config.toml 管理' },
+  '/proxy': {
+    title: '代理配置',
+    subtitle: '为 git 与平台接口配置 HTTP(S) / SOCKS5 代理，并测试 GitHub 连通性',
+  },
   '/labels': { title: '标签规范', subtitle: '15 个 ai/* 标签的语义、单选分组与流转规则' },
   '/settings': { title: '设置', subtitle: '调度节奏、并发、沙箱与提交身份' },
 };

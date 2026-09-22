@@ -7,6 +7,7 @@ import { EventBus } from './services/events.js';
 import { LabelService } from './services/labels.js';
 import { Orchestrator } from './services/orchestrator.js';
 import { ProviderFactory } from './services/providers.js';
+import { ProxyService } from './services/proxy.js';
 import { EngineRunner } from './services/runner.js';
 import { SettingsService } from './services/settings.js';
 import { WorkspaceManager } from './services/workspace.js';
@@ -18,6 +19,7 @@ export interface AppContext {
   db: Db;
   store: Store;
   settings: SettingsService;
+  proxy: ProxyService;
   events: EventBus;
   providers: ProviderFactory;
   labels: LabelService;
@@ -39,8 +41,9 @@ export function createContext(config: RuntimeConfig): AppContext {
   const store = new Store(db);
   const secretKey = loadOrCreateSecretKey(config.secretKeyPath, process.env.AUTOGIT_SECRET_KEY);
   const settings = new SettingsService(store, config);
+  const proxy = new ProxyService(store, secretKey);
   const events = new EventBus();
-  const providers = new ProviderFactory(store, secretKey);
+  const providers = new ProviderFactory(store, secretKey, proxy);
   const labels = new LabelService({ store, providers, events });
   const codex = new CodexService(config, settings, events);
   const runner = new EngineRunner(config, settings, codex);
@@ -62,6 +65,7 @@ export function createContext(config: RuntimeConfig): AppContext {
     db,
     store,
     settings,
+    proxy,
     events,
     providers,
     labels,

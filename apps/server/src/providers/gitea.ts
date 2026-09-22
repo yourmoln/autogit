@@ -107,14 +107,17 @@ function toNumericId(value: string | number | null): number | null {
 export class GiteaProvider implements GitProvider {
   readonly kind: ProviderKind = 'gitea';
   readonly baseUrl: string;
+  readonly proxyUrl: string | null;
   private readonly client: ApiClient;
 
   constructor(private readonly account: ProviderAccount) {
     this.baseUrl = normalizeBaseUrlFor(account.baseUrl);
+    this.proxyUrl = account.proxyUrl ?? null;
     this.client = new ApiClient({
       baseUrl: this.baseUrl,
       auth: { scheme: 'token', token: account.token },
       headers: { Accept: 'application/json' },
+      proxyUrl: this.proxyUrl,
     });
   }
 

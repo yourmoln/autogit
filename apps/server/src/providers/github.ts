@@ -92,17 +92,26 @@ interface GitHubComment {
   html_url: string;
 }
 
+/** Hosts that serve the GitHub web UI; the REST API lives on a different host. */
+const WEB_HOSTS = new Set(['github.com', 'www.github.com']);
+/** Public REST API host: every endpoint hangs directly off the root. */
+const PUBLIC_API_HOST = 'api.github.com';
+const PUBLIC_API_BASE = `https://${PUBLIC_API_HOST}`;
+
 function normalizeBaseUrlFor(rawBaseUrl: string): string {
   const base = normalizeBaseUrl(rawBaseUrl);
-  if (!base) return 'https://api.github.com';
+  if (!base) return PUBLIC_API_BASE;
+
   const url = new URL(base);
+  const host = url.hostname.toLowerCase();
   if (url.pathname === '/' || url.pathname === '') {
-    if (url.hostname === 'github.com' || url.hostname === 'www.github.com') {
-      return 'https://api.github.com';
-    }
-    return `${base}/api/v3`;
+    if (WEB_HOSTS.has(host)) return PUBLIC_API_BASE;
+    // api.github.com already answers at `/`; `/api/v3` only exists on GitHub
+    // Enterprise Server and turns every call against the public API into a 404.
+    if (host === PUBLIC_API_HOST) return base;
   }
-  return base;
+  if (/\/api\/v3$/.test(base)) return base;
+  return `${base}/api/v3`;
 }
 
 function labelNames(labels: Array<GitHubLabel | string> | undefined): string[] {

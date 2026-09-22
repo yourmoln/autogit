@@ -157,6 +157,56 @@ ${input.diff}
 5. 按给定的 JSON Schema 输出结论（verdict / summary / issues / tests），issues 中每条都要能直接指导修复。`;
 }
 
+/** Human-readable shape of `REVIEW_SCHEMA`, restated in the repair prompt. */
+const REVIEW_VERDICT_SHAPE = `{
+  "verdict": "approve 或 needs_fix",
+  "summary": "中文评审总结：结论与理由",
+  "issues": [
+    {
+      "severity": "blocker / major / minor",
+      "title": "问题标题",
+      "detail": "问题说明",
+      "file": "相关文件路径，不适用时填 null",
+      "line": 12,
+      "suggestion": "修复建议，不适用时填 null"
+    }
+  ],
+  "tests": "验证命令与结果，没有就填 null"
+}`;
+
+/**
+ * Repair prompt for the case where a review run finished but its output could
+ * not be parsed into a verdict.
+ *
+ * Re-asking is far cheaper than a failed review task: the model has already
+ * reached a conclusion, only the serialisation went wrong. So it gets its own
+ * output back together with the exact JSON shape, and is explicitly told not to
+ * re-review or touch the workspace.
+ */
+export function buildVerdictRepairPrompt(input: {
+  previousOutput: string;
+  attempt: number;
+  maxAttempts: number;
+}): string {
+  const previous = truncate(input.previousOutput.trim() || '（上一次输出为空）', 8000);
+  return `你是 AutoGit 的代码评审代理。你上一条消息无法被程序解析成评审结论，现在需要你重新输出结论（第 ${input.attempt}/${input.maxAttempts} 次尝试）。
+
+## 你上一次的输出
+\`\`\`
+${previous}
+\`\`\`
+
+## 你的任务
+1. 不要重新评审，不要读取或修改任何文件，不要运行任何命令。
+2. 只把你已经得出的评审结论重新输出成一个 JSON 对象，必须满足下面的结构。
+3. 只输出 JSON 本身：不要 Markdown 代码块包裹、不要任何解释文字，第一个字符必须是 \`{\`，最后一个字符必须是 \`}\`。
+4. 所有字段都必须出现：顶层 verdict / summary / issues / tests；issues 中每条的 severity / title / detail / file / line / suggestion。没有内容时用 \`null\` 或空数组。
+5. 上一次输出里已有的结论请原样保留，只补齐缺失或格式不对的部分。
+
+## 必须满足的 JSON 结构
+${REVIEW_VERDICT_SHAPE}`;
+}
+
 export function buildFixPrompt(input: {
   repository: PromptRepository;
   pullRequest: RemotePullRequest;

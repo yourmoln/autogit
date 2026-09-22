@@ -1,3 +1,5 @@
+import path from 'node:path';
+
 import {
   applyStatusTransition,
   type EngineId,
@@ -33,16 +35,26 @@ import {
   buildFixPrompt,
   buildImplementPrompt,
   buildReviewPrompt,
+  buildVerdictRepairPrompt,
   type CommentDigest,
   REVIEW_SCHEMA,
 } from './prompts.js';
 import type { ProviderFactory } from './providers.js';
-import { EngineRunner, type ReviewVerdict, type TaskLogger } from './runner.js';
+import {
+  EngineRunner,
+  type EngineRunResult,
+  type ReviewVerdict,
+  type TaskLogger,
+} from './runner.js';
 import type { SettingsService } from './settings.js';
 import type { WorkspaceManager } from './workspace.js';
 
 const AI_MARKER = '<!-- autogit -->';
 const MAX_ATTEMPTS_PER_ITEM = 3;
+/** How many times a review whose output is unparsable is asked to re-output. */
+const REVIEW_VERDICT_REPAIR_ATTEMPTS = 2;
+/** A re-ask only re-serialises an existing conclusion, so it needs a short budget. */
+const REVIEW_VERDICT_REPAIR_TIMEOUT_MS = 5 * 60_000;
 
 export interface OrchestratorDeps {
   config: RuntimeConfig;
@@ -996,18 +1008,26 @@ export class Orchestrator {
 
     if (!result.ok) throw new Error(result.error ?? 'Codex 评审执行失败');
 
-    const verdict =
-      EngineRunner.parseVerdict(result.summary) ?? EngineRunner.parseVerdict(result.output);
+    const { verdict, lastOutput, durationMs } = await this.resolveReviewVerdict({
+      entry,
+      signal,
+      cwd,
+      provider,
+      log,
+      first: result,
+    });
     if (!verdict) {
       await provider.createComment(
         ref,
         prNumber,
-        `${AI_MARKER}\n## 🤖 AI 评审未能给出结论\n\n模型输出没有包含可解析的评审结论，请人工查看任务日志。\n\n<details><summary>原始输出</summary>\n\n\`\`\`\n${result.summary.slice(0, 4000)}\n\`\`\`\n\n</details>`,
+        `${AI_MARKER}\n## 🤖 AI 评审未能给出结论\n\n模型输出没有包含可解析的评审结论；已要求模型重新输出 ${REVIEW_VERDICT_REPAIR_ATTEMPTS} 次仍未成功，请人工查看任务日志。\n\n<details><summary>原始输出</summary>\n\n\`\`\`\n${lastOutput.slice(0, 4000)}\n\`\`\`\n\n</details>`,
       );
-      throw new Error('无法从 Codex 输出中解析评审结论');
+      throw new Error(
+        `无法从 Codex 输出中解析评审结论（已要求模型重新输出 ${REVIEW_VERDICT_REPAIR_ATTEMPTS} 次）`,
+      );
     }
 
-    const body = renderReviewComment(verdict, result.durationMs);
+    const body = renderReviewComment(verdict, durationMs);
     await provider.createComment(ref, prNumber, body);
 
     if (verdict.verdict === 'approve') {
@@ -1042,6 +1062,90 @@ export class Orchestrator {
       repositoryId: repository.id,
       message: `PR #${prNumber} 评审发现问题（${verdict.issues.length} 条），已转 ai/needs-fix`,
     });
+  }
+
+  /**
+   * Resolves the verdict of a finished review run.
+   *
+   * A review can exit successfully yet return text that carries no
+   * machine-readable verdict: prose instead of the requested JSON, a truncated
+   * object, an unexpected enum value. The model already reached a conclusion in
+   * that case, so instead of failing the task we hand its own output back and
+   * ask it to re-serialise the conclusion. Only when every re-ask fails does the
+   * caller report an unparsable verdict.
+   */
+  private async resolveReviewVerdict(input: {
+    entry: QueueEntry;
+    signal: AbortSignal;
+    cwd: string;
+    provider: GitProvider;
+    log: TaskLogger;
+    first: EngineRunResult;
+  }): Promise<{ verdict: ReviewVerdict | null; lastOutput: string; durationMs: number }> {
+    let lastOutput = input.first.summary.trim() || input.first.output.trim();
+    // Re-asks are part of the review, so their runtime belongs in the report.
+    let durationMs = input.first.durationMs;
+
+    const direct = EngineRunner.parseVerdictFrom(input.first.summary, input.first.output);
+    if (direct) return { verdict: direct, lastOutput, durationMs };
+
+    for (let attempt = 1; attempt <= REVIEW_VERDICT_REPAIR_ATTEMPTS; attempt += 1) {
+      this.appendLog(
+        input.entry.taskId,
+        'system',
+        `评审输出无法解析为结论，要求模型重新输出（第 ${attempt}/${REVIEW_VERDICT_REPAIR_ATTEMPTS} 次）`,
+      );
+
+      const repair = await this.deps.runner.run({
+        taskId: input.entry.taskId,
+        engine: this.currentEngine(input.entry.taskId),
+        cwd: input.cwd,
+        prompt: buildVerdictRepairPrompt({
+          previousOutput: lastOutput,
+          attempt,
+          maxAttempts: REVIEW_VERDICT_REPAIR_ATTEMPTS,
+        }),
+        log: input.log,
+        signal: input.signal,
+        timeoutMs: REVIEW_VERDICT_REPAIR_TIMEOUT_MS,
+        outputSchema: REVIEW_SCHEMA as unknown as Record<string, unknown>,
+        env: buildGitEnv(input.provider.gitAuthorizationHeader()),
+        // Every re-ask gets its own scratch directory so `prompt.md` and
+        // `last-message.md` of earlier attempts stay on disk for inspection.
+        taskDir: path.join(
+          taskDirectory(this.deps.config.dataDir, input.entry.taskId),
+          `verdict-retry-${attempt}`,
+        ),
+      });
+
+      durationMs += repair.durationMs;
+
+      if (repair.aborted) throw new Error('任务已取消');
+
+      const raw = repair.summary.trim() || repair.output.trim();
+      if (raw) lastOutput = raw;
+
+      if (!repair.ok) {
+        this.appendLog(
+          input.entry.taskId,
+          'stderr',
+          `第 ${attempt} 次重新输出失败：${repair.error ?? '未知错误'}`,
+        );
+        continue;
+      }
+
+      const verdict = EngineRunner.parseVerdictFrom(repair.summary, repair.output);
+      if (verdict) {
+        this.appendLog(
+          input.entry.taskId,
+          'system',
+          `第 ${attempt} 次重新输出已解析出评审结论：${verdict.verdict}`,
+        );
+        return { verdict, lastOutput, durationMs };
+      }
+    }
+
+    return { verdict: null, lastOutput, durationMs };
   }
 
   private async runFix(entry: QueueEntry, signal: AbortSignal): Promise<void> {

@@ -245,6 +245,20 @@ export class EngineRunner {
     };
   }
 
+  /**
+   * Tries each text in turn (last message first, then the raw stream) and
+   * returns the first parseable verdict. Shared by the initial review run and
+   * by every re-ask, so both paths accept exactly the same shapes.
+   */
+  static parseVerdictFrom(...texts: Array<string | null | undefined>): ReviewVerdict | null {
+    for (const text of texts) {
+      if (!text) continue;
+      const verdict = EngineRunner.parseVerdict(text);
+      if (verdict) return verdict;
+    }
+    return null;
+  }
+
   /** Extracts the first JSON object that looks like a review verdict. */
   static parseVerdict(text: string): ReviewVerdict | null {
     const candidates: string[] = [];
@@ -263,13 +277,7 @@ export class EngineRunner {
     for (const candidate of candidates) {
       try {
         const parsed = JSON.parse(candidate) as Record<string, unknown>;
-        const verdictRaw = String(parsed.verdict ?? '').toLowerCase();
-        const verdict =
-          verdictRaw === 'approve' || verdictRaw === 'approved' || verdictRaw === 'pass'
-            ? 'approve'
-            : verdictRaw === 'needs_fix' || verdictRaw === 'needs-fix' || verdictRaw === 'fail'
-              ? 'needs_fix'
-              : null;
+        const verdict = normalizeVerdict(parsed.verdict);
         if (!verdict) continue;
 
         const issuesRaw = Array.isArray(parsed.issues) ? parsed.issues : [];
@@ -297,11 +305,14 @@ export class EngineRunner {
       }
     }
 
-    const fallback = text.match(/VERDICT\s*[:：]\s*(approve|approved|needs[_-]fix|needs_fix)/i);
+    const fallback = text.match(
+      /VERDICT\s*[:：]\s*(approve|approved|needs[_-]?fix|pass|fail|通过|不通过|需要修复)/i,
+    );
     if (fallback) {
-      const raw = (fallback[1] ?? '').toLowerCase();
+      const verdict = normalizeVerdict(fallback[1]);
+      if (!verdict) return null;
       return {
-        verdict: raw.startsWith('approve') ? 'approve' : 'needs_fix',
+        verdict,
         summary: text.trim().slice(0, 2000),
         issues: [],
       };
@@ -315,6 +326,33 @@ function normalizeSeverity(value: unknown): ReviewIssue['severity'] {
   if (text === 'blocker' || text === 'critical') return 'blocker';
   if (text === 'major' || text === 'high') return 'major';
   return 'minor';
+}
+
+/**
+ * Maps the spellings a model realistically produces onto the two enum values.
+ *
+ * The strict schema only allows `approve` / `needs_fix`, but a model that
+ * answers outside of schema mode (or in Chinese) still means one of them.
+ */
+function normalizeVerdict(value: unknown): ReviewVerdict['verdict'] | null {
+  const text = String(value ?? '')
+    .trim()
+    .toLowerCase();
+  if (!text) return null;
+  if (text === 'approve' || text === 'approved' || text === 'pass' || text === '通过') {
+    return 'approve';
+  }
+  if (
+    text === 'needs_fix' ||
+    text === 'needs-fix' ||
+    text === 'needsfix' ||
+    text === 'fail' ||
+    text === '不通过' ||
+    text === '需要修复'
+  ) {
+    return 'needs_fix';
+  }
+  return null;
 }
 
 /** Finds the index of the `}` closing the object starting at `start`. */

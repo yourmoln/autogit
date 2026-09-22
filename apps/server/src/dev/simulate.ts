@@ -236,45 +236,51 @@ class StubProvider implements GitProvider {
 /** Deterministic stand-in for the Codex CLI. */
 class SimulationRunner extends EngineRunner {
   reviewRounds = 0;
+  /** How often a review had to be asked to re-output its verdict. */
+  verdictRepairs = 0;
 
   override async run(input: EngineRunInput): Promise<EngineRunResult> {
     const started = Date.now();
     mkdirSyncIfNeeded(input.cwd);
 
+    // The first review answers in prose, so the parser cannot read a verdict and
+    // the orchestrator has to ask the model again instead of failing the task.
+    if (input.prompt.includes('重新输出结论')) {
+      this.verdictRepairs += 1;
+      const verdict = {
+        verdict: 'needs_fix',
+        summary: '实现方向正确，但 feature.txt 缺少标题行，需要补齐。',
+        issues: [
+          {
+            severity: 'major',
+            title: '缺少标题行',
+            detail: 'feature.txt 需要包含一行标题，便于后续渲染。',
+            file: 'src/feature.txt',
+            line: null,
+            suggestion: '在第一行写入 "AutoGit Feature"。',
+          },
+        ],
+        tests: 'node --test（模拟）',
+      };
+      input.log('agent', '模拟：按 JSON Schema 重新输出评审结论');
+      return success(JSON.stringify(verdict, null, 2), started);
+    }
+
     if (input.prompt.includes('代码评审代理')) {
       this.reviewRounds += 1;
+      if (this.reviewRounds === 1) {
+        const prose = '我看了这次改动：方向是对的，但 src/feature.txt 缺少标题行，补齐后再合并。';
+        input.log('agent', prose);
+        return success(prose, started);
+      }
       const verdict = {
-        verdict: this.reviewRounds === 1 ? 'needs_fix' : 'approve',
-        summary:
-          this.reviewRounds === 1
-            ? '实现方向正确，但 feature.txt 缺少标题行，需要补齐。'
-            : '改动符合预期，测试通过，可以合并。',
-        issues:
-          this.reviewRounds === 1
-            ? [
-                {
-                  severity: 'major',
-                  title: '缺少标题行',
-                  detail: 'feature.txt 需要包含一行标题，便于后续渲染。',
-                  file: 'src/feature.txt',
-                  suggestion: '在第一行写入 "AutoGit Feature"。',
-                },
-              ]
-            : [],
+        verdict: 'approve',
+        summary: '改动符合预期，测试通过，可以合并。',
+        issues: [],
         tests: 'node --test（模拟）',
       };
       input.log('agent', `模拟评审结论：${verdict.verdict}`);
-      return {
-        ok: true,
-        exitCode: 0,
-        summary: JSON.stringify(verdict, null, 2),
-        output: JSON.stringify(verdict),
-        durationMs: Date.now() - started,
-        timedOut: false,
-        aborted: false,
-        error: null,
-        usage: { inputTokens: 1200, outputTokens: 480 },
-      };
+      return success(JSON.stringify(verdict, null, 2), started);
     }
 
     if (input.prompt.includes('修复代理')) {
@@ -444,12 +450,13 @@ async function main(): Promise<void> {
 
   log.warn(`Issue #1 标签：${issue.labels.join(', ')}`);
   log.warn(`PR #${pr.number} 标签：${pr.labels.join(', ')}`);
-  log.warn(`评审轮次：${runner.reviewRounds}`);
+  log.warn(`评审轮次：${runner.reviewRounds}；结论重试：${runner.verdictRepairs}`);
 
   assert(issue.labels.includes('ai/in-review'), 'Issue 应当处于 ai/in-review');
   assert(!issue.labels.includes('ai/todo'), 'Issue 不应当保留 ai/todo');
   assert(pr.labels.includes('ai/approved'), 'PR 应当评审通过为 ai/approved');
   assert(runner.reviewRounds >= 2, '应当经历「评审 → 修复 → 复审」至少两轮');
+  assert(runner.verdictRepairs === 1, '首次评审输出不可解析时，应当要求模型重新输出一次结论');
 
   const branch = pr.headRef;
   const files = git(['ls-tree', '--name-only', '-r', `refs/heads/${branch}`], bareRepo)

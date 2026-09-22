@@ -7,6 +7,7 @@ import type {
   RemoteRepositorySummary,
   RemoteUser,
 } from '@autogit/shared';
+import { AI_LABEL_BY_NAME } from '@autogit/shared';
 
 import { ApiClient } from './http.js';
 import {
@@ -94,6 +95,13 @@ function normalizeBaseUrlFor(raw: string): string {
   if (!base) return 'http://127.0.0.1:3000/api/v1';
   if (/\/api\/v1$/.test(base)) return base;
   return `${base}/api/v1`;
+}
+
+/** Gitea reports label ids as numbers, but the shared label type also allows strings. */
+function toNumericId(value: string | number | null): number | null {
+  if (value === null) return null;
+  const parsed = typeof value === 'number' ? value : Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 export class GiteaProvider implements GitProvider {
@@ -317,9 +325,53 @@ export class GiteaProvider implements GitProvider {
   }
 
   async setLabels(ref: RepoRef, target: LabelTargetInput): Promise<void> {
+    const labels = await this.resolveLabelIds(ref, target.labels);
     await this.client.put(`/repos/${ref.owner}/${ref.name}/issues/${target.number}/labels`, {
-      body: { labels: target.labels },
+      body: { labels },
     });
+  }
+
+  /**
+   * Gitea's issue/PR label endpoint only accepts numeric label ids
+   * (`IssueLabelsOption.labels` is `[]int64`), unlike GitHub which takes names.
+   * Names are therefore resolved against the repository catalogue first;
+   * unknown names are created on the fly so a label transition never fails just
+   * because a label is missing from the catalogue.
+   */
+  private async resolveLabelIds(ref: RepoRef, names: readonly string[]): Promise<number[]> {
+    const wanted = [...new Set(names)];
+    if (wanted.length === 0) return [];
+
+    const existing = await this.listLabels(ref);
+    const idByName = new Map<string, number>();
+    for (const label of existing) {
+      const id = toNumericId(label.id);
+      if (id !== null) idByName.set(label.name, id);
+    }
+
+    const ids: number[] = [];
+    for (const name of wanted) {
+      const known = idByName.get(name);
+      if (known !== undefined) {
+        ids.push(known);
+        continue;
+      }
+
+      const definition = AI_LABEL_BY_NAME[name];
+      const created = await this.createLabel(ref, {
+        name,
+        color: definition?.color ?? 'ededed',
+        description: definition?.description ?? '',
+        exclusive: definition?.exclusiveGroup !== undefined,
+      });
+      const createdId = toNumericId(created.id);
+      if (createdId !== null) {
+        idByName.set(name, createdId);
+        ids.push(createdId);
+      }
+    }
+
+    return ids;
   }
 
   private mapPullRequest(pr: GiteaPullRequest): RemotePullRequest {

@@ -120,12 +120,7 @@ export function TasksPage(): ReactNode {
             description="实时日志始终通过 WebSocket 推送，此处仅控制列表刷新。"
           />
         </div>
-        <TaskList
-          tasks={items}
-          onSelect={setSelected}
-          selectedTaskId={selected?.id ?? null}
-          heightClass="h-[30rem]"
-        />
+        <TaskList tasks={items} onSelect={setSelected} selectedTaskId={selected?.id ?? null} />
       </SectionCard>
 
       <div className="grid gap-4 xl:grid-cols-[1.4fr_1fr]">

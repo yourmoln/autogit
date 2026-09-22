@@ -357,7 +357,6 @@ export function RepositoryDetailPage(): ReactNode {
             selectedTaskId={selectedTask?.id ?? null}
             onSelect={setSelectedTask}
             showRepository={false}
-            heightClass="h-[26rem]"
             emptyHint="该仓库还没有任务记录。"
           />
         </SectionCard>

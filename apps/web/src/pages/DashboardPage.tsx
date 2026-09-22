@@ -151,8 +151,6 @@ export function DashboardPage(): ReactNode {
         >
           <TaskList
             tasks={[...activeTasks, ...finishedTasks].slice(0, 8)}
-            // 总览只预览 8 条，保留自然高度；任务页与仓库工作台用固定高度虚拟列表。
-            heightClass={null}
             emptyHint="还没有任务记录。给 Issue 打上 ai/todo 并点击「立即轮询」即可开始。"
           />
         </SectionCard>

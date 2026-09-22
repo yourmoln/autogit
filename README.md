@@ -142,6 +142,7 @@ stateDiagram-v2
 
 - Issue 与 PR 各自维护一套「单选」状态标签，切换状态时旧状态标签会被移除。
 - `ai/stuck` 与 `ai/paused` 是附加开关，不会覆盖已有状态，便于人工判断停在哪里。
+- 只跟踪 **open** 的 Issue/PR：远端关闭 Issue（或 PR 被合并、关闭）后，条目会在下一次轮询时离开看板、计数与调度队列；本地快照保留，用于任务历史与标签回溯。
 - 修复与评审共用 PR 分支；分支名固定为 `<branchPrefix><issueNumber>-<slug>`（默认 `ai/issue-`），AutoGit 只会强推自己的分支。
 
 ## Codex CLI 集成

@@ -70,8 +70,8 @@ export function registerRepositoryRoutes(app: FastifyInstance, ctx: AppContext):
     return {
       items: repositories.map((repository) => ({
         ...repository,
-        tracked: ctx.store.listIssues(repository.id).length,
-        pullRequests: ctx.store.listPullRequests(repository.id).length,
+        tracked: ctx.store.listOpenIssues(repository.id).length,
+        pullRequests: ctx.store.listOpenPullRequests(repository.id).length,
       })),
     };
   });
@@ -155,8 +155,10 @@ export function registerRepositoryRoutes(app: FastifyInstance, ctx: AppContext):
     const repository = ctx.store.getRepository(id);
     if (!repository) throw new HttpError(404, '仓库不存在');
 
-    const issueRows = ctx.store.listIssues(id).filter((issue) => !issue.isPullRequest);
-    const prRows = ctx.store.listPullRequests(id);
+    // Closed items stay in the database for task history, but the board only
+    // ever shows what is still actionable on the remote.
+    const issueRows = ctx.store.listOpenIssues(id).filter((issue) => !issue.isPullRequest);
+    const prRows = ctx.store.listOpenPullRequests(id);
     const issues = issueRows.map((issue) => toTrackedIssue(id, issue));
     const pullRequests = prRows.map((pr) =>
       toTrackedIssue(id, {

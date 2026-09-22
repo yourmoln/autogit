@@ -444,7 +444,13 @@ export class Store {
     );
   }
 
-  listIssues(repositoryId: string): IssueRowRecord[] {
+  listIssues(repositoryId: string, filter: { state?: 'open' | 'closed' } = {}): IssueRowRecord[] {
+    const clauses = ['repository_id = ?'];
+    const params: SqlValue[] = [repositoryId];
+    if (filter.state) {
+      clauses.push('state = ?');
+      params.push(filter.state);
+    }
     const rows = this.db.all<{
       id: string;
       repository_id: string;
@@ -456,7 +462,7 @@ export class Store {
       html_url: string | null;
       updated_at: string;
       is_pull_request: number;
-    }>('SELECT * FROM issues WHERE repository_id = ? ORDER BY number DESC', [repositoryId]);
+    }>(`SELECT * FROM issues WHERE ${clauses.join(' AND ')} ORDER BY number DESC`, params);
 
     return rows.map((row) => ({
       id: row.id,
@@ -470,6 +476,17 @@ export class Store {
       updatedAt: row.updated_at,
       isPullRequest: fromBool(row.is_pull_request),
     }));
+  }
+
+  /**
+   * Snapshots that are still open on the remote.
+   *
+   * AutoGit only ever acts on open Issues/PRs, so boards and counters read
+   * through this filter instead of the raw table — a closed (or merged) item
+   * must never show up as pending work again.
+   */
+  listOpenIssues(repositoryId: string): IssueRowRecord[] {
+    return this.listIssues(repositoryId, { state: 'open' });
   }
 
   // ----------------------------------------------------------- pull requests
@@ -515,7 +532,16 @@ export class Store {
     );
   }
 
-  listPullRequests(repositoryId: string): PullRequestRowRecord[] {
+  listPullRequests(
+    repositoryId: string,
+    filter: { state?: 'open' | 'closed' } = {},
+  ): PullRequestRowRecord[] {
+    const clauses = ['repository_id = ?'];
+    const params: SqlValue[] = [repositoryId];
+    if (filter.state) {
+      clauses.push('state = ?');
+      params.push(filter.state);
+    }
     const rows = this.db.all<{
       id: string;
       repository_id: string;
@@ -532,7 +558,7 @@ export class Store {
       issue_number: number | null;
       merged_at: string | null;
       updated_at: string;
-    }>('SELECT * FROM pull_requests WHERE repository_id = ? ORDER BY number DESC', [repositoryId]);
+    }>(`SELECT * FROM pull_requests WHERE ${clauses.join(' AND ')} ORDER BY number DESC`, params);
 
     return rows.map((row) => ({
       id: row.id,
@@ -551,6 +577,11 @@ export class Store {
       mergedAt: row.merged_at,
       updatedAt: row.updated_at,
     }));
+  }
+
+  /** Open, unmerged PR snapshots — see `listOpenIssues()`. */
+  listOpenPullRequests(repositoryId: string): PullRequestRowRecord[] {
+    return this.listPullRequests(repositoryId, { state: 'open' }).filter((pr) => !pr.merged);
   }
 
   findPullRequestByHead(repositoryId: string, headRef: string): PullRequestRowRecord | null {
@@ -837,7 +868,7 @@ export class Store {
       "SELECT COUNT(*) AS count FROM issues WHERE state = 'open'",
     );
     const pullRequests = this.db.get<{ count: number }>(
-      "SELECT COUNT(*) AS count FROM pull_requests WHERE state = 'open'",
+      "SELECT COUNT(*) AS count FROM pull_requests WHERE state = 'open' AND merged = 0",
     );
     return {
       issues: Number(issues?.count ?? 0),

@@ -123,8 +123,14 @@ class StubProvider implements GitProvider {
     return { id: null, name: input.name, color: input.color, description: input.description };
   }
 
-  async listIssues(): Promise<RemoteIssue[]> {
-    return [...this.state.issues.values()];
+  async listIssues(
+    _ref: RepoRef,
+    options: { state?: 'open' | 'closed' | 'all' } = {},
+  ): Promise<RemoteIssue[]> {
+    const state = options.state ?? 'open';
+    return [...this.state.issues.values()].filter(
+      (issue) => state === 'all' || issue.state === state,
+    );
   }
 
   async getIssue(_ref: RepoRef, number: number): Promise<RemoteIssue> {
@@ -164,8 +170,14 @@ class StubProvider implements GitProvider {
     issue.labels = [...target.labels];
   }
 
-  async listPullRequests(): Promise<RemotePullRequest[]> {
-    return [...this.state.pullRequests.values()];
+  async listPullRequests(
+    _ref: RepoRef,
+    options: { state?: 'open' | 'closed' | 'all' } = {},
+  ): Promise<RemotePullRequest[]> {
+    const state = options.state ?? 'open';
+    return [...this.state.pullRequests.values()].filter(
+      (pr) => state === 'all' || pr.state === state,
+    );
   }
 
   async getPullRequest(_ref: RepoRef, number: number): Promise<RemotePullRequest> {
@@ -211,6 +223,14 @@ class StubProvider implements GitProvider {
     pr.merged = true;
     pr.mergedAt = new Date().toISOString();
     pr.state = 'closed';
+  }
+
+  /** Test helper: closes an issue the way a maintainer does after verifying it. */
+  closeIssue(number: number): void {
+    const issue = this.state.issues.get(number);
+    if (!issue) throw new Error(`stub issue #${number} not found`);
+    issue.state = 'closed';
+    issue.updatedAt = new Date().toISOString();
   }
 
   /** Test helper: seeds the issue that starts the pipeline. */
@@ -470,6 +490,35 @@ async function main(): Promise<void> {
   const merged = await provider.getIssue({ owner: 'sim', name: 'demo' }, 1);
   log.warn(`合并后 Issue #1 标签：${merged.labels.join(', ')}`);
   assert(merged.labels.includes('ai/verify'), 'PR 合并后 Issue 应转为 ai/verify');
+  assert(
+    !store.listOpenPullRequests(repository.id).some((row) => row.number === pr.number),
+    '合并后的 PR 应当从看板数据中移除',
+  );
+  assert(store.countTrackedItems().pullRequests === 0, '合并后的 PR 不应计入跟踪中的 PR');
+
+  // 一个只有人工关闭才会离开流水线的条目（`ai/verify`）：远端关闭后，
+  // 下一次轮询必须把本地快照也标记为 closed，否则它会继续留在看板上。
+  const verified = provider.seedIssue({
+    number: 2,
+    title: '待人工验证并关闭的 Issue',
+    body: '用于验证关闭后的条目会离开流水线看板。',
+    labels: ['ai/verify'],
+  });
+  await orchestrator.tick('verify-open');
+  assert(
+    store.listOpenIssues(repository.id).some((row) => row.number === verified.number),
+    'ai/verify 的 Issue 在远端仍 open 时应当留在看板上',
+  );
+
+  provider.closeIssue(verified.number);
+  await orchestrator.tick('verify-closed');
+  const closedRow = store.listIssues(repository.id).find((row) => row.number === verified.number);
+  assert(closedRow?.state === 'closed', '远端关闭后本地快照应当标记为 closed');
+  assert(
+    !store.listOpenIssues(repository.id).some((row) => row.number === verified.number),
+    '关闭的 Issue 不应当出现在看板数据里',
+  );
+  assert(store.countTrackedItems().issues === 1, '关闭的 Issue 不应计入跟踪中的 Issue');
 
   const tasks = store.listTasks({ repositoryId: repository.id, limit: 20 });
   log.warn(

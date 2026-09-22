@@ -23,6 +23,7 @@ import {
 
 import type { RuntimeConfig } from '../config.js';
 import type { RepositoryRecord, Store } from '../db/store.js';
+import { isApiError } from '../providers/http.js';
 import type { GitProvider, RepoRef } from '../providers/index.js';
 import { childLogger } from '../util/logger.js';
 import { taskDirectory } from '../util/paths.js';
@@ -51,6 +52,8 @@ import type { WorkspaceManager } from './workspace.js';
 
 const AI_MARKER = '<!-- autogit -->';
 const MAX_ATTEMPTS_PER_ITEM = 3;
+/** Upper bound on per-tick `getIssue`/`getPullRequest` calls used to confirm closures. */
+const MAX_CLOSE_CHECKS_PER_TICK = 10;
 /** How many times a review whose output is unparsable is asked to re-output. */
 const REVIEW_VERDICT_REPAIR_ATTEMPTS = 2;
 /** A re-ask only re-serialises an existing conclusion, so it needs a short budget. */
@@ -82,6 +85,12 @@ interface RunningTask {
   entry: QueueEntry;
   controller: AbortController;
 }
+
+/**
+ * Result of re-reading one Issue/PR: `missing` is a 404 (the item is gone from
+ * the repository), `unknown` is any other failure and must not change state.
+ */
+type RemoteLookup<T> = { kind: 'ok'; value: T } | { kind: 'missing' } | { kind: 'unknown' };
 
 export interface TickReport {
   at: string;
@@ -297,6 +306,7 @@ export class Orchestrator {
       await this.deps.labels.initialize(repository);
     }
 
+    await this.reconcileClosedItems(repository, provider, ref, issues, pullRequests);
     await this.scheduleIssues(repository, provider, ref, trackedIssues);
     await this.schedulePullRequests(repository, provider, ref, trackedPulls);
     await this.reconcileMerged(repository, provider, ref, trackedIssues);
@@ -306,6 +316,129 @@ export class Orchestrator {
       lastPolledAt: nowIso(),
       lastPollError: null,
     });
+  }
+
+  /**
+   * Marks locally tracked items as closed once they leave the remote open list.
+   *
+   * The poller only asks for `state=open`, so an Issue/PR that gets closed (or
+   * merged) between two polls simply stops being returned — without this step
+   * its snapshot would keep the stale `open` state and stay on the board
+   * forever. Every missing item is re-read individually, so a truncated page
+   * can never be mistaken for a closure.
+   */
+  private async reconcileClosedItems(
+    repository: RepositoryRecord,
+    provider: GitProvider,
+    ref: RepoRef,
+    openIssues: RemoteIssue[],
+    openPulls: RemotePullRequest[],
+  ): Promise<void> {
+    const openIssueNumbers = new Set(openIssues.map((issue) => issue.number));
+    const openPullNumbers = new Set(openPulls.map((pr) => pr.number));
+    let budget = MAX_CLOSE_CHECKS_PER_TICK;
+
+    const staleIssues = this.deps.store
+      .listOpenIssues(repository.id)
+      .filter((issue) => !issue.isPullRequest && !openIssueNumbers.has(issue.number));
+    const stalePulls = this.deps.store
+      .listOpenPullRequests(repository.id)
+      .filter((pr) => !openPullNumbers.has(pr.number));
+
+    for (const snapshot of staleIssues) {
+      if (budget <= 0) break;
+      budget -= 1;
+      const lookup = await this.lookupIssue(ref, provider, snapshot.number);
+      if (lookup.kind === 'unknown') continue;
+      const fresh = lookup.kind === 'ok' ? lookup.value : null;
+      if (fresh?.state === 'open') continue;
+
+      this.deps.store.upsertIssue({
+        repositoryId: repository.id,
+        number: snapshot.number,
+        title: fresh?.title ?? snapshot.title,
+        state: 'closed',
+        labels: fresh?.labels ?? snapshot.labels,
+        author: fresh?.author ?? snapshot.author,
+        htmlUrl: fresh?.htmlUrl ?? snapshot.htmlUrl,
+        updatedAt: fresh?.updatedAt ?? snapshot.updatedAt,
+        isPullRequest: false,
+      });
+      this.deps.store.addActivity({
+        level: 'info',
+        scope: 'pipeline',
+        repositoryId: repository.id,
+        message: `Issue #${snapshot.number} 已关闭，移出流水线看板`,
+      });
+    }
+
+    for (const snapshot of stalePulls) {
+      if (budget <= 0) break;
+      budget -= 1;
+      const lookup = await this.lookupPull(ref, provider, snapshot.number);
+      if (lookup.kind === 'unknown') continue;
+      const fresh = lookup.kind === 'ok' ? lookup.value : null;
+      if (fresh?.state === 'open' && !fresh.merged) continue;
+      const merged = fresh?.merged ?? snapshot.merged;
+
+      this.deps.store.upsertPullRequest({
+        repositoryId: repository.id,
+        number: snapshot.number,
+        title: fresh?.title ?? snapshot.title,
+        state: 'closed',
+        merged,
+        labels: fresh?.labels ?? snapshot.labels,
+        author: fresh?.author ?? snapshot.author,
+        htmlUrl: fresh?.htmlUrl ?? snapshot.htmlUrl,
+        headRef: fresh?.headRef ?? snapshot.headRef,
+        baseRef: fresh?.baseRef ?? snapshot.baseRef,
+        headSha: fresh?.headSha ?? snapshot.headSha,
+        issueNumber: null,
+        mergedAt: fresh?.mergedAt ?? snapshot.mergedAt,
+        updatedAt: fresh?.updatedAt ?? snapshot.updatedAt,
+      });
+      this.deps.store.addActivity({
+        level: 'info',
+        scope: 'pipeline',
+        repositoryId: repository.id,
+        message: `PR #${snapshot.number} ${merged ? '已合并' : '已关闭'}，移出评审回路`,
+      });
+    }
+  }
+
+  /**
+   * Reads a single Issue/PR to learn whether it is still open.
+   *
+   * `missing` means the item no longer exists in the repository (HTTP 404),
+   * which is also treated as "not open" so it cannot pin the board; `unknown`
+   * leaves the snapshot untouched and is retried on the next poll.
+   */
+  private async lookupIssue(
+    ref: RepoRef,
+    provider: GitProvider,
+    number: number,
+  ): Promise<RemoteLookup<RemoteIssue>> {
+    try {
+      return { kind: 'ok', value: await provider.getIssue(ref, number) };
+    } catch (error) {
+      if (isApiError(error, [404])) return { kind: 'missing' };
+      this.log.warn({ err: error, number }, 'failed to read issue state');
+      return { kind: 'unknown' };
+    }
+  }
+
+  private async lookupPull(
+    ref: RepoRef,
+    provider: GitProvider,
+    number: number,
+  ): Promise<RemoteLookup<RemotePullRequest>> {
+    try {
+      return { kind: 'ok', value: await provider.getPullRequest(ref, number) };
+    } catch (error) {
+      if (isApiError(error, [404])) return { kind: 'missing' };
+      this.log.warn({ err: error, number }, 'failed to read pull request state');
+      return { kind: 'unknown' };
+    }
   }
 
   private upsertPullRequest(repository: RepositoryRecord, pr: RemotePullRequest): void {
@@ -890,6 +1023,10 @@ export class Orchestrator {
       this.finishTask(entry.taskId, 'cancelled', 'Issue 处于 ai/paused，跳过执行');
       return;
     }
+    if (issue.state !== 'open') {
+      this.finishTask(entry.taskId, 'cancelled', 'Issue 已关闭，跳过执行');
+      return;
+    }
 
     const branch = `${settings.branchPrefix}${issue.number}-${slugify(issue.title)}`.slice(0, 120);
     this.deps.store.updateTask(entry.taskId, { branch, issueTitle: issue.title });
@@ -999,6 +1136,10 @@ export class Orchestrator {
 
     if (isPaused(pullRequest.labels)) {
       this.finishTask(entry.taskId, 'cancelled', 'PR 处于 ai/paused，跳过评审');
+      return;
+    }
+    if (pullRequest.state !== 'open' || pullRequest.merged) {
+      this.finishTask(entry.taskId, 'cancelled', 'PR 已合并或已关闭，跳过评审');
       return;
     }
     if (!pullRequest.labels.includes('ai/needs-review')) {
@@ -1200,6 +1341,10 @@ export class Orchestrator {
 
     if (isPaused(pullRequest.labels)) {
       this.finishTask(entry.taskId, 'cancelled', 'PR 处于 ai/paused，跳过修复');
+      return;
+    }
+    if (pullRequest.state !== 'open' || pullRequest.merged) {
+      this.finishTask(entry.taskId, 'cancelled', 'PR 已合并或已关闭，跳过修复');
       return;
     }
     if (!pullRequest.labels.includes('ai/needs-fix')) {

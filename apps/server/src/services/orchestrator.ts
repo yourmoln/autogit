@@ -111,6 +111,7 @@ export class Orchestrator {
     if (this.started) return;
     this.started = true;
     this.log.info('orchestrator started');
+    this.reconcileInterruptedTasks();
     void this.tick('startup');
     this.scheduleNext(1000);
   }
@@ -121,6 +122,42 @@ export class Orchestrator {
     this.timer = null;
     for (const runningTask of this.running.values()) runningTask.controller.abort();
     this.log.info('orchestrator stopped');
+  }
+
+  /**
+   * Releases tasks that were queued or running when the process died.
+   *
+   * The in-memory queue and its abort controllers die with the process, so
+   * those rows have no worker left — but `hasOpenTask()` counts `queued` and
+   * `running` as busy, which made the Issue/PR unschedulable forever and its
+   * workflow unrecoverable without touching the database by hand.
+   *
+   * They are recorded as `cancelled` (not `failed`, so they do not consume the
+   * 3-attempt budget) and the next tick re-derives the work from the labels
+   * that are still on the Issue / PR.
+   */
+  private reconcileInterruptedTasks(): void {
+    const interrupted = this.deps.store.listActiveTasks();
+    if (interrupted.length === 0) return;
+
+    const message = '服务重启，任务被中断；将按 Issue/PR 上的标签重新调度';
+    for (const task of interrupted) {
+      this.deps.store.updateTask(task.id, {
+        status: 'cancelled',
+        error: message,
+        finishedAt: nowIso(),
+      });
+      this.appendLog(task.id, 'system', message);
+      this.emitTask(task.id);
+      this.deps.store.addActivity({
+        level: 'warning',
+        scope: 'pipeline',
+        repositoryId: task.repositoryId,
+        message: `任务 ${task.id}（${task.kind}）因服务重启被中断，等待重新调度`,
+      });
+    }
+
+    this.log.warn({ count: interrupted.length }, 'reconciled tasks interrupted by a restart');
   }
 
   private scheduleNext(delayMs: number): void {

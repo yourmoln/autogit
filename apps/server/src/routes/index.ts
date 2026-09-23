@@ -63,8 +63,12 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
         ? matchedRoute
         : decodeRequestPath(request.url);
     if (!isApiPath(path)) return;
-    // OPTIONS has no body and no destination of its own; nothing to protect.
-    if (request.method === 'OPTIONS') return;
+    // No method gets a free pass — OPTIONS included. The guard used to return
+    // early for `OPTIONS` "because it has no body", which is a standing exemption
+    // on a security-critical path: the day an OPTIONS route (preflight help, API
+    // docs, a health probe) is registered under `/api`, it would run unauthenticated.
+    // AutoGit serves the console same-origin and registers no CORS layer, so no
+    // preflight needs an answer here; an unauthenticated OPTIONS now gets 401.
 
     const resolved = ctx.auth.resolveSession(
       readCookie(request.headers.cookie, AUTH_SESSION_COOKIE),

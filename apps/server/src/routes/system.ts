@@ -71,9 +71,10 @@ export function registerSystemRoutes(app: FastifyInstance, ctx: AppContext): voi
   });
 
   app.post('/api/orchestrator/restart', async () => {
-    ctx.orchestrator.stop();
+    // Settings are re-read on the next tick; the restart keeps the tasks this
+    // process already owns instead of reporting them as interrupted.
     ctx.settings.invalidate();
-    ctx.orchestrator.start();
+    ctx.orchestrator.restart();
     return { status: ctx.orchestrator.status() };
   });
 

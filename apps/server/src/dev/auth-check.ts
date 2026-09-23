@@ -267,6 +267,32 @@ async function main(): Promise<void> {
       return 'HTTP 401';
     });
 
+    await expect('OPTIONS 不再无条件放行（未登录 / 预检样式 → 401）', async () => {
+      // The guard used to `return` for every OPTIONS request under `/api` before
+      // it looked at the session, so the method was a standing hole that the first
+      // OPTIONS route would have fallen through. AutoGit answers no preflight
+      // (same-origin console, no CORS layer), so OPTIONS is guarded like any other
+      // method: a preflight-shaped request without a session is still a 401.
+      const anonymous = await app.inject({ method: 'OPTIONS', url: '/api/system/overview' });
+      assert(anonymous.statusCode === 401, `未登录 OPTIONS → ${anonymous.statusCode}`);
+      assert(
+        anonymous.headers['access-control-allow-origin'] === undefined,
+        '未登录 OPTIONS 返回了跨源头',
+      );
+
+      const preflight = await app.inject({
+        method: 'OPTIONS',
+        url: '/api/system/overview',
+        headers: {
+          origin: 'https://evil.example',
+          'access-control-request-method': 'GET',
+          'access-control-request-headers': 'content-type',
+        },
+      });
+      assert(preflight.statusCode === 401, `预检样式 OPTIONS → ${preflight.statusCode}`);
+      return 'HTTP 401';
+    });
+
     await expect('GET /api/auth/session 未登录时返回 authenticated=false', async () => {
       const response = await app.inject({ method: 'GET', url: '/api/auth/session' });
       const payload = response.json<AuthSessionPayload>();
@@ -326,7 +352,7 @@ async function main(): Promise<void> {
       // The router matches percent-decoded paths while `request.url` keeps the raw
       // bytes; the guard used to compare the raw string and let every one of these
       // through, including the write endpoints and the realtime upgrade.
-      const attempts: Array<{ method: 'GET' | 'POST'; url: string }> = [
+      const attempts: Array<{ method: 'GET' | 'POST' | 'OPTIONS'; url: string }> = [
         { method: 'GET', url: '/%61pi/system/overview' },
         { method: 'GET', url: '/%61pi/system/activity' },
         { method: 'GET', url: '/%61pi/settings' },
@@ -334,6 +360,7 @@ async function main(): Promise<void> {
         { method: 'POST', url: '/%61pi/orchestrator/restart' },
         { method: 'POST', url: '/%61pi/orchestrator/tick' },
         { method: 'GET', url: '/%61pi/realtime' },
+        { method: 'OPTIONS', url: '/%61pi/system/overview' },
       ];
       for (const attempt of attempts) {
         const response = await app.inject({

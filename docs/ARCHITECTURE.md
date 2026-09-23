@@ -53,33 +53,7 @@ SQLite 通过 Node 内置的 `node:sqlite`（`DatabaseSync`）访问，启用 WA
 
 > 注意：`node:sqlite` 在打包后会被 bundler 改写成裸 `sqlite` 说明符，因此 `db/database.ts` 用 `createRequire` 动态加载它，保证 `dist/index.js` 可直接运行。
 
-## 3. 登录门禁
-
-AutoGit 是单用户本地工具，所以没有用户表：`auth_account` 恒定只有一行，首次启动写入出厂凭据 `admin` / `admin`（启动日志会提醒尽快修改）。
-
-```mermaid
-flowchart LR
-    UI[React 控制台] -->|未登录| LOGIN["/login 登录页"]
-    LOGIN -->|POST /api/auth/login| GUARD
-    UI -->|"Cookie: autogit_session"| GUARD{"Fastify onRequest 守卫 · 路由模板 + 解码路径"}
-    GUARD -->|白名单| PUBLIC[login / session / logout]
-    GUARD -->|校验会话| AUTH[AuthService.resolveSession]
-    AUTH -->|命中且未过期| ROUTE[业务路由 + WebSocket]
-    AUTH -->|缺失 / 过期 / 已吊销| E401[HTTP 401]
-    E401 --> LOGIN
-```
-
-- **守卫**：`routes/index.ts` 在 `registerRoutes()` 内注册 `onRequest` 钩子，判断依据是**路由器匹配到的路由模板**（`request.routeOptions.url`）：`/api` 下除 `login` / `session` / `logout` 外一律要求有效会话，否则直接 `401`。路由器匹配的是百分号解码后的路径，所以 `/%61pi/system/overview` 与 `/api/system/overview` 命中同一条路由、也走同一道门禁 —— 早期版本按原始 `request.url` 做字符串比较，编码写法能整条绕开白名单（实测未登录即可读写全部接口与实时通道）。没匹配到路由的请求只会落到 404 / SPA 兜底，这里再按解码后的路径复查一遍，因此编码的 `/api` 前缀既跑不到处理器，也选不中公开白名单。`/api/realtime` 的 WebSocket 升级请求走同一钩子，所以未登录连不上实时通道；静态资源（SPA 的 HTML/JS）保持公开，前端才有机会跳转到 `/login`。
-- **跨源**：不注册 `@fastify/cors` —— 开发模式前端经 Vite 同源代理访问 `/api`，生产模式由同一个后端托管前端，都不需要 CORS；而 `origin: true` 会把任意网站的 `Origin` 原样回填并允许携带凭证，等于让任意网站在受害者浏览器里读写本机接口。现在跨源请求拿不到任何 `Access-Control-*` 头，加上 Cookie 是 `HttpOnly; SameSite=Lax`，跨站子请求既带不上凭证也读不到响应。
-- **凭据**：密码用 scrypt（`N=16384, r=8, p=1`，随机盐）哈希后入库，校验走 `timingSafeEqual`；接口只返回用户名、「是否仍是默认密码」与活跃会话数，从不返回哈希或明文。每次登录恒定只跑一次 scrypt：用户名对不上时校验的是启动时就生成好的诱饵哈希，所以「用户名不存在」不会比「密码错误」更快（早期版本在用户名不匹配时短路，约 0ms vs 约 25ms，等于一个用户名探测器）。连续失败 5 次后进入退避窗口：窗口内直接 `429` +「请 N 秒后重试」，每次再失败窗口翻倍（1 秒 → 最长 30 秒），窗口自然过期，成功登录清零 —— 目的是把在线猜解从「scrypt 允许的最快速度」压到每秒一次量级，同时不给单用户工具留下永久锁死自己的开关。计数器是 `AuthService` 的内存态（重启即清零），且因为这个工具只有一个账号、按实例计数而不是按来源 IP 计数，换用户名重试同样躲不开。
-- **会话**：`login()` 用 `randomBytes(32)` 生成 token，库里只存 `sha256(token)`；Cookie 为 `HttpOnly; SameSite=Lax`。勾选「保持登录」时是 30 天滚动窗口：解析会话按 5 分钟节流把 `expires_at` 往后推，并在同一次响应里（`onSend` 钩子）补一个 `Set-Cookie` 把新的 `Max-Age` 交给浏览器 —— 只续库不续 Cookie 的话，浏览器仍会在登录后第 30 天删掉它，天天使用也会被强制重新登录。不勾选则是浏览器会话 Cookie，`expires_at` 固定在登录后 12 小时、不随访问顺延。过期的会话在解析与登录时顺手清理。
-- **接口**：`POST /api/auth/login` 登录、`GET /api/auth/session` 查询状态、`POST /api/auth/logout` 吊销并清 Cookie、`PUT /api/auth/credentials` 修改账号/密码（必须提供当前密码）。
-- **改密码后轮换**：修改成功会删除全部旧会话并签发新会话，其他设备立即掉线，发起修改的浏览器拿新 Cookie 继续使用。删除会话会通过 `AuthService.onSessionRevoked()` 广播一次「会话已吊销」（改凭据 = 全部会话，退出登录 = 当前会话），`/api/realtime` 里已经建立的连接据此以 `4401` 关闭；此外每个连接每 30 秒用自己的 Cookie 复查一次会话，覆盖过期与清理这类没有广播的失效。
-- **默认凭据提示**：`auth_account.password_changed_at` 记录密码是否被改过（`NULL` = 仍是出厂密码），`GET /api/auth/session` 因此不再对默认账号跑一次约 25ms 的同步 scrypt；旧库没有这一列时，首次启动会用一次校验结果回填。
-- **前端**：`lib/auth.tsx` 把会话缓存在 React Query（key `auth-session`）；`App.tsx` 的 `RequireAuth` 在会话未知时显示占位、未登录时跳转 `/login` 并记住原路径，登录后跳回。受保护接口返回 `401` 时 `lib/api.ts` 广播 `autogit:unauthorized`，上下文清空会话并关闭 WebSocket，路由随即回到登录页。
-- **自检**：`pnpm --filter @autogit/server auth:check`（`src/dev/auth-check.ts`）在临时数据目录里启动真实 HTTP 栈并断言 29 项行为：未登录 401、百分号编码路径（`/%61pi/...`，含写操作与实时通道）同样 401、默认账号登录、未知用户名与错误密码不可区分（响应时间下界 + 相同文案）、保持登录 Cookie 与滚动续期（Cookie 同步续期，并按前移幅度核对库内 `expires_at`）、非保持登录的 12 小时上限、跨源请求无 CORS 头、会话摘要不做 scrypt、过期会话清理、改账号密码与会话轮换、退出登录、连续失败 5 次后的 `429` 限速与窗口过期后的自动恢复、在真实监听端口上用原始握手验证 WebSocket 升级（未登录 401、改凭据与退出登录后已建立的连接被 `4401` 关闭），以及旧库（缺 `password_changed_at` 列）升级时的回填。
-
-## 4. 调度器（Orchestrator）
+## 3. 调度器（Orchestrator）
 
 每个轮询周期对每个启用仓库执行：
 
@@ -105,7 +79,13 @@ flowchart LR
 
 去重按任务类型取字段：`implement` 比对 Issue 号，`review` / `fix` 比对 PR 号。评审任务同时记录关联 Issue 号，用它做去重会让「PR #5 关联 Issue #3」这类条目每个轮询周期都重新入队一次。
 
-## 5. Provider 抽象
+只有**没有 worker 的**任务行会被释放：`reconcileInterruptedTasks()` 先排除本进程仍在内存队列或正在运行的任务。`POST /api/orchestrator/restart`（设置页的「重启调度器」，用于让改动立即生效）改走 `Orchestrator.restart()`，队列与运行中的任务都保留 —— 否则仍在排队、随后照常执行的任务会先被标成 `cancelled`，并留下一条“服务重启中断”的活动记录。
+
+失败落 `ai/stuck` 时，`markStuck()` 除了写远端标签，还会把标签回写进本地快照（`Store.setItemLabels()`）并重新推送任务状态：重试门禁（`GET /api/tasks` 的 `retryable`）与看板读的就是本地快照，回写后按钮立即可用，不必等下一轮轮询（默认 45s）。每次失败只发放一次重试：`POST /api/tasks/:id/retry` 会消费掉 `ai/stuck`。
+
+PR 正文由 `buildPullRequestBody()` 生成，按仓库约定固定包含 `## 实现假设清单` 与 `## 代码逻辑图` 两节：实现任务的提示词要求模型在总结里给出这两节，AutoGit 抽取后放进 PR 正文；模型没给时回落到「无额外假设」与 AutoGit 流水线示意图，保证两节始终非空。这两节不会进入提交信息。
+
+## 4. Provider 抽象
 
 `GitProvider` 接口把三个平台的差异收敛成 16 个方法（用户、仓库、标签、Issue、评论、PR、Git 认证头）。共同点：
 
@@ -117,7 +97,7 @@ flowchart LR
 
 平台差异（端点、颜色格式、Gitee 的 `access_token` 查询参数、PR 标签端点兜底）见 [PROVIDERS.md](PROVIDERS.md)。
 
-## 6. 执行引擎
+## 5. 执行引擎
 
 `EngineRunner` 负责把一次任务变成一次 CLI 调用：
 
@@ -130,21 +110,22 @@ flowchart LR
 
 `WorkspaceManager` 负责所有 git 操作：克隆（首次）、`fetch --prune`、`checkout -B`、`reset --hard`、`clean -fd`、`commit`、`push`。提交身份、`commit.gpgsign=false`、`core.longpaths=true` 都在工作区内单独配置，不污染用户全局 git 配置。
 
-布局是「每仓库一个只读基座克隆 + 每任务一个一次性克隆」：`workspaces/<repositoryId>` 只做 clone / fetch，供任务克隆复用对象库（`git clone --local` 硬链接，不产生第二次下载）；真正跑任务的是 `workspaces/tasks/<repositoryId>/<taskId>`，任务结束后删除，进程重启时清理遗留目录。这样同一仓库的并发任务各自持有独立的分支与工作树。
+布局是「每仓库一个只读基座克隆 + 每任务一个一次性克隆」：`workspaces/<repositoryId>` 只做 clone / fetch，供任务克隆复用对象库（`git clone --local` 硬链接，不产生第二次下载）；真正跑任务的是 `workspaces/tasks/<repositoryId>/<taskId>`，任务结束后删除，进程重启时清理遗留目录。这样同一仓库的并发任务各自持有独立的分支与工作树。基座克隆是共享状态，所以它的 clone / fetch 按 repositoryId 串行（`util/keyed-lock.ts`）：否则同一仓库的两个任务会同时更新同一个 `refs/remotes/origin/*`，后手以 `cannot lock ref … is at X but expected Y` 失败并拖垮整个任务。
 
-工作区是可丢弃的克隆，切换分支前先把它恢复成干净状态：常规路径 `clean -fd` + `reset --hard` 丢掉上一次运行留下的改动与未跟踪文件；失败或 `checkout` 仍然被挡时升级为强制清理 —— `clean -fdx`、回滚未完成的 merge/rebase/cherry-pick、删除残留的 `.git/*.lock` —— 再重试一次 `checkout --force`。克隆与 `fetch` 遇到网络类错误（连接重置、超时、5xx）会退避重试 2 次，认证与权限错误依旧立即失败。
+工作区是可丢弃的克隆，切换分支前先把它恢复成干净状态：常规路径 `clean -fd` + `reset --hard` 丢掉上一次运行留下的改动与未跟踪文件；失败或 `checkout` 仍然被挡时升级为强制清理 —— `clean -fdx`、回滚未完成的 merge/rebase/cherry-pick、删除残留的 `.git/*.lock` —— 再重试一次 `checkout --force`。克隆与 `fetch` 遇到网络类错误（连接重置、超时、5xx）或 ref 抢锁（`cannot lock ref` / `unable to update local ref`，重试时会重新读取引用）会退避重试 2 次，认证与权限错误依旧立即失败。
 
-`CodexService.modelProbe()` 是唯一的可用性判据：用固定提示词执行一次最小的 `codex exec`（只读沙箱、`--ephemeral`，跑在 AutoGit 数据目录里），按退出码与输出判断模型能否响应，结果缓存 5 分钟。AutoGit 不读取 `auth.json`，也不判断登录态 —— 凭证与授权全由 Codex CLI 自己管理。
+`CodexService.modelProbe()` 是唯一的可用性判据：用固定提示词执行一次最小的 `codex exec`（只读沙箱、`--ephemeral`，跑在 AutoGit 数据目录里），按退出码与输出判断模型能否响应，结果缓存 5 分钟。同一时刻只跑一次探测，并在进行中时报告 `probing`：`POST /api/codex/invalidate`（「重新检测」）只清缓存、把探测放到后台，避免请求最长阻塞 3 分钟，`POST /api/codex/probe`（「测试模型响应」）才会等待结果；两个入口都会在探测结束后写入活动记录。AutoGit 不读取 `auth.json`，也不判断登录态 —— 凭证与授权全由 Codex CLI 自己管理。
 
-## 7. 前端
+## 6. 前端
 
 - 路由：`/login`（登录，未登录时唯一可见的页面）、`/`（总览）、`/accounts`、`/repositories`、`/repositories/:id`、`/tasks`、`/codex`、`/proxy`、`/labels`、`/settings`；除 `/login` 外全部包在 `RequireAuth` 内。
 - 数据：TanStack Query 负责缓存与失效，WebSocket 事件到达时精确失效对应 query key。
 - 日志：`logStore` 用 `useSyncExternalStore` 维护按任务分桶的环形缓冲（4000 行），高频日志不会引起整页重渲染。
 - 任务记录：`VirtualList` 按固定行高（88px）做窗口化渲染，`/tasks` 与仓库工作台的任务列表是固定高度的虚拟列表，只挂载可视区内的行；总览里 8 条以内的预览列表仍按普通列表渲染。
 - 设计系统：`styles.css` 中的 `panel` / `btn` / `chip` / `input` 等基础类 + Tailwind 工具类；暗色主题，动效集中在面板进场与状态切换。
+- 主题：偏好（跟随系统 / 浅色 / 深色）由 `lib/theme.ts` + `hooks/useTheme.tsx` 维护并写入 `localStorage`，默认跟随系统；`index.html` 的前置脚本在首帧前写好 `<html data-theme>`，避免闪屏。样式以暗色为基线，`styles.css` 的 `[data-theme='light']` 重定向 `white` / `slate` / `*-200~400` 等基础色板，组件无需为两套主题各写一份类名。
 
-## 8. 代理链路
+## 7. 代理链路
 
 网络出口在 AutoGit 里是一条独立链路，目标是「不依赖任何第三方代理库，也能让 git 与 REST 请求走同一个出口」。
 
@@ -168,6 +149,32 @@ flowchart LR
 - **Codex CLI**：配置了代理的账号会把代理变量传给 `codex exec`，让模型请求也走同一出口；没配置代理时不改动继承的环境变量。
 - **连通性测试**：`POST /api/proxy/test` 对「直连 + 各通道」或单个账号并发执行两项检查——`GET github api`（跟随重定向、解压 gzip、超时可控）与真实 `git ls-remote`，结果按检查项返回状态码、耗时与可读错误；测试支持使用未保存的草稿地址。
 - **自检脚本**：`pnpm --filter @autogit/server proxy:check` 会在本机起「源站 + HTTP 代理 + 需认证的 HTTP 代理 + SOCKS5（含账号密码）」，覆盖绝对形式、CONNECT 隧道、认证失败、重定向、gzip、错误码映射等断言；加 `-- --online` 还会用真实 `https://api.github.com/` 验证 TLS 隧道。
+
+## 8. 登录门禁
+
+AutoGit 是单用户本地工具，所以没有用户表：`auth_account` 恒定只有一行，首次启动写入出厂凭据 `admin` / `admin`（启动日志会提醒尽快修改）。
+
+```mermaid
+flowchart LR
+    UI[React 控制台] -->|未登录| LOGIN["/login 登录页"]
+    LOGIN -->|POST /api/auth/login| GUARD
+    UI -->|"Cookie: autogit_session"| GUARD{"Fastify onRequest 守卫 · 路由模板 + 解码路径"}
+    GUARD -->|白名单| PUBLIC[login / session / logout]
+    GUARD -->|校验会话| AUTH[AuthService.resolveSession]
+    AUTH -->|命中且未过期| ROUTE[业务路由 + WebSocket]
+    AUTH -->|缺失 / 过期 / 已吊销| E401[HTTP 401]
+    E401 --> LOGIN
+```
+
+- **守卫**：`routes/index.ts` 在 `registerRoutes()` 内注册 `onRequest` 钩子，判断依据是**路由器匹配到的路由模板**（`request.routeOptions.url`）：`/api` 下除 `login` / `session` / `logout` 外一律要求有效会话，否则直接 `401`。路由器匹配的是百分号解码后的路径，所以 `/%61pi/system/overview` 与 `/api/system/overview` 命中同一条路由、也走同一道门禁 —— 早期版本按原始 `request.url` 做字符串比较，编码写法能整条绕开白名单（实测未登录即可读写全部接口与实时通道）。没匹配到路由的请求只会落到 404 / SPA 兜底，这里再按解码后的路径复查一遍，因此编码的 `/api` 前缀既跑不到处理器，也选不中公开白名单。`/api/realtime` 的 WebSocket 升级请求走同一钩子，所以未登录连不上实时通道；静态资源（SPA 的 HTML/JS）保持公开，前端才有机会跳转到 `/login`。**没有任何方法级豁免**：`OPTIONS` 与其它方法一样要求会话 —— 早期版本对 `OPTIONS` 直接放行，等于给将来注册的 OPTIONS 路由留了一扇免登录的门，而 AutoGit 同源托管前端、不注册 CORS，本来就没有需要应答的预检。
+- **跨源**：不注册 `@fastify/cors` —— 开发模式前端经 Vite 同源代理访问 `/api`，生产模式由同一个后端托管前端，都不需要 CORS；而 `origin: true` 会把任意网站的 `Origin` 原样回填并允许携带凭证，等于让任意网站在受害者浏览器里读写本机接口。现在跨源请求拿不到任何 `Access-Control-*` 头，加上 Cookie 是 `HttpOnly; SameSite=Lax`，跨站子请求既带不上凭证也读不到响应。
+- **凭据**：密码用 scrypt（`N=16384, r=8, p=1`，随机盐）哈希后入库，校验走 `timingSafeEqual`；接口只返回用户名、「是否仍是默认密码」与活跃会话数，从不返回哈希或明文。每次登录恒定只跑一次 scrypt：用户名对不上时校验的是启动时就生成好的诱饵哈希，所以「用户名不存在」不会比「密码错误」更快（早期版本在用户名不匹配时短路，约 0ms vs 约 25ms，等于一个用户名探测器）。连续失败 5 次后进入退避窗口：窗口内直接 `429` +「请 N 秒后重试」，每次再失败窗口翻倍（1 秒 → 最长 30 秒），窗口自然过期，成功登录清零 —— 目的是把在线猜解从「scrypt 允许的最快速度」压到每秒一次量级，同时不给单用户工具留下永久锁死自己的开关。计数器是 `AuthService` 的内存态（重启即清零），且因为这个工具只有一个账号、按实例计数而不是按来源 IP 计数，换用户名重试同样躲不开。
+- **会话**：`login()` 用 `randomBytes(32)` 生成 token，库里只存 `sha256(token)`；Cookie 为 `HttpOnly; SameSite=Lax`。勾选「保持登录」时是 30 天滚动窗口：解析会话按 5 分钟节流把 `expires_at` 往后推，并在同一次响应里（`onSend` 钩子）补一个 `Set-Cookie` 把新的 `Max-Age` 交给浏览器 —— 只续库不续 Cookie 的话，浏览器仍会在登录后第 30 天删掉它，天天使用也会被强制重新登录。不勾选则是浏览器会话 Cookie，`expires_at` 固定在登录后 12 小时、不随访问顺延。过期的会话在解析与登录时顺手清理。实时连接是这条规则的一个例外：WebSocket 升级响应带不了 `Set-Cookie`，所以 `lib/realtime.ts` 在连接存活期间每 12 小时发一次 `GET /api/auth/session`（同一窗口内的重连按 5 分钟节流），让浏览器侧的 Cookie 跟着服务端一起顺延；该请求若返回 `401`，说明会话已在别处失效，同样走 `autogit:unauthorized` 广播。
+- **接口**：`POST /api/auth/login` 登录、`GET /api/auth/session` 查询状态、`POST /api/auth/logout` 吊销并清 Cookie、`PUT /api/auth/credentials` 修改账号/密码（必须提供当前密码）。
+- **改密码后轮换**：修改成功会删除全部旧会话并签发新会话，其他设备立即掉线，发起修改的浏览器拿新 Cookie 继续使用。删除会话会通过 `AuthService.onSessionRevoked()` 广播一次「会话已吊销」（改凭据 = 全部会话，退出登录 = 当前会话），`/api/realtime` 里已经建立的连接据此以 `4401` 关闭；此外每个连接每 30 秒用自己的 Cookie 复查一次会话，覆盖过期与清理这类没有广播的失效。
+- **默认凭据提示**：`auth_account.password_changed_at` 记录密码是否被改过（`NULL` = 仍是出厂密码），`GET /api/auth/session` 因此不再对默认账号跑一次约 25ms 的同步 scrypt；旧库没有这一列时，首次启动会用一次校验结果回填。
+- **前端**：`lib/auth.tsx` 把会话缓存在 React Query（key `auth-session`），`AuthProvider` 挂在 `App.tsx` 的 `Routes` 外层（因此仍在 `QueryClientProvider` 与 `BrowserRouter` 内，且与 `main.tsx` 的主题包裹层互不干扰）；`App.tsx` 的 `RequireAuth` 在会话未知时显示占位、未登录时跳转 `/login` 并记住原路径，登录后跳回。受保护接口返回 `401` 时 `lib/api.ts` 广播 `autogit:unauthorized`，上下文清空会话并关闭 WebSocket，路由随即回到登录页。
+- **自检**：`pnpm --filter @autogit/server auth:check`（`src/dev/auth-check.ts`）在临时数据目录里启动真实 HTTP 栈并断言 30 项行为：未登录 401（含不带会话的 `OPTIONS` 与预检样式请求）、百分号编码路径（`/%61pi/...`，含写操作、`OPTIONS` 与实时通道）同样 401、默认账号登录、未知用户名与错误密码不可区分（响应时间下界 + 相同文案）、保持登录 Cookie 与滚动续期（Cookie 同步续期，并按前移幅度核对库内 `expires_at`）、非保持登录的 12 小时上限、跨源请求无 CORS 头、会话摘要不做 scrypt、过期会话清理、改账号密码与会话轮换、退出登录、连续失败 5 次后的 `429` 限速与窗口过期后的自动恢复、在真实监听端口上用原始握手验证 WebSocket 升级（未登录 401、改凭据与退出登录后已建立的连接被 `4401` 关闭），以及旧库（缺 `password_changed_at` 列）升级时的回填。
 
 ## 9. 扩展点
 

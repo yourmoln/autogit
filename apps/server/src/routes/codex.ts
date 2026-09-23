@@ -1,13 +1,27 @@
+import type { CodexModelProbe } from '@autogit/shared';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 
 import type { AppContext } from '../context.js';
 import { buildFixPrompt, buildImplementPrompt, buildReviewPrompt } from '../services/prompts.js';
 import { HttpError, parseOrThrow } from '../util/http.js';
+import { logger } from '../util/logger.js';
 
 const configSchema = z.object({
   content: z.string().min(1, '配置内容不能为空'),
 });
+
+/** Records a probe outcome in the activity feed, for both probe entry points. */
+function recordProbe(ctx: AppContext, probe: CodexModelProbe): void {
+  ctx.store.addActivity({
+    level: probe.ready ? 'success' : 'warning',
+    scope: 'codex',
+    repositoryId: null,
+    message: probe.ready
+      ? `Codex 模型响应正常（${probe.durationMs ?? 0}ms）`
+      : `Codex 模型无响应：${probe.message ?? '未知原因'}`,
+  });
+}
 
 export function registerCodexRoutes(app: FastifyInstance, ctx: AppContext): void {
   app.get('/api/codex/status', async (request) => {
@@ -36,21 +50,22 @@ export function registerCodexRoutes(app: FastifyInstance, ctx: AppContext): void
   app.post('/api/codex/invalidate', async () => {
     ctx.codex.invalidate();
     // "重新检测" also refreshes the model probe, so the UI never shows a stale
-    // answer right after the user asked for a re-check.
-    await ctx.codex.modelProbe(true);
-    return { status: await ctx.codex.status({ force: true }) };
+    // answer right after the user asked for a re-check. The probe is a real
+    // model call that can take minutes, so it stays in the background: the
+    // request answers at once with `probing: true`, and the UI follows the
+    // result through /api/codex/status.
+    void ctx.codex
+      .modelProbe(true)
+      .then((probe) => recordProbe(ctx, probe))
+      .catch((error: unknown) => {
+        logger().warn({ err: error }, '后台模型探测失败');
+      });
+    return { status: await ctx.codex.status({ force: true }), probing: ctx.codex.isProbing() };
   });
 
   app.post('/api/codex/probe', async () => {
     const probe = await ctx.codex.modelProbe(true);
-    ctx.store.addActivity({
-      level: probe.ready ? 'success' : 'warning',
-      scope: 'codex',
-      repositoryId: null,
-      message: probe.ready
-        ? `Codex 模型响应正常（${probe.durationMs ?? 0}ms）`
-        : `Codex 模型无响应：${probe.message ?? '未知原因'}`,
-    });
+    recordProbe(ctx, probe);
     return { probe };
   });
 

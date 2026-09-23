@@ -3,7 +3,7 @@ import { Navigate, Outlet, Route, Routes, useLocation } from 'react-router-dom';
 
 import { AppShell } from './components/AppShell.js';
 import { Spinner } from './components/primitives.js';
-import { useAuth } from './lib/auth.js';
+import { AuthProvider, useAuth } from './lib/auth.js';
 import { AccountsPage } from './pages/AccountsPage.js';
 import { CodexPage } from './pages/CodexPage.js';
 import { DashboardPage } from './pages/DashboardPage.js';
@@ -16,24 +16,31 @@ import { SettingsPage } from './pages/SettingsPage.js';
 import { TasksPage } from './pages/TasksPage.js';
 
 export function App(): ReactNode {
+  // `AuthProvider` mounts here instead of in `main.tsx` on purpose: it needs to
+  // sit inside `QueryClientProvider` (it caches the session in React Query) and
+  // inside `BrowserRouter`, both of which already wrap `App` — and keeping the
+  // provider out of the entry file leaves the login wiring independent from the
+  // theme providers that wrap the very same render tree on `main`.
   return (
-    <Routes>
-      <Route path="/login" element={<LoginPage />} />
-      <Route element={<RequireAuth />}>
-        <Route element={<AppShell />}>
-          <Route path="/" element={<DashboardPage />} />
-          <Route path="/accounts" element={<AccountsPage />} />
-          <Route path="/repositories" element={<RepositoriesPage />} />
-          <Route path="/repositories/:id" element={<RepositoryDetailPage />} />
-          <Route path="/tasks" element={<TasksPage />} />
-          <Route path="/codex" element={<CodexPage />} />
-          <Route path="/proxy" element={<ProxyPage />} />
-          <Route path="/labels" element={<LabelsPage />} />
-          <Route path="/settings" element={<SettingsPage />} />
-          <Route path="*" element={<Navigate to="/" replace />} />
+    <AuthProvider>
+      <Routes>
+        <Route path="/login" element={<LoginPage />} />
+        <Route element={<RequireAuth />}>
+          <Route element={<AppShell />}>
+            <Route path="/" element={<DashboardPage />} />
+            <Route path="/accounts" element={<AccountsPage />} />
+            <Route path="/repositories" element={<RepositoriesPage />} />
+            <Route path="/repositories/:id" element={<RepositoryDetailPage />} />
+            <Route path="/tasks" element={<TasksPage />} />
+            <Route path="/codex" element={<CodexPage />} />
+            <Route path="/proxy" element={<ProxyPage />} />
+            <Route path="/labels" element={<LabelsPage />} />
+            <Route path="/settings" element={<SettingsPage />} />
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Route>
         </Route>
-      </Route>
-    </Routes>
+      </Routes>
+    </AuthProvider>
   );
 }
 

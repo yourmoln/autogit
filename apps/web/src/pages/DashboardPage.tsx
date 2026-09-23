@@ -235,7 +235,7 @@ export function DashboardPage(): ReactNode {
                   >
                     <span
                       className={cn(
-                        'absolute -left-3.5 top-1 h-2 w-2 rounded-full ring-4 ring-[#0a0d12]',
+                        'absolute -left-3.5 top-1 h-2 w-2 rounded-full ring-4 ring-canvas',
                         entry.level === 'success' && 'bg-emerald-400',
                         entry.level === 'info' && 'bg-indigo-400',
                         entry.level === 'warning' && 'bg-amber-400',

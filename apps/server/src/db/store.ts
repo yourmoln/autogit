@@ -685,6 +685,29 @@ export class Store {
     );
   }
 
+  // -------------------------------------------------------- snapshot labels
+
+  /**
+   * Overwrites the labels of a tracked Issue/PR snapshot.
+   *
+   * AutoGit writes the labels it just pushed to the remote straight back into
+   * the local row, so boards, counters and the retry gate agree with the remote
+   * without waiting for the next poll (default 45s). Rows that are not tracked
+   * anymore are left untouched.
+   */
+  setItemLabels(input: {
+    repositoryId: string;
+    number: number;
+    labels: string[];
+    isPullRequest: boolean;
+  }): void {
+    const table = input.isPullRequest ? 'pull_requests' : 'issues';
+    this.db.run(
+      `UPDATE ${table} SET labels = ?, synced_at = ? WHERE repository_id = ? AND number = ?`,
+      [JSON.stringify(input.labels), nowIso(), input.repositoryId, input.number],
+    );
+  }
+
   // ------------------------------------------------------------------ tasks
 
   createTask(input: TaskCreateInput): TaskRecord {

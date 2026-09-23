@@ -50,7 +50,9 @@ export function CodexPage(): ReactNode {
   const status = useQuery({
     queryKey: ['codex-status'],
     queryFn: () => api.codex.status(false),
-    refetchInterval: 60_000,
+    // A background probe started by "重新检测" is followed through the status
+    // payload, so poll faster until it lands.
+    refetchInterval: (query) => (query.state.data?.status.probing ? 5_000 : 60_000),
   });
 
   const install = useQuery({
@@ -112,8 +114,8 @@ export function CodexPage(): ReactNode {
   const recheck = useMutation({
     mutationFn: api.codex.invalidate,
     onSuccess: (data) => {
-      queryClient.setQueryData(['codex-status'], data);
-      toast.success('已重新检测 Codex CLI');
+      queryClient.setQueryData(['codex-status'], { status: data.status });
+      toast.success(data.probing ? '已重新检测，模型探测在后台进行中…' : '已重新检测 Codex CLI');
     },
     onError: (error) => toast.error(errorMessage(error)),
   });
@@ -130,7 +132,7 @@ export function CodexPage(): ReactNode {
   });
 
   const modelProbe = codexStatus?.modelProbe ?? null;
-  const probeChip = probeSummary(modelProbe, probe.isPending);
+  const probeChip = probeSummary(modelProbe, probe.isPending || codexStatus?.probing === true);
 
   return (
     <div className="space-y-4">

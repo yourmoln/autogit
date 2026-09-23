@@ -144,9 +144,13 @@ export class Orchestrator {
    * They are recorded as `cancelled` (not `failed`, so they do not consume the
    * 3-attempt budget) and the next tick re-derives the work from the labels
    * that are still on the Issue / PR.
+   *
+   * Only rows without a worker are released: `restart()` keeps the queue and
+   * the running tasks alive, and those must never be reported as interrupted
+   * (their queued task would be marked `cancelled` and then executed anyway).
    */
   private reconcileInterruptedTasks(): void {
-    const interrupted = this.deps.store.listActiveTasks();
+    const interrupted = this.deps.store.listActiveTasks().filter((task) => !this.owns(task.id));
     if (interrupted.length === 0) return;
 
     const message = '服务重启，任务被中断；将按 Issue/PR 上的标签重新调度';
@@ -167,6 +171,24 @@ export class Orchestrator {
     }
 
     this.log.warn({ count: interrupted.length }, 'reconciled tasks interrupted by a restart');
+  }
+
+  /** Whether this process still holds the queue entry / worker of a task. */
+  private owns(taskId: string): boolean {
+    return this.running.has(taskId) || this.queue.some((entry) => entry.taskId === taskId);
+  }
+
+  /**
+   * Restarts polling to pick up changed settings.
+   *
+   * Unlike a process restart, the work this process owns survives: queued tasks
+   * stay in the queue and in-flight runs are aborted by `stop()` and then
+   * re-derived from their labels by the next tick. Nothing here writes
+   * "interrupted by a restart" state for tasks that keep running.
+   */
+  restart(): void {
+    this.stop();
+    this.start();
   }
 
   private scheduleNext(delayMs: number): void {
@@ -495,6 +517,7 @@ export class Orchestrator {
       });
       if (attempts >= MAX_ATTEMPTS_PER_ITEM) {
         await this.markStuck(
+          repository.id,
           provider,
           ref,
           { number: issue.number, labels: issue.labels, isPullRequest: false },
@@ -552,6 +575,7 @@ export class Orchestrator {
           });
           if (attempts >= MAX_ATTEMPTS_PER_ITEM) {
             await this.markStuck(
+              repository.id,
               provider,
               ref,
               { number: pr.number, labels: pr.labels, isPullRequest: true },
@@ -594,6 +618,7 @@ export class Orchestrator {
         });
         if (attempts >= MAX_ATTEMPTS_PER_ITEM) {
           await this.markStuck(
+            repository.id,
             provider,
             ref,
             { number: pr.number, labels: pr.labels, isPullRequest: true },
@@ -665,6 +690,7 @@ export class Orchestrator {
         });
       } else if (pr.state === 'closed') {
         await this.markStuck(
+          repository.id,
           provider,
           ref,
           { number: issue.number, labels: issue.labels, isPullRequest: false },
@@ -990,6 +1016,10 @@ export class Orchestrator {
         await this.handleFailure(entry, message).catch((nested: unknown) => {
           this.log.warn({ err: nested }, 'failed to record failure state');
         });
+        // `handleFailure` has just written `ai/stuck` to the remote *and* the
+        // local snapshot, so re-emit: the retry button becomes clickable now
+        // instead of after the next poll.
+        this.emitTask(entry.taskId);
       }
     } finally {
       this.deps.store.pruneLogs(entry.taskId);
@@ -1490,27 +1520,45 @@ export class Orchestrator {
     }
   }
 
+  /**
+   * Parks an Issue/PR on `ai/stuck` and explains how to hand it back.
+   *
+   * The labels are mirrored into the local snapshot as well: the retry gate
+   * (`withRetryState`) and the boards read that snapshot, and the poller may be
+   * a full `pollSeconds` away — without the write-back the retry button stayed
+   * disabled until the next round even though the task was already stuck.
+   */
   private async markStuck(
+    repositoryId: string,
     provider: GitProvider,
     ref: RepoRef,
     target: { number: number; labels: string[]; isPullRequest: boolean },
     reason: string,
   ): Promise<void> {
-    if (target.labels.includes('ai/stuck')) return;
+    const alreadyStuck = target.labels.includes('ai/stuck');
     // `ai/stuck` replaces the pipeline slot without dropping the previous
     // status label, so a human can see where the run stopped and hand it back.
-    const finalLabels = [...new Set([...target.labels, 'ai/stuck'])];
+    const finalLabels = alreadyStuck ? target.labels : [...new Set([...target.labels, 'ai/stuck'])];
 
-    await provider.setLabels(ref, {
+    if (!alreadyStuck) {
+      await provider.setLabels(ref, {
+        number: target.number,
+        labels: finalLabels,
+        isPullRequest: target.isPullRequest,
+      });
+      await provider.createComment(
+        ref,
+        target.number,
+        `${AI_MARKER}\n## ⛔ AI 流水线已阻塞\n\n${reason}`,
+      );
+    }
+
+    this.deps.store.setItemLabels({
+      repositoryId,
       number: target.number,
       labels: finalLabels,
       isPullRequest: target.isPullRequest,
     });
-    await provider.createComment(
-      ref,
-      target.number,
-      `${AI_MARKER}\n## ⛔ AI 流水线已阻塞\n\n${reason}`,
-    );
   }
 
   private async handleFailure(entry: QueueEntry, message: string): Promise<void> {
@@ -1534,6 +1582,7 @@ export class Orchestrator {
 
     if (!target) return;
     await this.markStuck(
+      repository.id,
       provider,
       ref,
       target,
@@ -1657,9 +1706,87 @@ function buildVerificationHints(repository: RepositoryRecord): string[] {
   return hints;
 }
 
+/** Pull request sections the repository convention requires in every PR body. */
+const ASSUMPTIONS_HEADING = '实现假设清单';
+const DIAGRAM_HEADING = '代码逻辑图';
+
+/** Used when the implement agent did not report any assumption of its own. */
+const FALLBACK_ASSUMPTIONS = '- 无额外假设：按 Issue 描述与仓库既有约定实现。';
+
+/** Title of a Markdown heading line, `null` when the line is not a heading. */
+function headingTitle(line: string): string | null {
+  const match = line.match(/^\s*#{1,6}\s*(.+?)\s*$/);
+  // A trailing ":" / "：" is common when a model writes headings by hand.
+  return match?.[1] ? match[1].replace(/[:：]\s*$/, '') : null;
+}
+
+/**
+ * Reads one `## 标题` section out of the implement agent's summary.
+ *
+ * The summary is free-form prose written by the model, so both required PR
+ * sections are extracted by their heading and the rest stays in 改动说明.
+ */
+function extractSummarySection(summary: string, heading: string): string | null {
+  const lines = summary.split(/\r?\n/);
+  const start = lines.findIndex((line) => headingTitle(line) === heading);
+  if (start === -1) return null;
+
+  const body: string[] = [];
+  for (const line of lines.slice(start + 1)) {
+    if (headingTitle(line) !== null) break;
+    body.push(line);
+  }
+
+  const text = body.join('\n').trim();
+  return text.length > 0 ? text : null;
+}
+
+/** Drops the extracted sections so they are not repeated in 改动说明. */
+function withoutSummarySections(summary: string, headings: string[]): string {
+  const kept: string[] = [];
+  let skipping = false;
+
+  for (const line of summary.split(/\r?\n/)) {
+    const title = headingTitle(line);
+    if (title !== null) {
+      skipping = headings.includes(title);
+      if (skipping) continue;
+    } else if (skipping) {
+      continue;
+    }
+    kept.push(line);
+  }
+
+  return kept.join('\n').trim();
+}
+
+/**
+ * Diagram of the pipeline that produced the pull request.
+ *
+ * Only used when the implement agent reported no diagram of its own: the
+ * repository convention wants 代码逻辑图 in every PR body, non-empty.
+ */
+function buildPipelineDiagram(issue: RemoteIssue, baseBranch: string): string {
+  return `\`\`\`mermaid
+flowchart TD
+    A["Issue #${issue.number} 打上 ai/todo"] --> B["Orchestrator 轮询领取"]
+    B --> C["Codex 实现改动并运行验证"]
+    C --> D["提交并推送分支"]
+    D --> E["创建 PR → ai/needs-review"]
+    E --> F["AI 评审"]
+    F -->|needs_fix| G["按评审意见修复"]
+    G --> E
+    F -->|approve| H["ai/approved"]
+    H --> I["人工合并到 ${baseBranch}"]
+\`\`\``;
+}
+
 function buildCommitMessage(issue: RemoteIssue, summary: string): string {
   const title = issue.title.length > 60 ? `${issue.title.slice(0, 57)}…` : issue.title;
-  const body = summary.trim().slice(0, 3000) || 'AutoGit 自动实现';
+  // The two PR-only sections would only add noise to the commit history.
+  const body =
+    withoutSummarySections(summary, [ASSUMPTIONS_HEADING, DIAGRAM_HEADING]).slice(0, 3000) ||
+    'AutoGit 自动实现';
   return `feat: 实现 #${issue.number} ${title}\n\n${body}`;
 }
 
@@ -1677,13 +1804,28 @@ export function buildPullRequestBody(
   baseBranch: string,
 ): string {
   const list = files.slice(0, 40).join('\n');
+  const assumptions = extractSummarySection(summary, ASSUMPTIONS_HEADING) ?? FALLBACK_ASSUMPTIONS;
+  const diagram =
+    extractSummarySection(summary, DIAGRAM_HEADING) ?? buildPipelineDiagram(issue, baseBranch);
+  const description =
+    withoutSummarySections(summary, [ASSUMPTIONS_HEADING, DIAGRAM_HEADING]) ||
+    '由 AutoGit 自动生成。';
+
   return `## 关联 Issue
 
 Closes #${issue.number}
 
 ## 改动说明
 
-${summary.trim() || '由 AutoGit 自动生成。'}
+${description}
+
+## ${ASSUMPTIONS_HEADING}
+
+${assumptions}
+
+## ${DIAGRAM_HEADING}
+
+${diagram}
 
 ## 改动文件
 

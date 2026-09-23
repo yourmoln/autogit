@@ -153,7 +153,7 @@ stateDiagram-v2
 | 版本识别 | 执行 `codex --version`，从 `codex-cli x.y.z` 中解析版本号 |
 | 能力探测 | 解析 `codex exec --help` 与 `codex --help`，只在支持时追加 `--json`、`--sandbox`、`--cd`、`--output-last-message`、`--output-schema`、`-c` 等参数 |
 | 安装 / 更新 | 已安装且支持 `codex update` 时执行自更新，否则回退到 `npm install -g @openai/codex@latest`；输出实时推送前端 |
-| 模型响应 | 用固定提示词执行一次最小的 `codex exec`（只读沙箱、AutoGit 数据目录内运行），按退出码与输出判断模型能否响应；结果缓存 5 分钟，凭证始终由 Codex CLI 自己管理 |
+| 模型响应 | 用固定提示词执行一次最小的 `codex exec`（只读沙箱、AutoGit 数据目录内运行），按退出码与输出判断模型能否响应；结果缓存 5 分钟，同一时刻只跑一次探测，凭证始终由 Codex CLI 自己管理。`POST /api/codex/invalidate`（页面上的「重新检测」）只清缓存并在后台触发探测，请求立即返回，状态接口用 `probing` 字段跟进；「测试模型响应」按钮才会等待探测结果 |
 | 配置管理 | 直接编辑 `$CODEX_HOME/config.toml`，保存前做 TOML 校验，自动备份并保留最近 10 份 |
 | 执行方式 | `codex exec --json -` 从 stdin 读取提示词；评审任务额外使用 `--output-schema` 强制结构化结论 |
 | 隔离 | 每个仓库一个工作区（`~/.autogit/workspaces/<repoId>`），任务级目录存放提示词、JSON Schema 与最后一条消息 |
@@ -203,7 +203,7 @@ pnpm build        # shared → server → web
 pnpm simulate     # 端到端模拟：真实 git + 假 Codex + 假 Git 平台
 ```
 
-`pnpm simulate` 会在临时目录中创建裸仓库，跑完整链路（初始化 15 个标签 → 实现 → 建 PR → 评审不通过 → 修复 → 复审通过 → 合并 → `ai/verify`），并断言每一步的标签与产物，最后自动清理。
+`pnpm simulate` 会在临时目录中创建裸仓库，跑完整链路（初始化 15 个标签 → 实现 → 建 PR → 评审不通过 → 修复 → 复审通过 → 合并 → `ai/verify`），断言每一步的标签与产物；随后再经真实 HTTP 路由回归三处边界：失败后重试门禁立即放行、`POST /api/codex/invalidate` 不内联等待模型探测、`POST /api/orchestrator/restart` 不误伤在途任务。最后自动清理。
 
 ## 常见问题
 

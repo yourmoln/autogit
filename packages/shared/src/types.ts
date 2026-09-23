@@ -255,6 +255,11 @@ export interface CodexStatus {
   capabilities: CodexCapabilities | null;
   /** Result of the last model probe, `null` means no probe ran yet. */
   modelProbe: CodexModelProbe | null;
+  /**
+   * `true` while a probe runs. The probe is a real model call that can take
+   * minutes, so it runs in the background and the UI follows it through here.
+   */
+  probing: boolean;
   checkedAt: string;
   /** Populated when the CLI is present but a probe failed. */
   warning: string | null;

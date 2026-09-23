@@ -209,7 +209,12 @@ export const api = {
       request<{ status: CodexStatus }>(`/api/codex/status${force ? '?force=1' : ''}`),
     install: () => request<{ state: CodexInstallState }>('/api/codex/install', { method: 'POST' }),
     installState: () => request<{ state: CodexInstallState }>('/api/codex/install'),
-    invalidate: () => request<{ status: CodexStatus }>('/api/codex/invalidate', { method: 'POST' }),
+    // The model probe runs in the background, so the response reports whether
+    // it is still in flight instead of waiting for it.
+    invalidate: () =>
+      request<{ status: CodexStatus; probing: boolean }>('/api/codex/invalidate', {
+        method: 'POST',
+      }),
     probe: () => request<{ probe: CodexModelProbe }>('/api/codex/probe', { method: 'POST' }),
     config: () =>
       request<{

@@ -11,7 +11,7 @@ import {
   DEFAULT_AUTH_USERNAME,
 } from '@autogit/shared';
 
-import type { Store } from '../db/store.js';
+import type { AuthAccountRecord, Store } from '../db/store.js';
 import { HttpError } from '../util/http.js';
 import { logger } from '../util/logger.js';
 import { nowIso } from '../util/time.js';
@@ -35,6 +35,17 @@ const SCRYPT_PREFIX = 'scrypt';
 
 export function hashSessionToken(token: string): string {
   return createHash('sha256').update(token).digest('hex');
+}
+
+/**
+ * `Max-Age` of the session cookie, or `null` for a browser session cookie.
+ *
+ * "保持登录" sessions carry their sliding 30 day window; everything else lives
+ * only as long as the browser keeps the cookie.
+ */
+export function sessionCookieMaxAge(session: AuthSession): number | null {
+  if (!session.persistent) return null;
+  return Math.max(0, Math.floor((Date.parse(session.expiresAt) - Date.now()) / 1000));
 }
 
 /**
@@ -124,6 +135,26 @@ export interface AuthLoginResult {
   session: AuthSession;
 }
 
+export interface ResolvedAuthSession {
+  session: AuthSession;
+  /** SHA-256 of the presented token; identifies the session to live streams. */
+  tokenHash: string;
+  /**
+   * `true` when this call slid the expiry forward, i.e. the browser cookie has
+   * to be re-issued with the new `Max-Age` as well.
+   */
+  renewed: boolean;
+}
+
+/**
+ * Sessions that just stopped being valid.
+ *
+ * `null` means "every session" (a credential change rotates all of them), an
+ * array names the affected token hashes. Live WebSocket clients subscribe to
+ * this because the handshake check only covers new connections.
+ */
+export type RevokedSessions = readonly string[] | null;
+
 /**
  * Login gate for the whole app.
  *
@@ -133,16 +164,23 @@ export interface AuthLoginResult {
  * "one account, no user table".
  */
 export class AuthService {
+  private readonly revocationListeners = new Set<(revoked: RevokedSessions) => void>();
+
   constructor(private readonly store: Store) {}
 
   /** Creates the factory `admin` / `admin` credentials on first start. */
   bootstrap(): void {
     this.pruneExpiredSessions();
-    if (this.store.getAuthAccount()) return;
+    const account = this.store.getAuthAccount();
+    if (account) {
+      this.backfillPasswordChangedAt(account);
+      return;
+    }
 
     this.store.upsertAuthAccount({
       username: DEFAULT_AUTH_USERNAME,
       passwordHash: hashPassword(DEFAULT_AUTH_PASSWORD),
+      passwordChanged: false,
     });
     logger().warn(
       `已创建默认登录账号 ${DEFAULT_AUTH_USERNAME} / ${DEFAULT_AUTH_PASSWORD}，请尽快在「设置」页修改`,
@@ -189,7 +227,7 @@ export class AuthService {
    * Resolves a bearer token. Returns `null` for unknown, expired or revoked
    * sessions, which is exactly what the API guard turns into HTTP 401.
    */
-  resolveSession(token: string | null | undefined): AuthSession | null {
+  resolveSession(token: string | null | undefined): ResolvedAuthSession | null {
     const raw = token?.trim();
     if (!raw) return null;
 
@@ -199,39 +237,58 @@ export class AuthService {
 
     const now = Date.now();
     if (Date.parse(record.expiresAt) <= now) {
-      this.store.deleteAuthSession(tokenHash);
+      this.dropSession(tokenHash);
       return null;
     }
 
     // Credentials were replaced (or removed) after this session was issued.
     const account = this.store.getAuthAccount();
     if (!account || !sameUsername(account.username, record.username)) {
-      this.store.deleteAuthSession(tokenHash);
+      this.dropSession(tokenHash);
       return null;
     }
 
     let { lastSeenAt, expiresAt } = record;
-    // Sliding expiry: an active "保持登录" session never logs you out, but the
-    // renewal is throttled so pollers do not turn into write storms.
-    if (now - Date.parse(record.lastSeenAt) > TOUCH_INTERVAL_MS) {
+    let renewed = false;
+    // Sliding expiry: an active "保持登录" session keeps its full 30 day window,
+    // but the renewal is throttled so pollers do not turn into write storms.
+    // Sessions without "保持登录" are capped by their 12 hour TTL instead of
+    // sliding, so leaving a tab open cannot turn them into a permanent login.
+    if (record.persistent && now - Date.parse(record.lastSeenAt) > TOUCH_INTERVAL_MS) {
       lastSeenAt = new Date(now).toISOString();
       expiresAt = new Date(now + sessionTtlMs(record.persistent)).toISOString();
       this.store.touchAuthSession(tokenHash, lastSeenAt, expiresAt);
+      renewed = true;
     }
 
     return {
-      username: account.username,
-      persistent: record.persistent,
-      createdAt: record.createdAt,
-      lastSeenAt,
-      expiresAt,
+      tokenHash,
+      renewed,
+      session: {
+        username: account.username,
+        persistent: record.persistent,
+        createdAt: record.createdAt,
+        lastSeenAt,
+        expiresAt,
+      },
+    };
+  }
+
+  /**
+   * Observes revocation, so an already established realtime connection can be
+   * closed the moment its session disappears.
+   */
+  onSessionRevoked(listener: (revoked: RevokedSessions) => void): () => void {
+    this.revocationListeners.add(listener);
+    return () => {
+      this.revocationListeners.delete(listener);
     };
   }
 
   logout(token: string | null | undefined): void {
     const raw = token?.trim();
     if (!raw) return;
-    this.store.deleteAuthSession(hashSessionToken(raw));
+    this.dropSession(hashSessionToken(raw));
   }
 
   credentialsSummary(): AuthCredentialsSummary {
@@ -240,9 +297,12 @@ export class AuthService {
     return {
       username: account.username,
       updatedAt: account.updatedAt,
+      // Cheap on purpose: this runs on every `GET /api/auth/session`. Asking the
+      // stored hash whether it still verifies the factory password would mean a
+      // blocking scrypt on each page load, so `password_changed_at` records it.
       defaultCredentials:
         sameUsername(account.username, DEFAULT_AUTH_USERNAME) &&
-        verifyPasswordHash(DEFAULT_AUTH_PASSWORD, account.passwordHash),
+        account.passwordChangedAt === null,
       activeSessions: this.store.countAuthSessions(nowIso()),
     };
   }
@@ -280,12 +340,14 @@ export class AuthService {
       this.store.upsertAuthAccount({
         username,
         passwordHash: password ? hashPassword(password) : account.passwordHash,
+        passwordChanged: password !== null,
       });
     }
 
     // Rotate every session: other browsers lose access immediately, and the
     // caller gets a fresh token below.
     this.store.deleteAuthSessions();
+    this.announceRevocation(null);
 
     const persistent = input.persistent ?? false;
     const token = randomBytes(32).toString('base64url');
@@ -313,5 +375,33 @@ export class AuthService {
 
   private pruneExpiredSessions(): void {
     this.store.deleteExpiredAuthSessions(nowIso());
+  }
+
+  /** Deletes a session and tells live streams that it is gone. */
+  private dropSession(tokenHash: string): void {
+    if (this.store.deleteAuthSession(tokenHash) === 0) return;
+    this.announceRevocation([tokenHash]);
+  }
+
+  private announceRevocation(revoked: RevokedSessions): void {
+    for (const listener of [...this.revocationListeners]) {
+      try {
+        listener(revoked);
+      } catch {
+        // A broken socket must never break a logout or a credential change.
+      }
+    }
+  }
+
+  /**
+   * Databases written before `password_changed_at` existed cannot say whether
+   * the password was ever replaced. Verify once at startup — a single scrypt —
+   * and persist the answer so the request path never has to ask again.
+   */
+  private backfillPasswordChangedAt(account: AuthAccountRecord): void {
+    if (account.passwordChangedAt !== null) return;
+    if (account.updatedAt === account.createdAt) return;
+    if (verifyPasswordHash(DEFAULT_AUTH_PASSWORD, account.passwordHash)) return;
+    this.store.markAuthPasswordChanged(account.updatedAt);
   }
 }

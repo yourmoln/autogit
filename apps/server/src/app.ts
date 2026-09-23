@@ -1,6 +1,5 @@
 import { existsSync } from 'node:fs';
 
-import cors from '@fastify/cors';
 import fastifyStatic from '@fastify/static';
 import websocket from '@fastify/websocket';
 import Fastify, { type FastifyInstance } from 'fastify';
@@ -9,7 +8,7 @@ import { ensureRuntimeDirectories, type RuntimeConfig } from './config.js';
 import { type AppContext, createContext } from './context.js';
 import { ApiError } from './providers/index.js';
 import { registerRoutes } from './routes/index.js';
-import { HttpError } from './util/http.js';
+import { decodeRequestPath, HttpError, isApiPath } from './util/http.js';
 import { initLogger, logger } from './util/logger.js';
 
 /**
@@ -32,10 +31,10 @@ export async function buildServer(config: RuntimeConfig): Promise<{
     bodyLimit: 8 * 1024 * 1024,
   });
 
-  await app.register(cors, {
-    origin: true,
-    credentials: true,
-  });
+  // No CORS plugin on purpose. The console is served from this very origin (dev
+  // goes through the Vite proxy), so nothing needs cross-origin access — while
+  // `origin: true` with credentials echoed any website's `Origin` back and let it
+  // read this API through the visitor's browser.
   await app.register(websocket);
 
   if (config.webDist && existsSync(config.webDist)) {
@@ -50,7 +49,7 @@ export async function buildServer(config: RuntimeConfig): Promise<{
 
   // SPA fallback: everything that is not an API call renders the web app.
   app.setNotFoundHandler((request, reply) => {
-    if (request.url.startsWith('/api/')) {
+    if (isApiPath(decodeRequestPath(request.url))) {
       return reply.code(404).send({ error: `接口不存在：${request.method} ${request.url}` });
     }
     if (config.webDist && existsSync(config.webDist)) {

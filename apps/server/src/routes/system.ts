@@ -2,6 +2,19 @@ import { AI_LABELS, PROVIDER_META } from '@autogit/shared';
 import type { FastifyInstance } from 'fastify';
 
 import type { AppContext } from '../context.js';
+import { AUTH_SESSION_COOKIE } from '../services/auth.js';
+import { readCookie } from '../util/cookies.js';
+
+/**
+ * Close code for "the session behind this socket is gone".
+ *
+ * The SPA treats it like any other disconnect and reconnects, which fails at the
+ * handshake while the cookie stays invalid, so the user lands back on the login
+ * page after the next API call.
+ */
+const SESSION_GONE_CLOSE_CODE = 4401;
+/** How often an open socket re-checks that its own session is still valid. */
+const SESSION_RECHECK_MS = 30_000;
 
 export function registerSystemRoutes(app: FastifyInstance, ctx: AppContext): void {
   app.get('/api/health', async () => ({
@@ -81,8 +94,41 @@ export function registerSystemRoutes(app: FastifyInstance, ctx: AppContext): voi
       socket.send(JSON.stringify(event));
     });
 
-    socket.on('close', unsubscribe);
-    socket.on('error', unsubscribe);
+    // The handshake only proves the session once. A session that disappears
+    // afterwards — logout, credential rotation — has to close the sockets it
+    // already authorised, otherwise a browser that lost its session keeps
+    // receiving task logs.
+    const sessionHash = request.authSessionHash;
+    const closeForSession = (reason: string): void => {
+      try {
+        socket.close(SESSION_GONE_CLOSE_CODE, reason);
+      } catch {
+        // The socket is already gone; nothing left to close.
+      }
+    };
+
+    const unsubscribeRevocation = ctx.auth.onSessionRevoked((revoked) => {
+      if (!sessionHash) return;
+      if (revoked === null || revoked.includes(sessionHash)) {
+        closeForSession('登录状态已失效，请重新登录');
+      }
+    });
+
+    // Backstop for what the revocation hook cannot see: the session expired (or
+    // was pruned) while this socket sat idle.
+    const recheck = setInterval(() => {
+      const token = readCookie(request.headers.cookie, AUTH_SESSION_COOKIE);
+      if (!ctx.auth.resolveSession(token)) closeForSession('登录状态已失效，请重新登录');
+    }, SESSION_RECHECK_MS);
+    recheck.unref();
+
+    const cleanup = (): void => {
+      clearInterval(recheck);
+      unsubscribeRevocation();
+      unsubscribe();
+    };
+    socket.on('close', cleanup);
+    socket.on('error', cleanup);
     request.log.debug('realtime client connected');
   });
 }

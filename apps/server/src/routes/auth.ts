@@ -1,9 +1,13 @@
 import type { AuthSessionPayload } from '@autogit/shared';
-import type { FastifyInstance, FastifyReply } from 'fastify';
+import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 
 import type { AppContext } from '../context.js';
-import { AUTH_SESSION_COOKIE, type AuthLoginResult } from '../services/auth.js';
+import {
+  AUTH_SESSION_COOKIE,
+  type AuthLoginResult,
+  sessionCookieMaxAge,
+} from '../services/auth.js';
 import { clearCookie, readCookie, serializeCookie } from '../util/cookies.js';
 import { parseOrThrow } from '../util/http.js';
 
@@ -22,17 +26,23 @@ const credentialsSchema = z.object({
 });
 
 function sendSessionCookie(reply: FastifyReply, result: AuthLoginResult, secure: boolean): void {
-  const maxAgeSeconds = result.session.persistent
-    ? Math.max(0, Math.floor((Date.parse(result.session.expiresAt) - Date.now()) / 1000))
-    : null;
   reply.header(
     'set-cookie',
-    serializeCookie(AUTH_SESSION_COOKIE, result.token, { maxAgeSeconds, secure }),
+    serializeCookie(AUTH_SESSION_COOKIE, result.token, {
+      maxAgeSeconds: sessionCookieMaxAge(result.session),
+      secure,
+    }),
   );
 }
 
-function sessionPayload(ctx: AppContext, token: string | null): AuthSessionPayload {
-  const session = ctx.auth.resolveSession(token);
+/**
+ * Answer to `GET /api/auth/session`.
+ *
+ * The guard resolves the cookie for this public route as well, which is also what
+ * keeps a "保持登录" session sliding while the SPA polls for its state.
+ */
+function sessionPayload(ctx: AppContext, request: FastifyRequest): AuthSessionPayload {
+  const session = request.authSession;
   return {
     authenticated: session !== null,
     session,
@@ -78,9 +88,7 @@ export function registerAuthRoutes(app: FastifyInstance, ctx: AppContext): void 
   });
 
   app.post('/api/auth/logout', async (request, reply) => {
-    const session = ctx.auth.resolveSession(
-      readCookie(request.headers.cookie, AUTH_SESSION_COOKIE),
-    );
+    const session = request.authSession;
     ctx.auth.logout(readCookie(request.headers.cookie, AUTH_SESSION_COOKIE));
     reply.header(
       'set-cookie',
@@ -100,7 +108,7 @@ export function registerAuthRoutes(app: FastifyInstance, ctx: AppContext): void 
 
   /** Public endpoint: the SPA asks who it is before rendering any page. */
   app.get('/api/auth/session', async (request) =>
-    sessionPayload(ctx, readCookie(request.headers.cookie, AUTH_SESSION_COOKIE)),
+    sessionPayload(ctx, request),
   );
 
   app.put('/api/auth/credentials', async (request, reply) => {

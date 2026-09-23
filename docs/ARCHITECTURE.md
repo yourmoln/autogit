@@ -45,7 +45,7 @@ flowchart LR
 | `task_logs` | 逐行日志 | `task_id`、`stream`(system/stdout/stderr/agent/command/git)、`message` |
 | `activity` | 操作流水 | `level`、`scope`、`repository_id`、`message` |
 | `settings` | 全局设置 | JSON 值，键与 `AppSettings` 字段一一对应；`proxy` 键存代理通道（地址加密） |
-| `auth_account` | 登录账号 | 恒定一行（`id = 'default'`）：`username`、`password_hash`（scrypt）、`updated_at` |
+| `auth_account` | 登录账号 | 恒定一行（`id = 'default'`）：`username`、`password_hash`（scrypt）、`password_changed_at`（`NULL` = 仍是出厂密码）、`updated_at` |
 | `auth_sessions` | 登录会话 | `token_hash`（token 的 SHA-256）、`persistent`（保持登录）、`created_at`、`last_seen_at`、`expires_at` |
 | `schema_migrations` | 迁移版本 | 迁移在事务中执行，启动时自动补齐 |
 
@@ -61,7 +61,7 @@ AutoGit 是单用户本地工具，所以没有用户表：`auth_account` 恒定
 flowchart LR
     UI[React 控制台] -->|未登录| LOGIN["/login 登录页"]
     LOGIN -->|POST /api/auth/login| GUARD
-    UI -->|"Cookie: autogit_session"| GUARD{Fastify onRequest 守卫}
+    UI -->|"Cookie: autogit_session"| GUARD{"Fastify onRequest 守卫 · 路由模板 + 解码路径"}
     GUARD -->|白名单| PUBLIC[login / session / logout]
     GUARD -->|校验会话| AUTH[AuthService.resolveSession]
     AUTH -->|命中且未过期| ROUTE[业务路由 + WebSocket]
@@ -69,13 +69,15 @@ flowchart LR
     E401 --> LOGIN
 ```
 
-- **守卫**：`routes/index.ts` 在 `registerRoutes()` 内注册 `onRequest` 钩子，`/api` 下除 `login` / `session` / `logout` 外一律要求有效会话，否则直接 `401`。`/api/realtime` 的 WebSocket 升级请求走同一钩子，所以未登录连不上实时通道；静态资源（SPA 的 HTML/JS）保持公开，前端才有机会跳转到 `/login`。
+- **守卫**：`routes/index.ts` 在 `registerRoutes()` 内注册 `onRequest` 钩子，判断依据是**路由器匹配到的路由模板**（`request.routeOptions.url`）：`/api` 下除 `login` / `session` / `logout` 外一律要求有效会话，否则直接 `401`。路由器匹配的是百分号解码后的路径，所以 `/%61pi/system/overview` 与 `/api/system/overview` 命中同一条路由、也走同一道门禁 —— 早期版本按原始 `request.url` 做字符串比较，编码写法能整条绕开白名单（实测未登录即可读写全部接口与实时通道）。没匹配到路由的请求只会落到 404 / SPA 兜底，这里再按解码后的路径复查一遍，因此编码的 `/api` 前缀既跑不到处理器，也选不中公开白名单。`/api/realtime` 的 WebSocket 升级请求走同一钩子，所以未登录连不上实时通道；静态资源（SPA 的 HTML/JS）保持公开，前端才有机会跳转到 `/login`。
+- **跨源**：不注册 `@fastify/cors` —— 开发模式前端经 Vite 同源代理访问 `/api`，生产模式由同一个后端托管前端，都不需要 CORS；而 `origin: true` 会把任意网站的 `Origin` 原样回填并允许携带凭证，等于让任意网站在受害者浏览器里读写本机接口。现在跨源请求拿不到任何 `Access-Control-*` 头，加上 Cookie 是 `HttpOnly; SameSite=Lax`，跨站子请求既带不上凭证也读不到响应。
 - **凭据**：密码用 scrypt（`N=16384, r=8, p=1`，随机盐）哈希后入库，校验走 `timingSafeEqual`；接口只返回用户名、「是否仍是默认密码」与活跃会话数，从不返回哈希或明文。
-- **会话**：`login()` 用 `randomBytes(32)` 生成 token，库里只存 `sha256(token)`；Cookie 为 `HttpOnly; SameSite=Lax`，勾选「保持登录」时带 30 天 `Max-Age` 并每次访问滚动续期（写库按 5 分钟节流），不勾选则是浏览器会话 Cookie（上限 12 小时）。过期的会话在解析与登录时顺手清理。
+- **会话**：`login()` 用 `randomBytes(32)` 生成 token，库里只存 `sha256(token)`；Cookie 为 `HttpOnly; SameSite=Lax`。勾选「保持登录」时是 30 天滚动窗口：解析会话按 5 分钟节流把 `expires_at` 往后推，并在同一次响应里（`onSend` 钩子）补一个 `Set-Cookie` 把新的 `Max-Age` 交给浏览器 —— 只续库不续 Cookie 的话，浏览器仍会在登录后第 30 天删掉它，天天使用也会被强制重新登录。不勾选则是浏览器会话 Cookie，`expires_at` 固定在登录后 12 小时、不随访问顺延。过期的会话在解析与登录时顺手清理。
 - **接口**：`POST /api/auth/login` 登录、`GET /api/auth/session` 查询状态、`POST /api/auth/logout` 吊销并清 Cookie、`PUT /api/auth/credentials` 修改账号/密码（必须提供当前密码）。
-- **改密码后轮换**：修改成功会删除全部旧会话并签发新会话，其他设备立即掉线，发起修改的浏览器拿新 Cookie 继续使用。
+- **改密码后轮换**：修改成功会删除全部旧会话并签发新会话，其他设备立即掉线，发起修改的浏览器拿新 Cookie 继续使用。删除会话会通过 `AuthService.onSessionRevoked()` 广播一次「会话已吊销」（改凭据 = 全部会话，退出登录 = 当前会话），`/api/realtime` 里已经建立的连接据此以 `4401` 关闭；此外每个连接每 30 秒用自己的 Cookie 复查一次会话，覆盖过期与清理这类没有广播的失效。
+- **默认凭据提示**：`auth_account.password_changed_at` 记录密码是否被改过（`NULL` = 仍是出厂密码），`GET /api/auth/session` 因此不再对默认账号跑一次约 25ms 的同步 scrypt；旧库没有这一列时，首次启动会用一次校验结果回填。
 - **前端**：`lib/auth.tsx` 把会话缓存在 React Query（key `auth-session`）；`App.tsx` 的 `RequireAuth` 在会话未知时显示占位、未登录时跳转 `/login` 并记住原路径，登录后跳回。受保护接口返回 `401` 时 `lib/api.ts` 广播 `autogit:unauthorized`，上下文清空会话并关闭 WebSocket，路由随即回到登录页。
-- **自检**：`pnpm --filter @autogit/server auth:check`（`src/dev/auth-check.ts`）在临时数据目录里启动真实 HTTP 栈，断言未登录 401、默认账号登录、保持登录 Cookie、过期会话清理、改账号密码与会话轮换、退出登录等 15 项行为。
+- **自检**：`pnpm --filter @autogit/server auth:check`（`src/dev/auth-check.ts`）在临时数据目录里启动真实 HTTP 栈并断言 27 项行为：未登录 401、百分号编码路径（`/%61pi/...`，含写操作与实时通道）同样 401、默认账号登录、保持登录 Cookie 与滚动续期（Cookie 同步续期）、非保持登录的 12 小时上限、跨源请求无 CORS 头、会话摘要不做 scrypt、过期会话清理、改账号密码与会话轮换、退出登录、在真实监听端口上用原始握手验证 WebSocket 升级（未登录 401、改凭据与退出登录后已建立的连接被 `4401` 关闭），以及旧库（缺 `password_changed_at` 列）升级时的回填。
 
 ## 4. 调度器（Orchestrator）
 

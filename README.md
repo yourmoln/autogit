@@ -84,8 +84,8 @@ codex login            # 首次使用或凭证失效时执行一次设备授权
 
 首次打开 http://127.0.0.1:4711 会跳转到登录页，默认账号与密码都是 `admin`：
 
-- **保持登录**：勾选后凭证以 HttpOnly Cookie 保存在浏览器中，30 天内打开页面会自动登录（每次访问滚动续期）；不勾选则只在当前浏览器会话内有效（12 小时）。
-- **修改账号密码**：登录后在「设置 → 登录与安全」中修改，需要验证当前密码；修改后其他设备上的登录状态立即失效，本机保持登录。
+- **保持登录**：勾选后凭证以 HttpOnly Cookie 保存在浏览器中，30 天内打开页面会自动登录（每次访问滚动续期，Cookie 的有效期同步顺延）；不勾选则只在当前浏览器会话内有效（上限 12 小时，不滚动续期）。
+- **修改账号密码**：登录后在「设置 → 登录与安全」中修改，需要验证当前密码；修改后其他设备上的登录状态立即失效（包括已经建立的实时连接），本机保持登录。
 - **退出登录**：左侧边栏底部或页面右上角的「退出登录」按钮会吊销当前会话并清除凭证。
 - **忘记密码**：停掉服务后删除 `~/.autogit/data/autogit.sqlite` 中 `auth_account` 与 `auth_sessions` 两张表的数据（或参照 [docs/RESET.md](docs/RESET.md) 重置整个数据目录），下次启动会恢复默认的 `admin` / `admin`。
 
@@ -185,6 +185,8 @@ stateDiagram-v2
 
 所有接口都在 `/api` 下，返回 JSON；实时事件走 WebSocket `/api/realtime`。除 `POST /api/auth/login`、`GET /api/auth/session`、`POST /api/auth/logout` 外，**所有接口都需要有效的登录会话 Cookie**，否则返回 `401`。
 
+门禁按路由匹配结果判断而不是原始 URL：`/%61pi/system/overview` 这类百分号编码写法与 `/api/system/overview` 命中同一条路由，同样会被拦下（实时通道的升级请求也一样）。
+
 | 分类 | 方法与路径 |
 | --- | --- |
 | 登录 | `POST /api/auth/login`、`GET /api/auth/session`、`POST /api/auth/logout`、`PUT /api/auth/credentials` |
@@ -202,6 +204,7 @@ stateDiagram-v2
 
 - **数据目录**：`~/.autogit`（可用 `AUTOGIT_HOME` 覆盖），包含 `data/autogit.sqlite`、`workspaces/`、`secret.key`、`logs/`。
 - **登录凭证**：账号只有一份，密码以 scrypt 哈希存放在 `auth_account` 表，明文不落库；登录会话的随机 token 只保存 SHA-256 摘要（`auth_sessions`），浏览器侧是 HttpOnly + SameSite=Lax 的 Cookie，脚本读不到。首次启动自动创建默认账号 `admin` / `admin`，接口只返回用户名与「是否仍为默认密码」的提示，不返回任何哈希。
+- **跨源访问**：服务端不设置任何 CORS 响应头，别的网站在浏览器里读不到本机接口的响应（开发模式走 Vite 同源代理，生产模式由后端直接托管前端，都不需要跨源）。会话失效时（退出登录、改凭据、过期）会立刻关闭该会话已建立的实时连接。
 - **Token 加密**：使用 AES-256-GCM 加密后落库，密钥来自 `AUTOGIT_SECRET_KEY` 或自动生成的 `secret.key`；接口返回的只是掩码预览。
 - **Git 认证**：推送/拉取通过 `GIT_CONFIG_*` 环境变量注入 `http.extraheader`，Token 不会写进 `.git/config`，也不会出现在命令行参数里。
 - **代理地址**：HTTP(S) 与 SOCKS5 两个通道和账号级代理同样加密落库，接口只返回掩码；仅在配置了代理时注入 `http.proxy` 与代理环境变量，并清空凭据助手避免 Git Credential Manager 探测代理主机。
@@ -234,7 +237,7 @@ pnpm --filter @autogit/server proxy:check -- --online  # 额外验证真实 HTTP
 
 `pnpm simulate` 会在临时目录中创建裸仓库，跑完整链路（初始化 15 个标签 → 实现 → 建 PR → 评审不通过 → 修复 → 复审通过 → 合并 → `ai/verify`），并断言每一步的标签与产物，最后自动清理。
 
-`auth:check` 会在临时 `AUTOGIT_HOME` 中启动真实 HTTP 栈并断言 15 项行为：未登录访问接口与实时通道返回 401、默认账号可登录、勾选/不勾选「保持登录」的 Cookie 差异、过期会话被清理、修改账号密码的校验与会话轮换、旧密码失效、其他设备会话被吊销、退出登录清除凭据，最后自动清理。
+`auth:check` 会在临时 `AUTOGIT_HOME` 中启动真实 HTTP 栈并断言 27 项行为：未登录访问接口与实时通道返回 401、百分号编码路径（`/%61pi/...`）同样被拦下、默认账号可登录、勾选/不勾选「保持登录」的 Cookie 差异与滚动续期（续期时同步续期浏览器 Cookie，非保持登录保持 12 小时上限）、跨源请求不返回 CORS 头、会话摘要不再同步跑 scrypt、过期会话被清理、修改账号密码的校验与会话轮换、旧密码失效、其他设备会话被吊销、退出登录清除凭据、真实 WebSocket 升级路径（未登录 401、改凭据/退出登录后已建立的连接被 4401 关闭），以及旧库升级时 `password_changed_at` 的回填，最后自动清理。
 
 `proxy:check` 会启动一次性本地代理并断言 11 项行为（绝对形式转发、CONNECT 隧道、SOCKS5 用户名密码、认证失败提示、远程 DNS、重定向、gzip、错误码映射等），`--online` 会再追加两项真实 `https://api.github.com/` 隧道检查。
 

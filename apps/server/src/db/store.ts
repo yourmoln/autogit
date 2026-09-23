@@ -34,6 +34,11 @@ export interface AuthAccountRecord {
   passwordHash: string;
   createdAt: string;
   updatedAt: string;
+  /**
+   * When the password was last replaced, `null` while the factory password is
+   * still in place. Cheap enough to read on every `GET /api/auth/session`.
+   */
+  passwordChangedAt: string | null;
 }
 
 export interface AuthSessionRecord {
@@ -917,8 +922,10 @@ export class Store {
       password_hash: string;
       created_at: string;
       updated_at: string;
+      password_changed_at: string | null;
     }>(
-      "SELECT username, password_hash, created_at, updated_at FROM auth_account WHERE id = 'default'",
+      `SELECT username, password_hash, created_at, updated_at, password_changed_at
+       FROM auth_account WHERE id = 'default'`,
     );
     return row
       ? {
@@ -926,24 +933,40 @@ export class Store {
           passwordHash: row.password_hash,
           createdAt: row.created_at,
           updatedAt: row.updated_at,
+          passwordChangedAt: row.password_changed_at,
         }
       : null;
   }
 
-  upsertAuthAccount(input: { username: string; passwordHash: string }): AuthAccountRecord {
+  upsertAuthAccount(input: {
+    username: string;
+    passwordHash: string;
+    /**
+     * `true` when the caller just set a password. Omitted / `false` keeps the
+     * existing marker, so renaming the account does not clear the
+     * "still using the factory password" hint.
+     */
+    passwordChanged?: boolean;
+  }): AuthAccountRecord {
     const ts = nowIso();
     this.db.run(
-      `INSERT INTO auth_account (id, username, password_hash, created_at, updated_at)
-       VALUES ('default', ?, ?, ?, ?)
+      `INSERT INTO auth_account (id, username, password_hash, password_changed_at, created_at, updated_at)
+       VALUES ('default', ?, ?, ?, ?, ?)
        ON CONFLICT (id) DO UPDATE SET
          username = excluded.username,
          password_hash = excluded.password_hash,
+         password_changed_at = COALESCE(excluded.password_changed_at, auth_account.password_changed_at),
          updated_at = excluded.updated_at`,
-      [input.username, input.passwordHash, ts, ts],
+      [input.username, input.passwordHash, input.passwordChanged ? ts : null, ts, ts],
     );
     const record = this.getAuthAccount();
     if (!record) throw new Error('Auth account insert failed');
     return record;
+  }
+
+  /** Records that the stored hash is no longer the factory password. */
+  markAuthPasswordChanged(changedAt: string): void {
+    this.db.run("UPDATE auth_account SET password_changed_at = ? WHERE id = 'default'", [changedAt]);
   }
 
   createAuthSession(input: {
@@ -990,8 +1013,9 @@ export class Store {
     ]);
   }
 
-  deleteAuthSession(tokenHash: string): void {
-    this.db.run('DELETE FROM auth_sessions WHERE token_hash = ?', [tokenHash]);
+  /** Returns the number of removed rows, `0` when the session was already gone. */
+  deleteAuthSession(tokenHash: string): number {
+    return this.db.run('DELETE FROM auth_sessions WHERE token_hash = ?', [tokenHash]).changes;
   }
 
   /** Used after a credential change: every browser has to log in again. */

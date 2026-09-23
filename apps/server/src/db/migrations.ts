@@ -199,6 +199,19 @@ const MIGRATIONS: Migration[] = [
       CREATE INDEX IF NOT EXISTS idx_auth_sessions_expires ON auth_sessions (expires_at);
     `,
   },
+  {
+    // "Still using the factory password?" is answered on every
+    // `GET /api/auth/session`, so it must not cost a scrypt verification.
+    //
+    // `password_changed_at` keeps the answer in the row itself: `NULL` means the
+    // hash handed out by `bootstrap` was never replaced. Rows written by older
+    // versions are backfilled once at startup (see `AuthService.bootstrap`),
+    // because only the password hash can tell whether they were modified.
+    id: '005_auth_password_changed',
+    sql: `
+      ALTER TABLE auth_account ADD COLUMN password_changed_at TEXT;
+    `,
+  },
 ];
 
 export function migrate(db: Db): { applied: string[]; current: string } {

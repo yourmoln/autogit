@@ -505,10 +505,10 @@ function AccountSecurityCard(): ReactNode {
               session?.persistent ? (
                 <span className="flex items-center justify-end gap-1.5 text-emerald-300">
                   <ShieldCheck className="h-3.5 w-3.5" />
-                  保持登录（30 天滚动续期）
+                  保持登录（30 天滚动续期，活跃即顺延）
                 </span>
               ) : (
-                '本次登录（关闭浏览器后失效）'
+                '本次登录（关闭浏览器或 12 小时后失效）'
               )
             }
           />
@@ -517,7 +517,7 @@ function AccountSecurityCard(): ReactNode {
           <InfoRow label="账号最近修改" value={formatDateTime(credentials?.updatedAt)} />
         </div>
         <p className="mt-2 text-[11px] text-slate-500">
-          密码以 scrypt 哈希保存，会话 token 只保存 SHA-256 摘要；修改凭据后其他设备需要重新登录。
+          密码以 scrypt 哈希保存，会话 token 只保存 SHA-256 摘要；修改凭据后其他设备需要重新登录，已经建立的实时连接会立即断开。
         </p>
       </div>
     </SectionCard>

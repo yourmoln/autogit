@@ -241,6 +241,19 @@ class LogStore {
     this.notify(taskId);
   }
 
+  /**
+   * Drops every buffer at once; used when the login that produced those lines
+   * ends. Every subscriber is notified, so a mounted log viewer re-renders
+   * empty instead of keeping rows from the previous session on screen — and its
+   * seed effect can then hand the new session's lines to `seed()`, which stays
+   * a no-op while a longer buffer is still around.
+   */
+  clearAll(): void {
+    if (this.buffers.size === 0) return;
+    this.buffers.clear();
+    for (const taskId of [...this.listeners.keys()]) this.notify(taskId);
+  }
+
   subscribe(taskId: string, listener: () => void): () => void {
     const set = this.listeners.get(taskId) ?? new Set();
     set.add(listener);

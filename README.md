@@ -246,7 +246,7 @@ pnpm repo:check   # 仓库历史里没有 .pnpm-store（合并前必跑；先自
 pnpm build        # shared → server → web
 pnpm simulate     # 端到端模拟：真实 git + 假 Codex + 假 Git 平台
 pnpm --filter @autogit/server auth:check            # 登录门禁自检（临时数据目录，真实 HTTP 路由）
-pnpm --filter @autogit/web client:check            # 前端会话生命周期自检（4401 登出 / 4402 轮换重连 / 401 的登录态广播）
+pnpm --filter @autogit/web client:check            # 前端会话生命周期自检（4401 登出 / 4402 轮换重连 / 401 的登录态广播 / 会话结束后的清理）
 pnpm --filter @autogit/server proxy:check          # 代理链路自检（本地起 HTTP/SOCKS5 代理）
 pnpm --filter @autogit/server proxy:check -- --online  # 额外验证真实 HTTPS 隧道
 ```
@@ -257,11 +257,11 @@ pnpm --filter @autogit/server proxy:check -- --online  # 额外验证真实 HTTP
 
 `auth:check` 会在临时 `AUTOGIT_HOME` 中启动真实 HTTP 栈并断言 45 项行为：未登录访问接口与实时通道返回 401（`OPTIONS` 与预检样式请求同样需要会话）、探活接口 `GET /api/health`（含编码写法）未登录可访问且只回运行状态、百分号编码路径（`/%61pi/...`，含 `OPTIONS`）同样被拦下、默认账号可登录、用户名不存在与密码错误在响应时间与文案上不可区分、勾选/不勾选「保持登录」的 Cookie 差异与滚动续期（续期时同步续期浏览器 Cookie，并核对库内 `expires_at` 前移的幅度与 Cookie `Max-Age` 一致；非保持登录保持 12 小时上限）、跨源请求不返回 CORS 头、写请求的来源校验（跨站与同站其它端口的 `POST /api/orchestrator/tick`、`POST /api/orchestrator/restart`、`POST /api/codex/invalidate` 全部 403，跨站 `POST /api/auth/login` 同样 403，未登录的跨站写请求仍是 401，同源 / Vite 开发来源 / 无 `Origin` 的写请求 200）、会话摘要不再同步跑 scrypt、过期会话被清理、修改账号密码的校验与会话轮换、只改用户名时仍提示「仍在使用默认密码」、把密码显式改回出厂值后提示恢复（`password_changed_at` 被清空）、旧密码失效、其他设备会话被吊销、没有实际改动的保存（用户名与当前一致、密码留空）返回 `rotated: false` 且不换 Cookie、不写 `auth_account`、不吊销其他设备的会话、把当前密码原样填回来与用户名只改大小写同样不算改动、退出登录清除凭据、连续登录失败触发 `429` 且窗口过期后自动恢复并清零、编译产物（`pnpm start`）默认按生产模式启动且显式 `NODE_ENV` 优先、`AUTOGIT_DEV_ORIGINS` 只在开发模式生效、真实 WebSocket 升级路径（未登录 401、跨站 `Origin` 403、同源与 Vite 开发来源 101、其它本地端口与生产模式的开发来源 403、生产模式只放行显式允许列表、白名单与开发来源的协议必须一致（`https://` 条目不放行 `http://` 来源，反之亦然）、只写主机名的条目仍按主机比对、改凭据时发起这次请求的浏览器收到 4402（重连）、其它设备与退出登录后的连接被 4401 关闭）、`AUTOGIT_TRUST_PROXY` 的解析（默认关闭、开 / 关写法、地址列表）与反向代理下的 `Secure` Cookie（登录、滚动续期、退出登录清除三处都带，代理报告明文时不带；开关关闭时 `X-Forwarded-Proto` 一律忽略），以及旧库升级时 `password_changed_at` 的回填，最后自动清理。
 
-`client:check` 用 `window` / `WebSocket` / `fetch` 三个桩件跑前端会话生命周期的 7 项断言：实时连接收到 `4401`（其他设备改凭据、退出登录、会话过期）时广播一次 `autogit:unauthorized` 并停止重连；收到 `4402`（本机改凭据，新 Cookie 就在同一个响应里）时不广播、只退避重连，登录态原地不动（否则改密码成功会先闪一下登录页）；其它关闭码先按 5 分钟节流核对一次会话（会话已失效同样广播）再退避重连，会话仍有效时不广播；受保护接口（含 `PUT /api/auth/credentials`）返回 `401` 时广播失效，而公开的登录 / 会话查询 / 退出登录接口返回 `401`（密码错误）与其它状态码（如 `403`）不广播。
+`client:check` 用 `window` / `WebSocket` / `fetch` 三个桩件跑前端会话生命周期的 10 项断言：实时连接收到 `4401`（其他设备改凭据、退出登录、会话过期）时广播一次 `autogit:unauthorized` 并停止重连；收到 `4402`（本机改凭据，新 Cookie 就在同一个响应里）时不广播、只退避重连，登录态原地不动（否则改密码成功会先闪一下登录页）；其它关闭码先按 5 分钟节流核对一次会话（会话已失效同样广播）再退避重连，会话仍有效时不广播；受保护接口（含 `PUT /api/auth/credentials`）返回 `401` 时广播失效，而公开的登录 / 会话查询 / 退出登录接口返回 `401`（密码错误）与其它状态码（如 `403`）不广播。会话结束后的清理用真的 React Query 缓存验证（`window` 桩件带事件总线，广播会真的送到订阅方）：`4401` 与登出都走 `lib/session-state.ts` 的 `resetSessionState`，任务日志缓冲清空、受保护查询缓存移除、缓存里的登录态回到匿名；最后再核对 `AuthProvider` 编译后的源码确实把会话失效广播与 `logout` 都接到这个入口，防止它退回没人调用的死代码。
 
 ### 合并 PR 前：确认分支历史干净
 
-AutoGit 只强推 `ai/*` 分支，但分支历史里可能夹带工作区产物——例如一次误提交的 `.pnpm-store/`（`ai/issue-4-新增登录密码` 这条分支带着 11,678 个对象、约 265 MB，最大单个对象约 72 MB）。工作树里删掉它并不够：这些对象仍从 `HEAD` 可达，所以**含这类历史的分支只能用 `Squash and merge`，或先改写历史再合并**。`Create a merge commit` 会把整条对象链并进 `main`，`Rebase and merge` 会重放当初添加这些文件的提交，两者都让这份包缓存永久留在 `main` 的祖先链里，之后只能靠改写 `main` 的历史才能消除（克隆体积、`git rev-list --objects`、`git log --all` 都会一直背着它）。合并前跑一次：
+AutoGit 只强推 `ai/*` 分支，但分支历史里可能夹带工作区产物——例如一次误提交的 `.pnpm-store/`（`ai/issue-4-新增登录密码` 这条分支带着 11,678 个对象、约 265 MB，最大单个对象约 72 MB；`git rev-list --objects HEAD -- .pnpm-store` 的原始输出是 11,682 行 = 11,282 个 blob + 398 个 tree + 2 个提交，脚本按路径过滤掉那 2 个提交和 2 条没有路径的 tree，所以两处数字差 4）。工作树里删掉它并不够：这些对象仍从 `HEAD` 可达，所以**含这类历史的分支只能用 `Squash and merge`，或先改写历史再合并**。`Create a merge commit` 会把整条对象链并进 `main`，`Rebase and merge` 会重放当初添加这些文件的提交，两者都让这份包缓存永久留在 `main` 的祖先链里，之后只能靠改写 `main` 的历史才能消除（克隆体积、`git rev-list --objects`、`git log --all` 都会一直背着它）。合并前跑一次：
 
 ```bash
 pnpm repo:check                    # 先在一个临时仓库里自检扫描逻辑，再扫 HEAD 可达的全部对象
@@ -274,7 +274,7 @@ pnpm repo:purge                    # 预演：列出会被改写的对象数量�
 1. **改写历史**（有远端写权限时首选）：先 `pnpm repo:purge` 预演（只读，不动任何引用），确认对象数量后 `pnpm repo:purge --apply`；脚本用 git 自带的 `filter-branch` 把 `.pnpm-store` 从整条历史里去掉，先在临时分支上改写、比对 tip 树一字未变才移动真正的分支，旧历史留在 `refs/autogit-backup/<分支>/<时间戳>`（`git update-ref refs/heads/<分支> <备份引用>` 即可回退）。改写完推送并复核：`git fetch origin && git push --force-with-lease origin <分支>`，再跑 `pnpm repo:check` 确认本地可达历史归零。习惯 `git filter-repo` 的话 `git filter-repo --path .pnpm-store --invert-paths` 与脚本等价（`filter-repo` 不随 git 发布，需要自己安装）。
 2. **Squash and merge**：GitHub 的合并按钮选 `Squash and merge`（只取 PR 的最终树），**不要**选 `Create a merge commit` 或 `Rebase and merge`；合并后删除该分支（`refs/pull/<n>` 仍会短暂保留这些对象，之后随 GC 回收）。
 
-**本次收口决策（PR #8，`ai/issue-4-新增登录密码`）**：合并侧走第 2 条 —— 用 `Squash and merge` 合并并删除分支；若希望保留这条分支的逐个提交，必须先在有写权限的环境执行第 1 条（`pnpm repo:purge --apply` 后 `git push --force-with-lease`），确认 `pnpm repo:check` 归零，再改用普通合并。修复代理只改工作树里的源码、不重写历史（沙箱里 `.git` 只读，也没有推送权限），所以这条决策只能落在合并侧：仓库自身无法把已经提交过的对象从 `HEAD` 可达集合里摘掉。
+**本次收口决策（PR #8，`ai/issue-4-新增登录密码`）**：合并侧走第 2 条 —— 用 `Squash and merge` 合并并删除分支；若希望保留这条分支的逐个提交，必须先在有写权限的环境执行第 1 条（`pnpm repo:purge --apply` 后 `git push --force-with-lease`），确认 `pnpm repo:check` 归零，再改用普通合并。修复代理只改工作树里的源码、不重写历史（沙箱里 `.git` 只读，也没有推送权限），所以这条决策只能落在合并侧：仓库自身无法把已经提交过的对象从 `HEAD` 可达集合里摘掉。在这条分支上 `pnpm repo:check` 仍会以退出码 1 结束，这是预期结果（它扫的就是 `HEAD` 可达对象），`pnpm repo:check --ref origin/main` 保持退出码 0；只有走完上面第 1 条（改写历史）本地才会归零。
 
 「评审通过只打 `ai/approved`、合并动作留给人工」的约定不变，人工额外要确认的就是这里的合并方式。AutoGit 的修复代理跑在 `.git` 只读、也没有远端写权限的沙箱里，所以第 1 条只能由有推送权限的一侧执行；两条路都没走就合并，等于把这份包缓存写进 `main` 的祖先链。
 

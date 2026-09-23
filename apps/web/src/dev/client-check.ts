@@ -1,10 +1,10 @@
 /**
  * Self check for the browser side of the session lifecycle.
  *
- * `lib/api.ts`, `lib/realtime.ts` and `lib/session-events.ts` run in a DOM, so
- * this check drives them through tiny stubs (`window`, `WebSocket`, `fetch`)
- * instead of a browser. It covers the two ways a revoked session used to slip
- * past the console:
+ * `lib/api.ts`, `lib/realtime.ts` and `lib/session-state.ts` are all written
+ * for a browser, so this check drives them through tiny stubs (`window`,
+ * `WebSocket`, `fetch`) and a real React Query cache instead of a DOM. It
+ * covers the ways a revoked session used to slip past the console:
  *
  * - `lib/realtime.ts` reconnecting forever after the server closed the socket
  *   with `4401` (logout, a credential change on another device, expiry) — the tab
@@ -15,12 +15,17 @@
  * - `lib/api.ts` skipping the unauthorized broadcast for every `/api/auth/*`
  *   401, including the guarded `PUT /api/auth/credentials`, which only answers
  *   `401` when the session cookie is gone.
+ * - the console keeping what the previous login left behind after that
+ *   broadcast: the task log store is a module-level singleton, so signing back
+ *   in and opening the same task used to show up to 4000 lines of the old
+ *   session (`LogStore.seed` ignores a shorter seed while a longer buffer is
+ *   still in place), and the cached pages of the old session were still there.
  *
  * A revoked session has to end in the `autogit:unauthorized` broadcast the auth
- * context listens for (`AuthProvider` then stops the realtime client and drops
- * the session, so the router bounces back to the login page); a local rotation
- * must not, because the session it ends is replaced by the answer to the same
- * request.
+ * context listens for (`AuthProvider` then runs `resetSessionState` and the
+ * router bounces back to the login page, without anything the previous login
+ * cached surviving into the next one); a local rotation must not, because the
+ * session it ends is replaced by the answer to the same request.
  *
  * Usage: pnpm --filter @autogit/web client:check
  */
@@ -107,6 +112,9 @@ function unauthorizedCount(): number {
   return broadcasts;
 }
 
+/** Listeners registered through `window.addEventListener`, keyed by event name. */
+const windowListeners = new Map<string, Set<() => void>>();
+
 /** Minimal `window`: timers, the current URL and the event bus. */
 const windowStub = {
   location: { protocol: 'http:', host: '127.0.0.1:4711' },
@@ -119,12 +127,26 @@ const windowStub = {
   clearTimeout(id: number): void {
     for (const timer of timers) if (timer.id === id) timer.cleared = true;
   },
+  /**
+   * Counting the broadcast is not enough: the auth context subscribes to
+   * `autogit:unauthorized` through `addEventListener`, so the stub has to hand
+   * the event to its listeners the way a browser would. Without that, a check
+   * could seed task logs, close the socket with `4401` and still never notice
+   * whether the teardown behind the broadcast ran at all.
+   */
   dispatchEvent(event: { type: string }): boolean {
     if (event.type === UNAUTHORIZED_EVENT_NAME) broadcasts += 1;
+    for (const listener of [...(windowListeners.get(event.type) ?? [])]) listener();
     return true;
   },
-  addEventListener(): void {},
-  removeEventListener(): void {},
+  addEventListener(type: string, listener: () => void): void {
+    const registered = windowListeners.get(type) ?? new Set<() => void>();
+    registered.add(listener);
+    windowListeners.set(type, registered);
+  },
+  removeEventListener(type: string, listener: () => void): void {
+    windowListeners.get(type)?.delete(listener);
+  },
 };
 
 /** Records every socket the client opens and lets the check play its frames. */
@@ -195,10 +217,22 @@ globals.fetch = fetchStub;
 const nodeProcess = (globalThis as unknown as { process: { exitCode?: number } }).process;
 
 const { UNAUTHORIZED_EVENT } = await import('../lib/session-events.js');
-const { SESSION_ROTATED_CLOSE_CODE: CLIENT_ROTATED_CLOSE_CODE, realtime } = await import(
-  '../lib/realtime.js'
+const {
+  SESSION_ROTATED_CLOSE_CODE: CLIENT_ROTATED_CLOSE_CODE,
+  logStore,
+  realtime,
+} = await import('../lib/realtime.js');
+const { AUTH_SESSION_KEY, registerSessionReset, resetSessionState } = await import(
+  '../lib/session-state.js'
 );
 const { ApiRequestError, api } = await import('../lib/api.js');
+/**
+ * The auth context, imported for the wiring check at the end of the run. It is a
+ * React component, so this check never renders it — an effect would not run
+ * outside a browser — it reads the source `tsx` compiles it to instead.
+ */
+const { AuthProvider } = await import('../lib/auth.js');
+const { QueryClient } = await import('@tanstack/react-query');
 
 /** Waits for the promise chains behind a stubbed request. */
 async function flush(): Promise<void> {
@@ -242,6 +276,25 @@ const LIVE_SESSION = {
 
 /** What the server answers once the cookie is gone. */
 const ANONYMOUS_SESSION = { authenticated: false, session: null, credentials: null };
+
+/**
+ * A real React Query cache, so the teardown runs against the same object the
+ * console uses instead of a hand written stub.
+ *
+ * `gcTime: Infinity` is what keeps this check from hanging: with the default the
+ * cache arms a five minute garbage collection timer for the entries nothing
+ * observes, and `tsx` would wait for it before exiting.
+ */
+function newQueryClient() {
+  return new QueryClient({
+    defaultOptions: { queries: { gcTime: Number.POSITIVE_INFINITY, retry: false } },
+  });
+}
+
+/** One line as the server hands it to `logStore`. */
+function logLine(taskId: string, message: string) {
+  return { id: 1, taskId, ts: new Date().toISOString(), stream: 'stdout' as const, message };
+}
 
 async function main(): Promise<void> {
   assert(
@@ -415,6 +468,97 @@ async function main(): Promise<void> {
     });
     assert(!(await unauthorizedFrom(() => api.overview())), '403 被当成会话失效');
     return '广播 0 次';
+  });
+
+  console.log('\n会话结束后的清理：');
+
+  await expect('会话失效（4401）清空实时日志、受保护缓存并回到匿名登录态', async () => {
+    const queryClient = newQueryClient();
+    const unsubscribe = registerSessionReset(queryClient);
+    const taskId = 'stub-task-revoked';
+    logStore.append(taskId, logLine(taskId, '上一段会话写下的日志'));
+    queryClient.setQueryData(['tasks'], [{ id: taskId }]);
+    queryClient.setQueryData(AUTH_SESSION_KEY, LIVE_SESSION);
+    assert(logStore.get(taskId).length === 1, '前置条件不成立：日志没有进入 logStore');
+    // 日志视图靠订阅重渲染，所以除了缓冲变空，还必须收到通知。
+    let notified = 0;
+    const unsubscribeLogs = logStore.subscribe(taskId, () => {
+      notified += 1;
+    });
+
+    realtime.stop();
+    resetTimers();
+    StubWebSocket.instances.length = 0;
+    broadcasts = 0;
+    advanceClock(6);
+    routes.set('/api/auth/session', { status: 200, payload: LIVE_SESSION });
+
+    realtime.start();
+    const socket = StubWebSocket.instances[0];
+    assert(socket, 'start() 没有建立实时连接');
+    socket.serverOpen();
+    await flush();
+    socket.serverClose(4401);
+    await flush();
+    assert(unauthorizedCount() === 1, '4401 没有广播会话失效，后面的清理无从谈起');
+
+    assert(
+      logStore.get(taskId).length === 0,
+      `会话失效后 logStore 还留着 ${logStore.get(taskId).length} 行上一段会话的日志`,
+    );
+    assert(notified >= 1, '清空日志后没有通知订阅方，已挂载的日志视图不会重渲染');
+    assert(
+      queryClient.getQueryData(['tasks']) === undefined,
+      '会话失效后受保护查询的缓存没有被清掉',
+    );
+    assert(
+      queryClient.getQueryData<{ authenticated?: boolean }>(AUTH_SESSION_KEY)?.authenticated ===
+        false,
+      '会话失效后缓存里的登录态没有回到匿名',
+    );
+
+    realtime.stop();
+    resetTimers();
+    unsubscribeLogs();
+    unsubscribe();
+    return `广播 1 次，日志 0 行（通知订阅方 ${notified} 次），受保护缓存已移除，登录态已匿名`;
+  });
+
+  await expect('登出走同一条清理路径', async () => {
+    const queryClient = newQueryClient();
+    const taskId = 'stub-task-logout';
+    logStore.append(taskId, logLine(taskId, '登出前的日志'));
+    queryClient.setQueryData(['task', taskId], { id: taskId });
+    queryClient.setQueryData(AUTH_SESSION_KEY, LIVE_SESSION);
+
+    await resetSessionState(queryClient);
+
+    assert(
+      logStore.get(taskId).length === 0,
+      `登出后 logStore 还留着 ${logStore.get(taskId).length} 行日志`,
+    );
+    assert(queryClient.getQueryData(['task', taskId]) === undefined, '登出后任务缓存没有被清掉');
+    assert(
+      queryClient.getQueryData<{ authenticated?: boolean }>(AUTH_SESSION_KEY)?.authenticated ===
+        false,
+      '登出后缓存里的登录态没有回到匿名',
+    );
+    return '日志 0 行，任务缓存已移除，登录态已匿名';
+  });
+
+  await expect('AuthProvider 把两条路径都接到同一处清理', async () => {
+    // 组件本身没法在这里渲染（useEffect 在浏览器之外不会跑），所以核对它编译后
+    // 的源码：任何一处漏接线，上面两条断言都测不到，清理入口就会退回死代码。
+    const source = AuthProvider.toString();
+    assert(
+      source.includes('registerSessionReset'),
+      'AuthProvider 没有把会话失效广播接到 registerSessionReset',
+    );
+    assert(
+      source.includes('resetSessionState'),
+      'AuthProvider 的 logout 没有调用 resetSessionState',
+    );
+    return '会话失效广播与 logout 都调用 lib/session-state.ts 的清理入口';
   });
 
   const failed = checks.filter((check) => !check.ok);

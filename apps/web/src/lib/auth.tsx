@@ -3,16 +3,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { createContext, type ReactNode, useCallback, useContext, useEffect, useMemo } from 'react';
 
 import { ApiRequestError, api } from './api.js';
-import { realtime } from './realtime.js';
-import { onUnauthorized } from './session-events.js';
-
-const AUTH_SESSION_KEY = ['auth-session'] as const;
-
-const ANONYMOUS: AuthSessionPayload = {
-  authenticated: false,
-  session: null,
-  credentials: null,
-};
+import { AUTH_SESSION_KEY, registerSessionReset, resetSessionState } from './session-state.js';
 
 export interface LoginInput {
   username: string;
@@ -75,16 +66,12 @@ export function AuthProvider({ children }: { children: ReactNode }): ReactNode {
     [queryClient],
   );
 
-  // Any 401 from a protected endpoint means the cookie is gone (expired,
-  // revoked by a credential change on another device, or logged out remotely).
-  useEffect(
-    () =>
-      onUnauthorized(() => {
-        realtime.stop();
-        applyPayload(ANONYMOUS);
-      }),
-    [applyPayload],
-  );
+  // A session that dies under this tab — a protected request answered `401`, or
+  // the server closing the socket with `4401` after a logout, an expiry or a
+  // credential change made on another device — goes through `resetSessionState`:
+  // the cached session turns anonymous, realtime stops, and everything the
+  // previous login cached (including the module-level task logs) is dropped.
+  useEffect(() => registerSessionReset(queryClient), [queryClient]);
 
   const login = useCallback<AuthContextValue['login']>(
     async (input) => {
@@ -100,15 +87,12 @@ export function AuthProvider({ children }: { children: ReactNode }): ReactNode {
     try {
       await api.auth.logout();
     } finally {
-      realtime.stop();
-      // Drop every cached page before the next login, they belonged to the
-      // previous session.
-      queryClient.removeQueries({
-        predicate: (query) => query.queryKey[0] !== AUTH_SESSION_KEY[0],
-      });
-      applyPayload(ANONYMOUS);
+      // The same teardown an expired session runs: drop every cached page, stop
+      // realtime and empty the task log store before the next login can read
+      // anything that belonged to this one.
+      await resetSessionState(queryClient);
     }
-  }, [applyPayload, queryClient]);
+  }, [queryClient]);
 
   const updateCredentials = useCallback<AuthContextValue['updateCredentials']>(
     async (input) => {

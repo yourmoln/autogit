@@ -67,12 +67,15 @@
 pnpm install
 
 # 2. 开发模式：后端 4711，前端 5173（已配置代理 /api 与 WebSocket）
+#    只有这条路径会放行 Vite 开发来源，其它本地端口一律拒绝
 pnpm dev
 
 # 或者生产模式：构建后由后端统一托管前端
 pnpm build
-pnpm start          # http://127.0.0.1:4711
+pnpm start          # http://127.0.0.1:4711（编译产物自动按 NODE_ENV=production 运行）
 ```
+
+`pnpm start` 运行的是打包后的 `dist/index.js`，进程没有 `NODE_ENV` 时默认按生产模式启动：实时通道只接受同源与 `AUTOGIT_ALLOWED_ORIGINS` 列出的来源，服务日志也是结构化 JSON。手动 `node dist/index.js` 同理；需要从编译产物连 Vite 开发服务器（或想保留彩色的单行日志）时显式设置 `NODE_ENV=development`。
 
 首次使用前，请确认 Codex CLI 可用：
 
@@ -208,7 +211,7 @@ stateDiagram-v2
 
 - **数据目录**：`~/.autogit`（可用 `AUTOGIT_HOME` 覆盖），包含 `data/autogit.sqlite`、`workspaces/`、`secret.key`、`logs/`。
 - **登录凭证**：账号只有一份，密码以 scrypt 哈希存放在 `auth_account` 表，明文不落库；登录会话的随机 token 只保存 SHA-256 摘要（`auth_sessions`），浏览器侧是 HttpOnly + SameSite=Lax 的 Cookie，脚本读不到。首次启动自动创建默认账号 `admin` / `admin`，接口只返回用户名与「密码是否仍是出厂口令」的提示，不返回任何哈希；这个提示只跟密码走，所以「先把用户名改掉、密码还留着」的账号一样会持续提醒。每次登录恒定执行一次 scrypt（用户名不存在时校验进程内生成好的诱饵哈希），所以「用户名不存在」与「密码错误」的响应时间与文案都一致，无法用来枚举账号；连续失败 5 次后进入 1 秒起步、逐次翻倍、最长 30 秒的退避窗口，把在线猜解压到每秒一次量级，成功登录即清零。
-- **跨源访问**：服务端不设置任何 CORS 响应头，别的网站在浏览器里读不到本机接口的响应（开发模式走 Vite 同源代理，生产模式由后端直接托管前端，都不需要跨源）；实时通道的 WebSocket 升级再单独校验 `Origin` 与 `Host` 同源（回环来源只在 `NODE_ENV !== 'production'` 开发模式下放行，其它情况用 `AUTOGIT_ALLOWED_ORIGINS` 显式声明），不一致直接 `403`。会话失效时（退出登录、改凭据、过期）会立刻关闭该会话已建立的实时连接。
+- **跨源访问**：服务端不设置任何 CORS 响应头，别的网站在浏览器里读不到本机接口的响应（开发模式走 Vite 同源代理，生产模式由后端直接托管前端，都不需要跨源）；实时通道的 WebSocket 升级再单独校验 `Origin` 与 `Host` 同源，不一致直接 `403`。生产模式（`NODE_ENV=production`，`pnpm start` 默认如此）只接受同源与 `AUTOGIT_ALLOWED_ORIGINS`；开发模式额外接受 `AUTOGIT_DEV_ORIGINS`（默认 `http://localhost:5173`、`http://127.0.0.1:5173`），不再放行「任意回环来源」——本机其它端口的页面对于 `127.0.0.1` 属于同站，Lax Cookie 会随握手发出，旧实现等于让它们也能订阅任务日志。会话失效时（退出登录、改凭据、过期）会立刻关闭该会话已建立的实时连接。
 - **Token 加密**：使用 AES-256-GCM 加密后落库，密钥来自 `AUTOGIT_SECRET_KEY` 或自动生成的 `secret.key`；接口返回的只是掩码预览。
 - **Git 认证**：推送/拉取通过 `GIT_CONFIG_*` 环境变量注入 `http.extraheader`，Token 不会写进 `.git/config`，也不会出现在命令行参数里。
 - **代理地址**：HTTP(S) 与 SOCKS5 两个通道和账号级代理同样加密落库，接口只返回掩码；仅在配置了代理时注入 `http.proxy` 与代理环境变量，并清空凭据助手避免 Git Credential Manager 探测代理主机。
@@ -225,6 +228,7 @@ AUTOGIT_POLL_SECONDS=45
 AUTOGIT_MAX_CONCURRENT=2
 AUTOGIT_MAX_CONCURRENT_PER_REPO=1
 # AUTOGIT_ALLOWED_ORIGINS=https://autogit.example.com
+# AUTOGIT_DEV_ORIGINS=http://localhost:5174   # 仅开发模式生效（Vite 换端口时用）
 # AUTOGIT_CODEX_PATH=C:\Users\me\AppData\Roaming\npm\codex.cmd
 ```
 
@@ -245,7 +249,7 @@ pnpm --filter @autogit/server proxy:check -- --online  # 额外验证真实 HTTP
 
 `proxy:check` 会启动一次性本地代理并断言 11 项行为（绝对形式转发、CONNECT 隧道、SOCKS5 用户名密码、认证失败提示、远程 DNS、重定向、gzip、错误码映射等），`--online` 会再追加两项真实 `https://api.github.com/` 隧道检查。
 
-`auth:check` 会在临时 `AUTOGIT_HOME` 中启动真实 HTTP 栈并断言 35 项行为：未登录访问接口与实时通道返回 401（`OPTIONS` 与预检样式请求同样需要会话）、探活接口 `GET /api/health`（含编码写法）未登录可访问且只回运行状态、百分号编码路径（`/%61pi/...`，含 `OPTIONS`）同样被拦下、默认账号可登录、用户名不存在与密码错误在响应时间与文案上不可区分、勾选/不勾选「保持登录」的 Cookie 差异与滚动续期（续期时同步续期浏览器 Cookie，并核对库内 `expires_at` 前移的幅度与 Cookie `Max-Age` 一致；非保持登录保持 12 小时上限）、跨源请求不返回 CORS 头、会话摘要不再同步跑 scrypt、过期会话被清理、修改账号密码的校验与会话轮换、只改用户名时仍提示「仍在使用默认密码」、旧密码失效、其他设备会话被吊销、退出登录清除凭据、连续登录失败触发 `429` 且窗口过期后自动恢复并清零、真实 WebSocket 升级路径（未登录 401、跨站 `Origin` 403、同源与开发用回环来源 101、生产模式只放行显式允许列表、改凭据/退出登录后已建立的连接被 4401 关闭），以及旧库升级时 `password_changed_at` 的回填，最后自动清理。
+`auth:check` 会在临时 `AUTOGIT_HOME` 中启动真实 HTTP 栈并断言 38 项行为：未登录访问接口与实时通道返回 401（`OPTIONS` 与预检样式请求同样需要会话）、探活接口 `GET /api/health`（含编码写法）未登录可访问且只回运行状态、百分号编码路径（`/%61pi/...`，含 `OPTIONS`）同样被拦下、默认账号可登录、用户名不存在与密码错误在响应时间与文案上不可区分、勾选/不勾选「保持登录」的 Cookie 差异与滚动续期（续期时同步续期浏览器 Cookie，并核对库内 `expires_at` 前移的幅度与 Cookie `Max-Age` 一致；非保持登录保持 12 小时上限）、跨源请求不返回 CORS 头、会话摘要不再同步跑 scrypt、过期会话被清理、修改账号密码的校验与会话轮换、只改用户名时仍提示「仍在使用默认密码」、把密码显式改回出厂值后提示恢复（`password_changed_at` 被清空）、旧密码失效、其他设备会话被吊销、退出登录清除凭据、连续登录失败触发 `429` 且窗口过期后自动恢复并清零、编译产物（`pnpm start`）默认按生产模式启动且显式 `NODE_ENV` 优先、`AUTOGIT_DEV_ORIGINS` 只在开发模式生效、真实 WebSocket 升级路径（未登录 401、跨站 `Origin` 403、同源与 Vite 开发来源 101、其它本地端口与生产模式的开发来源 403、生产模式只放行显式允许列表、改凭据/退出登录后已建立的连接被 4401 关闭），以及旧库升级时 `password_changed_at` 的回填，最后自动清理。
 
 ### 合并 PR 前：确认分支历史干净
 

@@ -36,7 +36,9 @@ export interface AuthAccountRecord {
   updatedAt: string;
   /**
    * When the password was last replaced, `null` while the factory password is
-   * still in place. Cheap enough to read on every `GET /api/auth/session`.
+   * still in place — including after a user sets it back to `admin`, so the
+   * weak password hint cannot disappear while the factory credential works.
+   * Cheap enough to read on every `GET /api/auth/session`.
    */
   passwordChangedAt: string | null;
 }
@@ -965,22 +967,30 @@ export class Store {
     username: string;
     passwordHash: string;
     /**
-     * `true` when the caller just set a password. Omitted / `false` keeps the
-     * existing marker, so renaming the account does not clear the
-     * "still using the factory password" hint.
+     * Tri-state marker for "the stored password is still the factory one":
+     * omitted keeps the stored value (renaming the account must not drop the
+     * hint), `true` stamps `password_changed_at`, and `false` clears it — the
+     * caller just set the password back to the factory value, so the weak
+     * password warning has to come back.
      */
     passwordChanged?: boolean;
   }): AuthAccountRecord {
     const ts = nowIso();
+    // 1 = stamp now, 0 = clear, -1 = keep whatever is stored.
+    const marker = input.passwordChanged === undefined ? -1 : input.passwordChanged ? 1 : 0;
     this.db.run(
       `INSERT INTO auth_account (id, username, password_hash, password_changed_at, created_at, updated_at)
        VALUES ('default', ?, ?, ?, ?, ?)
        ON CONFLICT (id) DO UPDATE SET
          username = excluded.username,
          password_hash = excluded.password_hash,
-         password_changed_at = COALESCE(excluded.password_changed_at, auth_account.password_changed_at),
+         password_changed_at = CASE
+           WHEN ? = 0 THEN NULL
+           WHEN ? = 1 THEN excluded.password_changed_at
+           ELSE auth_account.password_changed_at
+         END,
          updated_at = excluded.updated_at`,
-      [input.username, input.passwordHash, input.passwordChanged ? ts : null, ts, ts],
+      [input.username, input.passwordHash, marker === 1 ? ts : null, ts, ts, marker, marker],
     );
     const record = this.getAuthAccount();
     if (!record) throw new Error('Auth account insert failed');

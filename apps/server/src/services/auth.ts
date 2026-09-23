@@ -152,6 +152,18 @@ function normalizePassword(value: string): string {
   return value;
 }
 
+/**
+ * `true` when `password` is the factory password.
+ *
+ * A plain constant comparison after the same NFKC normalisation that
+ * {@link hashPassword} applies, so it is cheap enough for the credential
+ * update path (no scrypt) and still recognises e.g. a full-width spelling of
+ * `admin`.
+ */
+function isFactoryPassword(password: string): boolean {
+  return password.normalize('NFKC') === DEFAULT_AUTH_PASSWORD.normalize('NFKC');
+}
+
 export interface AuthLoginResult {
   /** Raw session token, handed to the browser as an HttpOnly cookie. */
   token: string;
@@ -387,7 +399,11 @@ export class AuthService {
       this.store.upsertAuthAccount({
         username,
         passwordHash: password ? hashPassword(password) : account.passwordHash,
-        passwordChanged: password !== null,
+        // The hint follows the stored password, not "the endpoint was called":
+        // setting the password back to the factory value has to bring the
+        // warning back, so only a password that differs from `admin` stamps the
+        // marker. A rename passes `undefined` and keeps the stored marker.
+        passwordChanged: password === null ? undefined : !isFactoryPassword(password),
       });
     }
 

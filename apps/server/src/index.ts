@@ -1,6 +1,12 @@
 import { buildServer } from './app.js';
-import { loadRuntimeConfig } from './config.js';
+import { applyDefaultNodeEnv, loadRuntimeConfig } from './config.js';
 import { logger } from './util/logger.js';
+
+// `pnpm start` runs this module from the compiled bundle without setting
+// `NODE_ENV`, while `pnpm dev` loads the TypeScript source through tsx: the
+// compiled entry defaults to production so the documented self-hosted start
+// gets the strict realtime origin policy. An explicit `NODE_ENV` still wins.
+applyDefaultNodeEnv(import.meta.url);
 
 async function main(): Promise<void> {
   const config = loadRuntimeConfig();

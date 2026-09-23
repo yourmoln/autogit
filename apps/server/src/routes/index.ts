@@ -5,6 +5,7 @@ import type { AppContext } from '../context.js';
 import { AUTH_SESSION_COOKIE, sessionCookieMaxAge } from '../services/auth.js';
 import { readCookie, serializeCookie } from '../util/cookies.js';
 import { API_PREFIX, decodeRequestPath, isApiPath } from '../util/http.js';
+import { logger } from '../util/logger.js';
 import { isTrustedOrigin, isWebSocketUpgrade } from '../util/origin.js';
 import { registerAccountRoutes } from './accounts.js';
 import { registerAuthRoutes } from './auth.js';
@@ -104,9 +105,23 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
       isWebSocketUpgrade(request) &&
       !isTrustedOrigin(request, {
         allowedOrigins: ctx.config.allowedOrigins,
-        allowLoopback: ctx.config.isDev,
+        // Development only: the local Vite dev server, which reaches this
+        // process through a proxy that rewrites `Host`. Empty in production and
+        // limited to the dev server's own origins, so a page on another local
+        // port — same-site for 127.0.0.1, hence able to carry the Lax cookie —
+        // cannot subscribe to task logs. See `config.devOrigins`.
+        devOrigins: ctx.config.devOrigins,
       })
     ) {
+      // The one legitimate victim of this rule is a dev console whose Vite port
+      // is not in `devOrigins` (5173 was taken, so Vite moved on). Name the
+      // origin instead of leaving a socket that silently never opens. The
+      // session is already verified at this point, so an anonymous stranger
+      // cannot use this line to fill the log.
+      logger().warn(
+        { origin: request.headers.origin, host: request.headers.host },
+        '实时连接来源不在信任列表，已拒绝（开发服务器换了端口时用 AUTOGIT_DEV_ORIGINS 声明）',
+      );
       return reply.code(403).send({ error: '跨站来源的实时连接已被拒绝' });
     }
   });

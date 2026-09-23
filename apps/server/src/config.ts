@@ -34,6 +34,13 @@ export interface RuntimeConfig {
    * server on another machine). See `util/origin.ts`.
    */
   allowedOrigins: string[];
+  /**
+   * Origins of the local Vite dev console (`AUTOGIT_DEV_ORIGINS`), trusted only
+   * while {@link RuntimeConfig.isDev} is set. Empty in production, so a
+   * self-hosted instance accepts same-origin handshakes plus
+   * `AUTOGIT_ALLOWED_ORIGINS` and nothing else. See `util/origin.ts`.
+   */
+  devOrigins: string[];
   isDev: boolean;
   repoRoot: string;
 }
@@ -58,17 +65,81 @@ function resolveWebDist(): string | null {
   return existsSync(candidate) ? candidate : null;
 }
 
+/** Splits a comma separated env var into trimmed, non empty entries. */
+function splitList(value: string | undefined): string[] {
+  return (value ?? '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+}
+
 /** `AUTOGIT_ALLOWED_ORIGINS=a.example,b.example` → `['a.example', 'b.example']`. */
 function resolveAllowedOrigins(): string[] {
-  return (process.env.AUTOGIT_ALLOWED_ORIGINS ?? '')
-    .split(',')
-    .map((value) => value.trim())
-    .filter((value) => value.length > 0);
+  return splitList(process.env.AUTOGIT_ALLOWED_ORIGINS);
+}
+
+/** Origins the local Vite dev server is served from unless told otherwise. */
+const DEFAULT_DEV_ORIGINS = ['http://localhost:5173', 'http://127.0.0.1:5173'];
+
+/**
+ * Origins the Vite dev console is reached from.
+ *
+ * Vite proxies `/api` with `changeOrigin: true`, so the backend sees
+ * `Origin: http://localhost:5173` next to `Host: 127.0.0.1:4711` and a strict
+ * same-origin comparison would lock the dev console out of its realtime
+ * channel. The allowance is deliberately narrower than "any loopback origin"
+ * (the previous behaviour): a page served on *any* other local port is
+ * same-site for `127.0.0.1`, so the `SameSite=Lax` session cookie travels with
+ * its WebSocket handshake and it could read task logs. `AUTOGIT_DEV_ORIGINS`
+ * replaces the defaults — list the port Vite actually bound when 5173 was
+ * taken.
+ *
+ * Development only: production ignores this variable, list extra origins in
+ * `AUTOGIT_ALLOWED_ORIGINS` there.
+ */
+function resolveDevOrigins(isDev: boolean): string[] {
+  if (!isDev) return [];
+  const configured = splitList(process.env.AUTOGIT_DEV_ORIGINS);
+  return configured.length > 0 ? configured : [...DEFAULT_DEV_ORIGINS];
+}
+
+/**
+ * `true` when a module url names JavaScript emitted by the build (`dist`)
+ * instead of TypeScript source loaded by `tsx`.
+ */
+export function isCompiledEntry(entryUrl: string): boolean {
+  try {
+    return /\.(?:[cm]?js)$/i.test(new URL(entryUrl).pathname);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Defaults `NODE_ENV` for a process that never set it.
+ *
+ * `pnpm start` runs `node dist/index.js` and `pnpm dev` runs `tsx
+ * src/index.ts`, but only the first is the documented production start, and npm
+ * scripts cannot portably export `NODE_ENV`. Left to the old implicit default
+ * (`NODE_ENV !== 'production'`), a self-hosted install that follows the README
+ * silently ran the development policy, which also trusted the loopback origins
+ * of a dev server. A compiled entry therefore defaults to `production`; an
+ * explicit `NODE_ENV` always wins and the TypeScript entry keeps the
+ * development default.
+ */
+export function applyDefaultNodeEnv(
+  /** `import.meta.url` of the executing entry point, not of this module. */
+  entryUrl: string,
+  env: Record<string, string | undefined> = process.env,
+): void {
+  if (env.NODE_ENV?.trim()) return;
+  if (isCompiledEntry(entryUrl)) env.NODE_ENV = 'production';
 }
 
 export function loadRuntimeConfig(): RuntimeConfig {
   const home = resolveHome();
   const codexHome = process.env.CODEX_HOME?.trim() || path.join(homedir(), '.codex');
+  const isDev = process.env.NODE_ENV !== 'production';
 
   return {
     home,
@@ -87,7 +158,8 @@ export function loadRuntimeConfig(): RuntimeConfig {
     defaultMaxConcurrent: asNumber(process.env.AUTOGIT_MAX_CONCURRENT, 2),
     defaultMaxConcurrentPerRepo: asNumber(process.env.AUTOGIT_MAX_CONCURRENT_PER_REPO, 1),
     allowedOrigins: resolveAllowedOrigins(),
-    isDev: process.env.NODE_ENV !== 'production',
+    devOrigins: resolveDevOrigins(isDev),
+    isDev,
     repoRoot,
   };
 }

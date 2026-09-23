@@ -19,7 +19,7 @@ import type { AuthSessionPayload } from '@autogit/shared';
 import type { FastifyInstance } from 'fastify';
 
 import { buildServer } from '../app.js';
-import { loadRuntimeConfig } from '../config.js';
+import { applyDefaultNodeEnv, isCompiledEntry, loadRuntimeConfig } from '../config.js';
 import { migrate } from '../db/migrations.js';
 import {
   AUTH_LOGIN_BACKOFF_MS,
@@ -258,6 +258,14 @@ async function main(): Promise<void> {
 
   const config = loadRuntimeConfig();
   assert(config.home === path.resolve(home), `数据目录未隔离：${config.home}`);
+  assert(
+    config.isDev,
+    `auth:check 需要开发模式运行，当前 NODE_ENV=${process.env.NODE_ENV ?? '(未设置)'}`,
+  );
+  assert(
+    config.devOrigins.includes('http://localhost:5173'),
+    `开发模式没有放行 Vite 开发来源：${config.devOrigins.join('、') || '(空)'}`,
+  );
 
   const { app, ctx } = await buildServer(config);
   await app.ready();
@@ -702,6 +710,50 @@ async function main(): Promise<void> {
       return '会话已轮换';
     });
 
+    await expect('把密码改回出厂值后弱口令提示恢复（defaultCredentials=true）', async () => {
+      // 提示必须跟着「库里的口令还是不是 admin」走，而不是跟「有没有调用过改密
+      // 接口」走：用户把密码显式改回 admin 后出厂口令重新可用，界面却不再提醒，
+      // 弱口令就这样留在生产环境里。
+      const revert = await app.inject({
+        method: 'PUT',
+        url: '/api/auth/credentials',
+        headers: { cookie: cookieHeader(sessionToken) },
+        payload: { currentPassword: 's3cret-pw', password: 'admin' },
+      });
+      assert(revert.statusCode === 200, `状态码 ${revert.statusCode}`);
+      assert(
+        revert.json<AuthSessionPayload>().credentials?.defaultCredentials === true,
+        '密码已改回出厂值，弱口令提示却没有恢复',
+      );
+      assert(
+        ctx.store.getAuthAccount()?.passwordChangedAt === null,
+        'password_changed_at 没有随「改回出厂密码」一起清空',
+      );
+      sessionToken = cookieToken(revert.headers['set-cookie']);
+
+      const login = await app.inject({
+        method: 'POST',
+        url: '/api/auth/login',
+        payload: { username: 'moln', password: 'admin' },
+      });
+      assert(login.statusCode === 200, `出厂口令无法登录（${login.statusCode}）`);
+
+      // 换回非出厂口令，后续用例继续按原密码推进。
+      const restore = await app.inject({
+        method: 'PUT',
+        url: '/api/auth/credentials',
+        headers: { cookie: cookieHeader(sessionToken) },
+        payload: { currentPassword: 'admin', password: 's3cret-pw' },
+      });
+      assert(restore.statusCode === 200, `还原密码失败：${restore.statusCode}`);
+      assert(
+        restore.json<AuthSessionPayload>().credentials?.defaultCredentials === false,
+        '重新设成非出厂密码后弱口令提示没有消失',
+      );
+      sessionToken = cookieToken(restore.headers['set-cookie']);
+      return 'defaultCredentials true → false';
+    });
+
     await expect('旧密码无法登录，新密码可以登录', async () => {
       const oldLogin = await app.inject({
         method: 'POST',
@@ -764,6 +816,60 @@ async function main(): Promise<void> {
       });
       assert(response.statusCode === 401, `会话仍然有效（${response.statusCode}）`);
       return 'HTTP 200 + 401';
+    });
+
+    process.stdout.write('\n启动模式与实时来源策略：\n');
+
+    await expect('编译产物（pnpm start）默认进入生产模式，显式 NODE_ENV 优先', async () => {
+      // README 记录的生产启动是 `pnpm build` + `pnpm start`，而 npm 脚本无法跨平台
+      // 导出 NODE_ENV：旧实现让这条路径退回开发策略，实时通道因此对本机任意端口的
+      // 页面开放。编译入口（dist/*.js）现在默认 production，tsx 加载源码时保持开发
+      // 默认，两者都可以用显式 NODE_ENV 覆盖。
+      const compiled: Record<string, string | undefined> = {};
+      applyDefaultNodeEnv('file:///srv/autogit/apps/server/dist/index.js', compiled);
+      assert(
+        compiled.NODE_ENV === 'production',
+        `编译入口没有默认到生产模式：${compiled.NODE_ENV ?? '(未设置)'}`,
+      );
+
+      const explicit: Record<string, string | undefined> = { NODE_ENV: 'development' };
+      applyDefaultNodeEnv('file:///srv/autogit/apps/server/dist/index.js', explicit);
+      assert(explicit.NODE_ENV === 'development', '显式 NODE_ENV 被默认值覆盖');
+
+      const source: Record<string, string | undefined> = {};
+      applyDefaultNodeEnv('file:///srv/autogit/apps/server/src/index.ts', source);
+      assert(source.NODE_ENV === undefined, `tsx 开发入口被改成生产模式：${source.NODE_ENV}`);
+      assert(
+        !isCompiledEntry('file:///srv/autogit/apps/server/src/index.ts'),
+        'TypeScript 源码被当成编译产物',
+      );
+      return 'dist → production，src → 保持开发默认';
+    });
+
+    await expect('AUTOGIT_DEV_ORIGINS 只在开发模式生效', async () => {
+      const savedNodeEnv = process.env.NODE_ENV;
+      const savedDevOrigins = process.env.AUTOGIT_DEV_ORIGINS;
+      try {
+        process.env.NODE_ENV = 'development';
+        process.env.AUTOGIT_DEV_ORIGINS = 'http://localhost:6001';
+        const dev = loadRuntimeConfig();
+        assert(
+          dev.devOrigins.join(',') === 'http://localhost:6001',
+          `开发来源解析异常：${dev.devOrigins.join('、') || '(空)'}`,
+        );
+
+        process.env.NODE_ENV = 'production';
+        const prod = loadRuntimeConfig();
+        assert(prod.isDev === false, '生产模式未生效');
+        assert(
+          prod.devOrigins.length === 0,
+          `生产模式忽略开发来源失败：${prod.devOrigins.join('、')}`,
+        );
+        return '开发 6001、生产 0 条';
+      } finally {
+        restoreEnv('NODE_ENV', savedNodeEnv);
+        restoreEnv('AUTOGIT_DEV_ORIGINS', savedDevOrigins);
+      }
     });
 
     process.stdout.write('\n实时通道会话吊销（真实 HTTP + WebSocket 升级）：\n');
@@ -845,7 +951,7 @@ async function main(): Promise<void> {
       return 'HTTP 403（未登录 401）';
     });
 
-    await expect('同源与开发用回环 Origin 的实时升级正常（101）', async () => {
+    await expect('同源与 Vite 开发来源的实时升级正常（101），其它本地端口 403', async () => {
       const sameOrigin = await upgradeRealtime(
         realtimePort,
         '/api/realtime',
@@ -857,17 +963,29 @@ async function main(): Promise<void> {
       assert(await sameOrigin.probe.waitForFrame(3_000), '同源连接没有收到服务端消息');
 
       // 开发模式：Vite 代理用 changeOrigin 把 Host 改写成后端地址，Origin 仍是
-      // http://localhost:5173，所以回环来源要放行（生产模式见下一个用例）。
+      // http://localhost:5173，所以这个来源要放行（生产模式见下一个用例）。
       const devOrigin = await upgradeRealtime(
         realtimePort,
         '/api/realtime',
         cookieHeader(revokedToken),
         'http://localhost:5173',
       );
-      assert(devOrigin.upgraded, '开发用回环 Origin 被拒绝');
+      assert(devOrigin.upgraded, 'Vite 开发来源被拒绝');
       realtimeProbes.push(devOrigin.probe);
-      assert(await devOrigin.probe.waitForFrame(3_000), '开发用连接没有收到服务端消息');
-      return 'HTTP 101 ×2';
+      assert(await devOrigin.probe.waitForFrame(3_000), 'Vite 开发连接没有收到服务端消息');
+
+      // 放行范围只到 Vite 自己的端口为止。本机其它端口的页面对于 127.0.0.1 而言
+      // 是同站（Lax Cookie 会随握手一起发出），旧实现「任意回环来源都放行」等于
+      // 让它们也能订阅任务日志与 AI 输出。
+      const otherLocalPort = await upgradeRealtime(
+        realtimePort,
+        '/api/realtime',
+        cookieHeader(revokedToken),
+        'http://127.0.0.1:9999',
+      );
+      assert(!otherLocalPort.upgraded, '其它本地端口仍然可以建立实时连接');
+      assert(otherLocalPort.statusCode === 403, `其它本地端口 → ${otherLocalPort.statusCode}`);
+      return 'HTTP 101 ×2、其它本地端口 403';
     });
 
     await expect('生产模式不放行回环 Origin，显式允许列表可放行', async () => {
@@ -888,6 +1006,10 @@ async function main(): Promise<void> {
           prodConfig.allowedOrigins.length === 1,
           `允许列表解析异常：${prodConfig.allowedOrigins.join('、')}`,
         );
+        assert(
+          prodConfig.devOrigins.length === 0,
+          `生产模式仍然信任开发来源：${prodConfig.devOrigins.join('、')}`,
+        );
 
         prod = await buildServer(prodConfig);
         await prod.app.listen({ host: '127.0.0.1', port: 0 });
@@ -906,7 +1028,21 @@ async function main(): Promise<void> {
           cookie,
           'http://localhost:5173',
         );
-        assert(!loopback.upgraded, '生产模式仍然放行回环来源');
+        assert(!loopback.upgraded, '生产模式仍然放行 Vite 开发来源');
+        assert(loopback.statusCode === 403, `生产模式开发来源 → ${loopback.statusCode}`);
+
+        // 生产模式连「其它本地端口」也不再有任何隐式放行。
+        const otherLocalPort = await upgradeRealtime(
+          prodPort,
+          '/api/realtime',
+          cookie,
+          'http://127.0.0.1:9999',
+        );
+        assert(!otherLocalPort.upgraded, '生产模式仍然放行其它回环端口');
+        assert(
+          otherLocalPort.statusCode === 403,
+          `生产模式本地端口 → ${otherLocalPort.statusCode}`,
+        );
 
         const sameOrigin = await upgradeRealtime(
           prodPort,
@@ -937,7 +1073,7 @@ async function main(): Promise<void> {
         }
         rmSync(prodHome, { recursive: true, force: true });
       }
-      return '回环 403、同源 101、允许列表 101';
+      return '开发来源 403、本地端口 403、同源 101、允许列表 101';
     });
 
     let rotatedToken = '';

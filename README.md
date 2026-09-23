@@ -282,7 +282,7 @@ PR 标题由 `renderTitle()` 渲染「设置 → PR 标题模板」再归一化�
 AutoGit 只强推 `ai/*` 分支，但分支历史里可能夹带工作区产物——例如一次误提交的 `.pnpm-store/`（`ai/issue-4-新增登录密码` 这条分支带着 11,678 个对象、约 265 MB，最大单个对象约 72 MB；`git rev-list --objects HEAD -- .pnpm-store` 的原始输出是 11,682 行 = 11,282 个 blob + 398 个 tree + 2 个提交，脚本按路径过滤掉那 2 个提交和 2 条没有路径的 tree，所以两处数字差 4）。工作树里删掉它并不够：这些对象仍从 `HEAD` 可达，所以**含这类历史的分支只能用 `Squash and merge`，或先改写历史再合并**。`Create a merge commit` 会把整条对象链并进 `main`，`Rebase and merge` 会重放当初添加这些文件的提交，两者都让这份包缓存永久留在 `main` 的祖先链里，之后只能靠改写 `main` 的历史才能消除（克隆体积、`git rev-list --objects`、`git log --all` 都会一直背着它）。合并前跑一次：
 
 ```bash
-pnpm repo:check                    # 先在一个临时仓库里自检扫描逻辑，再扫 HEAD 可达的全部对象
+pnpm repo:check                    # 先自检扫描逻辑（干净仓库退出码 0、含缓存分支退出码 1），再扫 HEAD 可达的全部对象
 pnpm repo:check --ref origin/main  # 合并后复核目标分支同样干净
 pnpm repo:purge                    # 预演：列出会被改写的对象数量与备份位置（加 --apply 才真正改写）
 pnpm repo:purge --base origin/main # 指定合并基准分支（默认按 origin/main、main、origin/master、master、origin/HEAD 探测）
@@ -290,12 +290,14 @@ pnpm repo:purge --base origin/main # 指定合并基准分支（默认按 origin
 
 `pnpm repo:check` 还会报告 pnpm store 的落点：落在仓库内时打印一条 ⚠️ 警告（只警告、不改退出码），并给出把 store 指向仓库外的安装命令，理由见上面「快速开始」里的安装说明。
 
-命中 `.pnpm-store` 时会打印对象数量与体积、给出合并方式提醒，并以退出码 1 结束；先按下面二选一处理、再合并：
+命中 `.pnpm-store` 时会打印对象数量与体积、给出合并方式提醒、附上可以直接复制的 `git push --force-with-lease origin <当前分支>`（分支名取自当前检出；扫 `--ref <别的分支>` 时保留占位符），并以退出码 1 结束；先按下面二选一处理、再合并：
 
 1. **改写历史**（有远端写权限时首选）：先 `git fetch origin`，再 `pnpm repo:purge` 预演（只读，不动任何引用），确认对象数量后 `pnpm repo:purge --apply`。脚本用 git 自带的 `filter-branch` 只改写**这条分支自己带来的提交**（`<合并基准>..<分支>`），基准分支的历史一字不动，所以 `main` 上 GitHub 建的合并提交（带 `gpgsig`，被重建就会丢签名、SHA 随之改变）不会被卷进来：范围一旦放宽到整条历史，`main` 的提交会在分支里被重建，与 `main` 的合并基准会从分叉点往后退（本仓库实测 `403990a` → `9daccf9`），PR 从「无冲突、合并结果树就是 `HEAD` 树」变成 8 个冲突文件——而 tip 树一个字没变，只看树根本发现不了。改写前先在临时仓库里跑一遍自检（几秒，`--skip-self-test` 跳过），改写时先在临时分支上做，比对 tip 树一字未变**且与基准分支的合并基准没有移动**才移动真正的分支，旧历史留在 `refs/autogit-backup/<分支>/<时间戳>`（`git update-ref refs/heads/<分支> <备份引用>` 即可回退）。基准默认按 `origin/main`、`main`、`origin/master`、`master`、`origin/HEAD` 的顺序探测，也可以用 `--base <ref>` 指定；对象是基准分支自己带进来的（本分支没添加过）时脚本会拒绝改写并说明原因。改写完推送并复核：`git fetch origin && git push --force-with-lease origin <分支>`，再跑 `pnpm repo:check` 确认本地可达历史归零。注意 `git filter-repo --path .pnpm-store --invert-paths` 并不等价：它默认改写它看到的所有 ref（包括 `main`），范围比这里大得多。
 2. **Squash and merge**：GitHub 的合并按钮选 `Squash and merge`（只取 PR 的最终树），**不要**选 `Create a merge commit` 或 `Rebase and merge`；合并后删除该分支（`refs/pull/<n>` 仍会短暂保留这些对象，之后随 GC 回收）。
 
-**本次收口决策（PR #8，`ai/issue-4-新增登录密码`）**：合并侧走第 2 条 —— 用 `Squash and merge` 合并并删除分支；若希望保留这条分支的逐个提交，必须先在有写权限的环境执行第 1 条（`pnpm repo:purge --apply` 后 `git push --force-with-lease`），确认 `pnpm repo:check` 归零，再改用普通合并。修复代理只改工作树里的源码、不重写历史（沙箱里 `.git` 只读，也没有推送权限），所以这条决策只能落在合并侧：仓库自身无法把已经提交过的对象从 `HEAD` 可达集合里摘掉。在这条分支上 `pnpm repo:check` 仍会以退出码 1 结束，这是预期结果（它扫的就是 `HEAD` 可达对象），`pnpm repo:check --ref origin/main` 保持退出码 0；只有走完上面第 1 条（改写历史）本地才会归零。第 1 条已在临时克隆上实测（改完立即复核）：改写只动这条分支自己带来的提交，tip 树逐字节不变、与 `origin/main` 的合并基准仍是 `403990a`、`git merge-tree --write-tree HEAD origin/main` 仍是退出码 0 且结果树等于 tip 树、`pnpm repo:check` 归零（改写前后 `main` 的提交逐字节相同）。涉及具体哈希的数字会随分支增长变化，以脚本每次打印的结果为准。标题同样按仓库规范收口：这个 PR 的标题应当是 `feat: 新增登录密码`（AutoGit 用当时的默认模板 `{issueTitle} (#{issueNumber})` 建成了「新增登录密码 (#4)」）；仓库里的改动只影响之后新建的 PR，所以这条也要由合并侧在 GitHub 上改。
+**本次收口决策（PR #8，`ai/issue-4-新增登录密码`）**：合并侧走第 2 条 —— 用 `Squash and merge` 合并并删除分支；若希望保留这条分支的逐个提交，必须先在有写权限的环境执行第 1 条（`pnpm repo:purge --apply` 后 `git push --force-with-lease`），确认 `pnpm repo:check` 归零，再改用普通合并。修复代理只改工作树里的源码、不重写历史（沙箱里 `.git` 只读，也没有推送权限），所以这条决策只能落在合并侧：仓库自身无法把已经提交过的对象从 `HEAD` 可达集合里摘掉。在这条分支上 `pnpm repo:check` 仍会以退出码 1 结束，这是预期结果（它扫的就是 `HEAD` 可达对象），`pnpm repo:check --ref origin/main` 保持退出码 0；只有走完上面第 1 条（改写历史）本地才会归零。第 1 条已在临时克隆上实测（改完立即复核）：改写只动这条分支自己带来的提交，tip 树逐字节不变、与 `origin/main` 的合并基准仍是 `403990a`、`git merge-tree --write-tree HEAD origin/main` 仍是退出码 0 且结果树等于 tip 树、`pnpm repo:check` 归零（改写前后 `main` 的提交逐字节相同）。涉及具体哈希的数字会随分支增长变化，以脚本每次打印的结果为准。标题同样按仓库规范收口：这个 PR 的标题应当是 `feat: 新增登录密码 (#4)` —— 也就是 `renderTitle()` 用默认模板 `{issueTitle} (#{issueNumber})` 渲染出的结果（AutoGit 建 PR 时用的还是改前的旧模板，于是建成了不合规的「新增登录密码 (#4)」）；仓库里的改动只影响之后新建的 PR，已有标题不会被回改，所以这条也要由合并侧在 GitHub 上改。
+
+**合并侧操作清单（PR #8）**：① 把这个 PR 的标题改成 `feat: 新增登录密码 (#4)`；② 在 GitHub 上点 `Squash and merge`，合并后删除 `ai/issue-4-新增登录密码` 分支；③ 复核 `git fetch origin && pnpm repo:check --ref origin/main` 退出码 0，并且 `git log --oneline -1 origin/main` 的主题就是①里写进去的那个 `feat: ...`；④ 想保留这条分支的逐个提交，就先做①、再按第 1 条改写历史（`pnpm repo:purge --apply` + `git push --force-with-lease origin ai/issue-4-新增登录密码`，这条命令由 `pnpm repo:check` 直接打印）确认归零，之后才可以用普通合并。
 
 「评审通过只打 `ai/approved`、合并动作留给人工」的约定不变，人工额外要确认的就是这里的合并方式。AutoGit 的修复代理跑在 `.git` 只读、也没有远端写权限的沙箱里，所以第 1 条只能由有推送权限的一侧执行；两条路都没走就合并，等于把这份包缓存写进 `main` 的祖先链。
 

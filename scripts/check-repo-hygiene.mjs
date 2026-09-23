@@ -36,16 +36,18 @@
  *   pnpm repo:check --skip-self-test    # skip the scanner self test
  *
  * Every run starts with a self test (`--skip-self-test` opts out): a throwaway
- * repository in the temp directory proves that a clean history passes, that
- * `.pnpm-store` objects a later commit deleted are still caught and that the store
- * location check separates a store inside the repository from a sibling directory
- * that merely shares the prefix. If the detection logic ever breaks, this gate
- * fails instead of silently passing.
+ * repository in the temp directory proves that a clean history passes and exits 0,
+ * that `.pnpm-store` objects a later commit deleted are still caught — exit code 1
+ * plus the remediation the merge side reads, including a copy-pasteable force push
+ * for the branch being scanned — and that the store location check separates a store
+ * inside the repository from a sibling directory that merely shares the prefix. If
+ * the detection logic ever breaks, this gate fails instead of silently passing.
  */
 import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const FORBIDDEN = '.pnpm-store';
 const GIT = process.platform === 'win32' ? 'git.exe' : 'git';
@@ -203,6 +205,16 @@ function storeLocationWarning(cwd, store) {
   );
 }
 
+/** Current branch name, `null` when the checkout is detached or has no commits. */
+function currentBranch(cwd) {
+  try {
+    const name = git(cwd, ['rev-parse', '--abbrev-ref', 'HEAD']).trim();
+    return name && name !== 'HEAD' ? name : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Scans one repository: the index, the ignore rule and every object reachable
  * from `ref`. Returns the problems plus the numbers the caller reports.
@@ -229,12 +241,18 @@ function scan(cwd, ref) {
   const entries = historyEntries(cwd, ref);
   const bytes = totalBlobBytes(cwd, entries);
   if (entries.length > 0) {
+    // 分支名让强推那行可以直接复制；只有扫的就是当前检出时才拿得到，`--ref <别的分支>`
+    // 继续用占位符。
+    const branch = ref === 'HEAD' ? currentBranch(cwd) : null;
+    const push = branch
+      ? `git push --force-with-lease origin ${branch}`
+      : 'git push --force-with-lease origin <分支>';
     problems.push(
       `${ref} 可达的历史里有 ${entries.length} 个 ${FORBIDDEN} 对象（blob 合计 ${formatMb(bytes)}）。` +
         '删除文件只让工作树与索引变干净：这些对象仍从当初添加它们的提交起可达，' +
         'Create a merge commit 会把整条链并进目标分支，Rebase and merge 会重放那次添加。\n' +
         '   处理（二选一）：① 在有远端写权限的环境改写该分支：先 git fetch origin，再 pnpm repo:purge 预演、' +
-        'pnpm repo:purge --apply，最后 git push --force-with-lease，再跑 pnpm repo:check 确认归零；' +
+        `pnpm repo:purge --apply，最后 ${push}，再跑 pnpm repo:check 确认归零；` +
         '该脚本只改写分支自己的提交（基准分支的历史与合并基准都不动，不会把 PR 变成有冲突的）；' +
         '② 直接用 Squash and merge 合并（只取最终树）并在合并后删除该分支。',
     );
@@ -306,6 +324,37 @@ function selfTest() {
       throw new Error('检出对象但没有给出历史相关的诊断');
     }
 
+    // 这条诊断是合并侧唯一的抓手（分支历史没法从工作树里修），所以锁定它点名的三种
+    // 合并方式、两条安全路径，以及能直接复制粘贴的强推命令——分支名必须从仓库读出来，
+    // 留占位符等于把命令留给人工补全。
+    const [advice] = found.problems.filter((problem) => problem.includes('可达的历史'));
+    const leakBranch = git(leaked, ['rev-parse', '--abbrev-ref', 'HEAD']).trim();
+    for (const expected of [
+      'Create a merge commit',
+      'Rebase and merge',
+      'Squash and merge',
+      'pnpm repo:purge',
+      `git push --force-with-lease origin ${leakBranch}`,
+    ]) {
+      if (!advice.includes(expected)) {
+        throw new Error(`历史诊断里缺少「${expected}」：${advice}`);
+      }
+    }
+
+    // 合并侧真正跑的是这条命令，退出码就是门禁结论：含缓存的分支 1、干净的 0。
+    const cli = [process.execPath, fileURLToPath(import.meta.url), '--skip-self-test'];
+    const leakedRun = spawnSync(cli[0], cli.slice(1), { cwd: leaked, encoding: 'utf8' });
+    if (leakedRun.status !== 1) {
+      throw new Error(`含 .pnpm-store 历史时退出码应为 1，实际 ${leakedRun.status}`);
+    }
+    if (!(leakedRun.stderr ?? '').includes('Squash and merge')) {
+      throw new Error('退出码 1 却没有给出合并方式建议');
+    }
+    const cleanRun = spawnSync(cli[0], cli.slice(1), { cwd: clean, encoding: 'utf8' });
+    if (cleanRun.status !== 0) {
+      throw new Error(`干净仓库的退出码应为 0，实际 ${cleanRun.status}：${cleanRun.stderr}`);
+    }
+
     // A missing ignore rule is its own problem: the next install adds it back.
     commitAll(unignored, 'init');
     const noRule = scan(unignored, 'HEAD');
@@ -340,7 +389,8 @@ function selfTest() {
     }
 
     return (
-      `干净仓库 0 命中、提交后删除仍检出 ${found.entries} 个对象、缺少 .gitignore 规则被拦下、` +
+      `干净仓库 0 命中、提交后删除仍检出 ${found.entries} 个对象、含缓存的分支退出码 1 且带上` +
+      '合并方式与可复制的强推命令、干净仓库退出码 0、缺少 .gitignore 规则被拦下、' +
       '仓库内的 store 目录被警告而仓库外的不误报'
     );
   } finally {

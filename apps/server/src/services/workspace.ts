@@ -6,6 +6,7 @@ import { type LogStream, maskProxyUrl } from '@autogit/shared';
 import type { RuntimeConfig } from '../config.js';
 import type { RepositoryRecord } from '../db/store.js';
 import type { GitProvider } from '../providers/index.js';
+import { KeyedLock } from '../util/keyed-lock.js';
 import { safePathSegment } from '../util/paths.js';
 import type { RunResult } from '../util/subprocess.js';
 import { type GitProxyOption, git } from './git.js';
@@ -46,11 +47,22 @@ const INTERRUPTED_OPERATIONS = [
   ['am', '--abort'],
 ];
 
-/** Clone / fetch are the only git calls that fail on a flaky link, so they get retries. */
-const NETWORK_ATTEMPTS = 3;
-const NETWORK_RETRY_DELAYS_MS = [2_000, 5_000];
+/**
+ * Clone / fetch are the only git calls that fail on a flaky link or on a ref
+ * another writer moved first, so they are the ones that get retries.
+ */
+const RETRY_ATTEMPTS = 3;
+const RETRY_DELAYS_MS = [2_000, 5_000];
 const TRANSIENT_GIT_ERROR =
   /(could not resolve host|connection (was )?(reset|refused|closed)|connection timed out|recv failure|send failure|unable to access|remote end hung up|early eof|rpc failed|gnutls|ssl|tls|operation timed out|proxy|error: 5\d\d)/i;
+/**
+ * Another git process (a second AutoGit task, a manual fetch, an IDE) already
+ * moved the ref this fetch planned to update: it read the old value, the other
+ * writer committed the new one, and the lock now finds
+ * `is at <new> but expected <old>`. Reading the ref again — which is exactly
+ * what a retry does — resolves it, so it counts as transient.
+ */
+const REF_LOCK_ERROR = /(cannot lock ref|unable to update local ref)/i;
 /** Auth or permission problems never heal by retrying. */
 const PERMANENT_GIT_ERROR =
   /(returned error: 4\d\d|authentication failed|permission denied|repository not found|could not read username)/i;
@@ -69,10 +81,11 @@ function delay(ms: number): Promise<void> {
 }
 
 /** True when running the same git command again has a realistic chance to succeed. */
-function isTransientGitFailure(result: RunResult): boolean {
+export function isTransientGitFailure(result: RunResult): boolean {
   if (result.code === 0) return false;
   const text = `${result.stderr}\n${result.stdout}`;
   if (PERMANENT_GIT_ERROR.test(text)) return false;
+  if (REF_LOCK_ERROR.test(text)) return true;
   return TRANSIENT_GIT_ERROR.test(text) || result.timedOut;
 }
 
@@ -88,8 +101,15 @@ function isTransientGitFailure(result: RunResult): boolean {
  *
  * Inside a task clone branches are switched with a hard reset so the agent
  * always starts from a clean, predictable tree.
+ *
+ * The base clone itself is shared state, so everything that writes it (clone,
+ * fetch, prune) is queued per repository: with `maxConcurrentPerRepo` above 1
+ * two tasks of the same repository fetched it at the same moment and raced for
+ * the same `refs/remotes/origin/*`.
  */
 export class WorkspaceManager {
+  private readonly baseFetches = new KeyedLock();
+
   constructor(
     private readonly config: RuntimeConfig,
     private readonly settings: SettingsService,
@@ -130,7 +150,9 @@ export class WorkspaceManager {
     log: WorkspaceLog,
     options: { taskId?: string } = {},
   ): Promise<string> {
-    const base = await this.ensureBaseClone(repository, provider, log);
+    const base = await this.baseFetches.run(repository.id, () =>
+      this.ensureBaseClone(repository, provider, log),
+    );
     if (!options.taskId) return base;
     return this.ensureTaskClone(base, repository, provider, log, options.taskId);
   }
@@ -309,12 +331,13 @@ export class WorkspaceManager {
   }
 
   /**
-   * Runs a clone / fetch and retries transient network failures.
+   * Runs a clone / fetch and retries failures that a second attempt can fix.
    *
    * The pipeline used to park an Issue on `ai/stuck` after a single
    * `Recv failure: Connection was reset`; a couple of retries turn that kind
-   * of hiccup back into a normal run, while auth and permission errors still
-   * fail on the first attempt.
+   * of hiccup back into a normal run. The same goes for a ref lock another
+   * process held for a moment, while auth and permission errors still fail on
+   * the first attempt.
    */
   private async runNetworkGit(
     args: string[],
@@ -335,15 +358,11 @@ export class WorkspaceManager {
       });
 
     let result = await run();
-    for (
-      let attempt = 1;
-      attempt < NETWORK_ATTEMPTS && isTransientGitFailure(result);
-      attempt += 1
-    ) {
-      const wait = NETWORK_RETRY_DELAYS_MS[attempt - 1] ?? NETWORK_RETRY_DELAYS_MS.at(-1) ?? 5_000;
+    for (let attempt = 1; attempt < RETRY_ATTEMPTS && isTransientGitFailure(result); attempt += 1) {
+      const wait = RETRY_DELAYS_MS[attempt - 1] ?? RETRY_DELAYS_MS.at(-1) ?? 5_000;
       log(
         'system',
-        `git ${args[0] ?? ''} 网络失败（第 ${attempt}/${NETWORK_ATTEMPTS} 次）：${firstLine(
+        `git ${args[0] ?? ''} 失败（第 ${attempt}/${RETRY_ATTEMPTS} 次）：${firstLine(
           result.stderr || result.stdout,
         )}；${Math.round(wait / 1000)}s 后重试`,
       );

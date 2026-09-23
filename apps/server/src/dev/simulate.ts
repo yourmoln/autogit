@@ -37,7 +37,11 @@ import { ProxyService } from '../services/proxy.js';
 import type { EngineRunInput, EngineRunResult } from '../services/runner.js';
 import { EngineRunner } from '../services/runner.js';
 import { SettingsService } from '../services/settings.js';
-import { WorkspaceManager } from '../services/workspace.js';
+import {
+  isTransientGitFailure,
+  type WorkspaceLog,
+  WorkspaceManager,
+} from '../services/workspace.js';
 import { initLogger, logger } from '../util/logger.js';
 import { slugify } from '../util/time.js';
 
@@ -793,6 +797,95 @@ async function main(): Promise<void> {
     '远端已有同名分支且基础克隆残留分支指向别处时，重跑实现任务仍应推送成功',
   );
   log.warn('残留分支场景通过：重跑 Issue 时租约同样以远端当前值为准 ✅');
+
+  // ---- 场景 5：同仓库并发任务共享基座克隆，fetch 不得互抢 ref 锁 ----------
+  //
+  // 同一仓库的并发任务都会在基座克隆里跑 `git fetch --all --prune --tags`。
+  // 两个 fetch 同时更新同一个 refs/remotes/origin/* 时，先到的把分支推到新值，
+  // 后到的还拿着自己读到的旧值去加锁，于是整个任务报
+  // `cannot lock ref … is at c241f09… but expected 1150e10…` 失败（线上 PR #5
+  // 评审任务的故障）。这里先制造「基座克隆落后、远端已前进」的状态，再同时发起
+  // 两次抓取：修复前两个 fetch 会争抢同一个 ref，修复后同一仓库的基座抓取串行
+  // 执行，两次都成功。
+  assert(
+    isTransientGitFailure({
+      command: 'git',
+      args: ['fetch'],
+      code: 128,
+      stdout:
+        ' ! 1150e10..c241f09  ai/issue-3-x -> origin/ai/issue-3-x  (unable to update local ref)',
+      stderr:
+        "error: cannot lock ref 'refs/remotes/origin/ai/issue-3-x': is at c241f09 but expected 1150e10",
+      durationMs: 12,
+      timedOut: false,
+      aborted: false,
+      spawnError: null,
+    }),
+    'ref 抢锁（cannot lock ref）应当算作可重试的瞬时错误',
+  );
+
+  const silentLog: WorkspaceLog = () => {};
+  const raceBranch = `${settings.get().branchPrefix}9-并发抓取回归`;
+  git(['branch', raceBranch, 'main'], bareRepo);
+  // 基座克隆先跟上远端，随后远端再前进一步：本地引用就落在了旧值上。
+  await workspace.ensureClone(repository, provider, silentLog);
+  const baseCloneDir = workspace.pathFor(repository.id);
+  const staleTip = git(['rev-parse', `refs/remotes/origin/${raceBranch}`], baseCloneDir).trim();
+
+  const seedDir = path.join(root, 'seed');
+  writeFileSync(path.join(seedDir, 'race.txt'), '远端已经前进，基座克隆仍停在旧值。\n', 'utf8');
+  git(['add', '-A'], seedDir);
+  git(['commit', '-m', 'chore: 推进并发抓取回归分支'], seedDir);
+  git(['push', 'origin', `main:refs/heads/${raceBranch}`], seedDir);
+  const remoteTip = git(['rev-parse', 'HEAD'], seedDir).trim();
+  assert(staleTip !== remoteTip, '回归场景要求基座克隆的远端引用落后于远端');
+
+  const raceTaskIds = ['sim-race-a', 'sim-race-b'];
+  const raceLines: Array<{ task: string; message: string }> = [];
+  const taggedLog =
+    (task: string): WorkspaceLog =>
+    (_stream, message) => {
+      raceLines.push({ task, message });
+    };
+  const raceResults = await Promise.allSettled(
+    raceTaskIds.map((taskId, index) =>
+      workspace.ensureClone(repository, provider, taggedLog(index === 0 ? 'a' : 'b'), { taskId }),
+    ),
+  );
+  // 串行化的观测点：第一个任务的抓取会打印 `From <远端>`，第二个任务必须等到它
+  // 结束之后才轮到「更新远端引用」这一行。修复前两行会在同一批微任务里先后打出，
+  // 第二个任务的抓取压根不会等第一个。
+  const firstFetchOutput = raceLines.findIndex(
+    (line) => line.task === 'a' && /^From /i.test(line.message),
+  );
+  const secondFetchStart = raceLines.findIndex(
+    (line) => line.task === 'b' && line.message.startsWith('更新远端引用'),
+  );
+  assert(firstFetchOutput !== -1, '回归场景要求第一次抓取打印远端更新行');
+  assert(
+    secondFetchStart > firstFetchOutput,
+    '同一仓库的第二次基座抓取应当排在第一次之后（基座克隆按仓库串行）',
+  );
+
+  const raceFailure = raceResults.find((result) => result.status === 'rejected');
+  assert(
+    raceFailure === undefined,
+    `同一仓库并发抓取基座克隆不应互相抢锁：${
+      raceFailure?.status === 'rejected' ? String(raceFailure.reason) : ''
+    }`,
+  );
+  assert(
+    git(['rev-parse', `refs/remotes/origin/${raceBranch}`], baseCloneDir).trim() === remoteTip,
+    '基座克隆应当已经跟上远端最新提交',
+  );
+  for (const taskId of raceTaskIds) {
+    assert(
+      existsSync(path.join(workspace.pathForTask(repository.id, taskId), '.git')),
+      `并发抓取的任务工作区应当就绪：${taskId}`,
+    );
+    workspace.releaseTaskWorkspace(repository.id, taskId);
+  }
+  log.warn('基座抓取场景通过：同仓库并发任务串行抓取基座克隆，不再互抢 ref 锁 ✅');
 
   orchestrator.stop();
   db.close();

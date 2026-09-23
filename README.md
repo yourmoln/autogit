@@ -89,7 +89,7 @@ codex login            # 首次使用或凭证失效时执行一次设备授权
 首次打开 http://127.0.0.1:4711 会跳转到登录页，默认账号与密码都是 `admin`：
 
 - **保持登录**：勾选后凭证以 HttpOnly Cookie 保存在浏览器中，30 天内打开页面会自动登录（每次访问滚动续期，Cookie 的有效期同步顺延；页面长时间只挂着实时连接时，前端每 12 小时发一次会话查询让 Cookie 一起顺延）；不勾选则只在当前浏览器会话内有效（上限 12 小时，不滚动续期）。
-- **修改账号密码**：登录后在「设置 → 登录与安全」中修改，需要验证当前密码；修改后其他设备上的登录状态立即失效（包括已经建立的实时连接），本机保持登录。
+- **修改账号密码**：登录后在「设置 → 登录与安全」中修改，需要验证当前密码；修改后其他设备上的登录状态立即失效（包括已经建立的实时连接），本机保持登录。被吊销的页面会立刻退回登录页：实时连接收到服务端的 `4401` 关闭帧时广播一次「会话失效」并停止重连，受保护接口返回 `401`（含 `PUT /api/auth/credentials`）时同样广播，而不是停在一个看起来仍然登录的页面上。
 - **退出登录**：左侧边栏底部或页面右上角的「退出登录」按钮会吊销当前会话并清除凭证。
 - **登录失败限速**：连续失败 5 次后进入退避窗口，窗口内一律返回 `429` 与「请 N 秒后重试」，每次再失败窗口翻倍（最长 30 秒）；窗口会自动过期，成功登录立即清零，所以忘记密码不会把自己永久锁在外面。
 - **忘记密码**：停掉服务后删除 `~/.autogit/data/autogit.sqlite` 中 `auth_account` 与 `auth_sessions` 两张表的数据（或参照 [docs/RESET.md](docs/RESET.md) 重置整个数据目录），下次启动会恢复默认的 `admin` / `admin`。
@@ -194,6 +194,8 @@ stateDiagram-v2
 
 实时通道的升级请求与非 `GET`/`HEAD`/`OPTIONS` 的 `/api` 写请求都要求 `Origin` 与请求到达的 `Host` 一致（比较的是主机与端口：TLS 通常终结在反向代理上，此时进程看到的协议是 `http`，把协议拉进这条比较会锁住所有 HTTPS 部署），开发模式额外放行 Vite 开发服务器的来源（默认 `http://localhost:5173`、`http://127.0.0.1:5173`），不一致直接 `403`，不再只依赖「浏览器会不会带上 `SameSite=Lax` 的 Cookie」。升级请求拿不到可读的响应、也没有 CORS 层兜底，所以只能自己比对；写请求同理：`POST /api/orchestrator/tick`、`POST /api/orchestrator/restart`、`POST /api/codex/invalidate` 这类请求没有请求体，属浏览器眼里的简单请求，**不触发预检**，同站另一个端口（`127.0.0.1:9999`、被顶掉的本地服务）照样把 Cookie 带过来 —— 读响应被 CORS 挡住，但动作已经发生。发不出 `Origin` 的调用方（`curl`、探针、脚本）不受影响：浏览器一定会带这个头，页面脚本也改不了它。`AUTOGIT_ALLOWED_ORIGINS` / `AUTOGIT_DEV_ORIGINS` 里的条目按完整 origin 比较：写了协议就锁定协议（列了 `https://autogit.example.com` 就不会再放行 `http://autogit.example.com`），只写主机名的老写法保持「只比主机」的语义；反向代理改写了 `Host`、或开发前端跑在另一台机器上时，用 `AUTOGIT_ALLOWED_ORIGINS` 追加允许的来源。
 
+反向代理终结 TLS 时还要给进程设 `AUTOGIT_TRUST_PROXY=1`（或只信任代理地址的 `AUTOGIT_TRUST_PROXY=127.0.0.1,::1`）：Fastify 才会采信 `X-Forwarded-Proto`，登录 / 续期 / 退出登录下发的会话 Cookie 才会带 `Secure`。不设置时这个头一律忽略，直连端口的客户端无法用它影响 Cookie 属性（细节见「数据与安全」）。
+
 | 分类 | 方法与路径 |
 | --- | --- |
 | 登录 | `POST /api/auth/login`、`GET /api/auth/session`、`POST /api/auth/logout`、`PUT /api/auth/credentials` |
@@ -212,6 +214,7 @@ stateDiagram-v2
 - **数据目录**：`~/.autogit`（可用 `AUTOGIT_HOME` 覆盖），包含 `data/autogit.sqlite`、`workspaces/`、`secret.key`、`logs/`。
 - **登录凭证**：账号只有一份，密码以 scrypt 哈希存放在 `auth_account` 表，明文不落库；登录会话的随机 token 只保存 SHA-256 摘要（`auth_sessions`），浏览器侧是 HttpOnly + SameSite=Lax 的 Cookie，脚本读不到。首次启动自动创建默认账号 `admin` / `admin`，接口只返回用户名与「密码是否仍是出厂口令」的提示，不返回任何哈希；这个提示只跟密码走，所以「先把用户名改掉、密码还留着」的账号一样会持续提醒。每次登录恒定执行一次 scrypt（用户名不存在时校验进程内生成好的诱饵哈希），所以「用户名不存在」与「密码错误」的响应时间与文案都一致，无法用来枚举账号；连续失败 5 次后进入 1 秒起步、逐次翻倍、最长 30 秒的退避窗口，把在线猜解压到每秒一次量级，成功登录即清零。
 - **跨源访问**：服务端不设置任何 CORS 响应头，别的网站在浏览器里读不到本机接口的响应（开发模式走 Vite 同源代理，生产模式由后端直接托管前端，都不需要跨源）；实时通道的 WebSocket 升级与非 `GET`/`HEAD`/`OPTIONS` 的写请求再单独校验 `Origin` 与 `Host` 同源（只比主机与端口，理由见「HTTP API」），不一致直接 `403` —— 公开接口也不例外，跨站的 `POST /api/auth/login` 会被拒，免得别的页面把浏览器登录到攻击者掌握的账号上。生产模式（`NODE_ENV=production`，`pnpm start` 默认如此）只接受同源与 `AUTOGIT_ALLOWED_ORIGINS`；开发模式额外接受 `AUTOGIT_DEV_ORIGINS`（默认 `http://localhost:5173`、`http://127.0.0.1:5173`），不再放行「任意回环来源」——本机其它端口的页面对于 `127.0.0.1` 属于同站，Lax Cookie 会随请求（含 WebSocket 握手）发出，旧实现等于让它们也能订阅任务日志、也能直接触发轮询与重启。白名单条目按完整 origin 比较（协议 + 主机 + 端口，统一小写）：列了 `https://autogit.example.com` 就不会再放行同主机的 `http://autogit.example.com`，只写主机名的条目保持「只比主机」的旧语义。会话失效时（退出登录、改凭据、过期）会立刻关闭该会话已建立的实时连接。
+- **反向代理与 `Secure` Cookie**：TLS 终结在反向代理、以明文 HTTP 转发给 AutoGit 时（`AUTOGIT_ALLOWED_ORIGINS` 描述的正是这种部署），进程看到的协议是 `http`，默认（`AUTOGIT_TRUST_PROXY` 未设置）下会话 Cookie 不会带 `Secure`——这条加固只在 HTTPS 部署里有意义，而默认直连的用法（`127.0.0.1`）不受影响。要补上它，给反向代理设 `AUTOGIT_TRUST_PROXY=1`（`true` / `yes` / `on` 等价）：Fastify 随即采信 `X-Forwarded-Proto`，`request.protocol` 返回 `https`，登录、滚动续期与退出登录的 Cookie 都会带 `Secure`。若后端端口不止代理能访问，用地址列表形式（`AUTOGIT_TRUST_PROXY=127.0.0.1,::1`）只信任那些代理；选项关闭时该请求头一律忽略，任何能直连端口的调用方都无法用 `X-Forwarded-Proto: https` 影响 Cookie 属性。
 - **Token 加密**：使用 AES-256-GCM 加密后落库，密钥来自 `AUTOGIT_SECRET_KEY` 或自动生成的 `secret.key`；接口返回的只是掩码预览。
 - **Git 认证**：推送/拉取通过 `GIT_CONFIG_*` 环境变量注入 `http.extraheader`，Token 不会写进 `.git/config`，也不会出现在命令行参数里。
 - **代理地址**：HTTP(S) 与 SOCKS5 两个通道和账号级代理同样加密落库，接口只返回掩码；仅在配置了代理时注入 `http.proxy` 与代理环境变量，并清空凭据助手避免 Git Credential Manager 探测代理主机。
@@ -229,6 +232,7 @@ AUTOGIT_MAX_CONCURRENT=2
 AUTOGIT_MAX_CONCURRENT_PER_REPO=1
 # AUTOGIT_ALLOWED_ORIGINS=https://autogit.example.com
 # AUTOGIT_DEV_ORIGINS=http://localhost:5174   # 仅开发模式生效（Vite 换端口时用）
+# AUTOGIT_TRUST_PROXY=1                       # 反向代理终结 TLS 时设置，Cookie 才会带 Secure
 # AUTOGIT_CODEX_PATH=C:\Users\me\AppData\Roaming\npm\codex.cmd
 ```
 
@@ -241,6 +245,7 @@ pnpm repo:check   # 仓库历史里没有 .pnpm-store（合并前必跑；先自
 pnpm build        # shared → server → web
 pnpm simulate     # 端到端模拟：真实 git + 假 Codex + 假 Git 平台
 pnpm --filter @autogit/server auth:check            # 登录门禁自检（临时数据目录，真实 HTTP 路由）
+pnpm --filter @autogit/web client:check            # 前端会话生命周期自检（4401 关闭与 401 的登录态广播）
 pnpm --filter @autogit/server proxy:check          # 代理链路自检（本地起 HTTP/SOCKS5 代理）
 pnpm --filter @autogit/server proxy:check -- --online  # 额外验证真实 HTTPS 隧道
 ```
@@ -249,7 +254,9 @@ pnpm --filter @autogit/server proxy:check -- --online  # 额外验证真实 HTTP
 
 `proxy:check` 会启动一次性本地代理并断言 11 项行为（绝对形式转发、CONNECT 隧道、SOCKS5 用户名密码、认证失败提示、远程 DNS、重定向、gzip、错误码映射等），`--online` 会再追加两项真实 `https://api.github.com/` 隧道检查。
 
-`auth:check` 会在临时 `AUTOGIT_HOME` 中启动真实 HTTP 栈并断言 40 项行为：未登录访问接口与实时通道返回 401（`OPTIONS` 与预检样式请求同样需要会话）、探活接口 `GET /api/health`（含编码写法）未登录可访问且只回运行状态、百分号编码路径（`/%61pi/...`，含 `OPTIONS`）同样被拦下、默认账号可登录、用户名不存在与密码错误在响应时间与文案上不可区分、勾选/不勾选「保持登录」的 Cookie 差异与滚动续期（续期时同步续期浏览器 Cookie，并核对库内 `expires_at` 前移的幅度与 Cookie `Max-Age` 一致；非保持登录保持 12 小时上限）、跨源请求不返回 CORS 头、写请求的来源校验（跨站与同站其它端口的 `POST /api/orchestrator/tick`、`POST /api/orchestrator/restart`、`POST /api/codex/invalidate` 全部 403，跨站 `POST /api/auth/login` 同样 403，未登录的跨站写请求仍是 401，同源 / Vite 开发来源 / 无 `Origin` 的写请求 200）、会话摘要不再同步跑 scrypt、过期会话被清理、修改账号密码的校验与会话轮换、只改用户名时仍提示「仍在使用默认密码」、把密码显式改回出厂值后提示恢复（`password_changed_at` 被清空）、旧密码失效、其他设备会话被吊销、退出登录清除凭据、连续登录失败触发 `429` 且窗口过期后自动恢复并清零、编译产物（`pnpm start`）默认按生产模式启动且显式 `NODE_ENV` 优先、`AUTOGIT_DEV_ORIGINS` 只在开发模式生效、真实 WebSocket 升级路径（未登录 401、跨站 `Origin` 403、同源与 Vite 开发来源 101、其它本地端口与生产模式的开发来源 403、生产模式只放行显式允许列表、白名单与开发来源的协议必须一致（`https://` 条目不放行 `http://` 来源，反之亦然）、只写主机名的条目仍按主机比对、改凭据/退出登录后已建立的连接被 4401 关闭），以及旧库升级时 `password_changed_at` 的回填，最后自动清理。
+`auth:check` 会在临时 `AUTOGIT_HOME` 中启动真实 HTTP 栈并断言 43 项行为：未登录访问接口与实时通道返回 401（`OPTIONS` 与预检样式请求同样需要会话）、探活接口 `GET /api/health`（含编码写法）未登录可访问且只回运行状态、百分号编码路径（`/%61pi/...`，含 `OPTIONS`）同样被拦下、默认账号可登录、用户名不存在与密码错误在响应时间与文案上不可区分、勾选/不勾选「保持登录」的 Cookie 差异与滚动续期（续期时同步续期浏览器 Cookie，并核对库内 `expires_at` 前移的幅度与 Cookie `Max-Age` 一致；非保持登录保持 12 小时上限）、跨源请求不返回 CORS 头、写请求的来源校验（跨站与同站其它端口的 `POST /api/orchestrator/tick`、`POST /api/orchestrator/restart`、`POST /api/codex/invalidate` 全部 403，跨站 `POST /api/auth/login` 同样 403，未登录的跨站写请求仍是 401，同源 / Vite 开发来源 / 无 `Origin` 的写请求 200）、会话摘要不再同步跑 scrypt、过期会话被清理、修改账号密码的校验与会话轮换、只改用户名时仍提示「仍在使用默认密码」、把密码显式改回出厂值后提示恢复（`password_changed_at` 被清空）、旧密码失效、其他设备会话被吊销、退出登录清除凭据、连续登录失败触发 `429` 且窗口过期后自动恢复并清零、编译产物（`pnpm start`）默认按生产模式启动且显式 `NODE_ENV` 优先、`AUTOGIT_DEV_ORIGINS` 只在开发模式生效、真实 WebSocket 升级路径（未登录 401、跨站 `Origin` 403、同源与 Vite 开发来源 101、其它本地端口与生产模式的开发来源 403、生产模式只放行显式允许列表、白名单与开发来源的协议必须一致（`https://` 条目不放行 `http://` 来源，反之亦然）、只写主机名的条目仍按主机比对、改凭据/退出登录后已建立的连接被 4401 关闭）、`AUTOGIT_TRUST_PROXY` 的解析（默认关闭、开 / 关写法、地址列表）与反向代理下的 `Secure` Cookie（登录、滚动续期、退出登录清除三处都带，代理报告明文时不带；开关关闭时 `X-Forwarded-Proto` 一律忽略），以及旧库升级时 `password_changed_at` 的回填，最后自动清理。
+
+`client:check` 用 `window` / `WebSocket` / `fetch` 三个桩件跑前端会话生命周期的 6 项断言：实时连接收到 `4401`（改凭据、退出登录、会话过期）时广播一次 `autogit:unauthorized` 并停止重连；其它关闭码先按 5 分钟节流核对一次会话（会话已失效同样广播）再退避重连，会话仍有效时不广播；受保护接口（含 `PUT /api/auth/credentials`）返回 `401` 时广播失效，而公开的登录 / 会话查询 / 退出登录接口返回 `401`（密码错误）与其它状态码（如 `403`）不广播。
 
 ### 合并 PR 前：确认分支历史干净
 

@@ -41,6 +41,17 @@ export interface RuntimeConfig {
    * `AUTOGIT_ALLOWED_ORIGINS` and nothing else. See `util/origin.ts`.
    */
   devOrigins: string[];
+  /**
+   * Fastify `trustProxy`, driven by `AUTOGIT_TRUST_PROXY`.
+   *
+   * When a reverse proxy terminates TLS, this process sees `http` while the
+   * browser used `https`, so `request.protocol` answers `http` and the session
+   * cookie loses `Secure`. Turning the switch on makes Fastify honor
+   * `X-Forwarded-Proto` (see `routes/auth.ts` for the cookie); `false` (the
+   * default) keeps the header ignored, so a directly reachable instance cannot
+   * be tricked into setting `Secure` by anyone who can send that header.
+   */
+  trustProxy: boolean | string;
   isDev: boolean;
   repoRoot: string;
 }
@@ -84,6 +95,29 @@ function splitList(value: string | undefined): string[] {
  */
 function resolveAllowedOrigins(): string[] {
   return splitList(process.env.AUTOGIT_ALLOWED_ORIGINS);
+}
+
+/** Values of `AUTOGIT_TRUST_PROXY` that switch the option on / off. */
+const TRUST_PROXY_ON = new Set(['1', 'true', 'yes', 'on']);
+const TRUST_PROXY_OFF = new Set(['0', 'false', 'no', 'off']);
+
+/**
+ * `AUTOGIT_TRUST_PROXY` → Fastify's `trustProxy`.
+ *
+ * `1` / `true` trusts `X-Forwarded-Proto` (and `X-Forwarded-For`) from every
+ * hop, which is what a single reverse proxy on the same host needs. A value
+ * that is neither on nor off is handed to Fastify as an address list
+ * (`127.0.0.1,::1`), so only those proxies may set the forwarded headers —
+ * the narrow form, and the one to prefer when the backend port is reachable
+ * from more than the proxy.
+ */
+function resolveTrustProxy(): boolean | string {
+  const raw = process.env.AUTOGIT_TRUST_PROXY?.trim();
+  if (!raw) return false;
+  const normalized = raw.toLowerCase();
+  if (TRUST_PROXY_ON.has(normalized)) return true;
+  if (TRUST_PROXY_OFF.has(normalized)) return false;
+  return raw;
 }
 
 /** Origins the local Vite dev server is served from unless told otherwise. */
@@ -171,6 +205,7 @@ export function loadRuntimeConfig(): RuntimeConfig {
     defaultMaxConcurrentPerRepo: asNumber(process.env.AUTOGIT_MAX_CONCURRENT_PER_REPO, 1),
     allowedOrigins: resolveAllowedOrigins(),
     devOrigins: resolveDevOrigins(isDev),
+    trustProxy: resolveTrustProxy(),
     isDev,
     repoRoot,
   };

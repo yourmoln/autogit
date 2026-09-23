@@ -7,6 +7,20 @@ type Listener = (event: RealtimeEvent) => void;
 
 export type ConnectionState = 'connecting' | 'online' | 'offline';
 
+/**
+ * Close code the server sends when the session behind a socket is gone.
+ *
+ * `routes/system.ts` closes established connections with it on logout, on a
+ * credential change (which revokes every session) and when a reconnect hits an
+ * expired session.
+ */
+export const SESSION_GONE_CLOSE_CODE = 4401;
+
+/** `true` when a close means "the cookie is gone", so reconnecting cannot help. */
+export function isSessionGoneCloseCode(code: number): boolean {
+  return code === SESSION_GONE_CLOSE_CODE;
+}
+
 /** How long a live socket may go without refreshing its session cookie. */
 const SESSION_REFRESH_INTERVAL_MS = 12 * 60 * 60_000;
 /** Reconnects are frequent and noisy; only the first one in a window pings. */
@@ -74,8 +88,24 @@ class RealtimeClient {
         // ignore malformed frames
       }
     };
-    socket.onclose = () => {
+    socket.onclose = (event: CloseEvent) => {
+      if (this.socket === socket) this.socket = null;
       this.setState('offline');
+      // A revoked session (logout elsewhere, credential change, expiry) closes
+      // the socket with 4401. The cookie is gone, so the usual backoff would
+      // keep reconnecting into `401` forever while the tab still looks signed
+      // in: stop the client and hand the tab back to the login state instead.
+      if (isSessionGoneCloseCode(event.code)) {
+        this.stop();
+        notifyUnauthorized();
+        return;
+      }
+      // Any other close can be the first sign that the session died while the
+      // socket was down: a reconnect whose upgrade is rejected with `401` never
+      // reaches `onopen`, so nothing else would ask before the 12h timer. The
+      // refresh is throttled to one call per `SESSION_REFRESH_MIN_GAP_MS`, so a
+      // flapping socket does not turn into a request storm.
+      void this.refreshSessionCookie();
       this.scheduleReconnect();
     };
     socket.onerror = () => {

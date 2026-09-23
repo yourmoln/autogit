@@ -9,7 +9,7 @@ import {
   sessionCookieMaxAge,
 } from '../services/auth.js';
 import { clearCookie, readCookie, serializeCookie } from '../util/cookies.js';
-import { HttpError, parseOrThrow } from '../util/http.js';
+import { HttpError, isSecureRequest, parseOrThrow } from '../util/http.js';
 
 const loginSchema = z.object({
   username: z.string().min(1, '请输入用户名').max(64),
@@ -76,7 +76,7 @@ export function registerAuthRoutes(app: FastifyInstance, ctx: AppContext): void 
       throw error;
     }
 
-    sendSessionCookie(reply, result, request.protocol === 'https');
+    sendSessionCookie(reply, result, isSecureRequest(request));
     ctx.store.addActivity({
       level: 'success',
       scope: 'auth',
@@ -95,7 +95,7 @@ export function registerAuthRoutes(app: FastifyInstance, ctx: AppContext): void 
     ctx.auth.logout(readCookie(request.headers.cookie, AUTH_SESSION_COOKIE));
     reply.header(
       'set-cookie',
-      clearCookie(AUTH_SESSION_COOKIE, { secure: request.protocol === 'https' }),
+      clearCookie(AUTH_SESSION_COOKIE, { secure: isSecureRequest(request) }),
     );
 
     if (session) {
@@ -120,7 +120,7 @@ export function registerAuthRoutes(app: FastifyInstance, ctx: AppContext): void 
       password: body.password ?? null,
       persistent: request.authSession?.persistent ?? false,
     });
-    sendSessionCookie(reply, result, request.protocol === 'https');
+    sendSessionCookie(reply, result, isSecureRequest(request));
     ctx.store.addActivity({
       level: 'success',
       scope: 'auth',

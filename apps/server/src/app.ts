@@ -29,6 +29,12 @@ export async function buildServer(config: RuntimeConfig): Promise<{
   const app = Fastify({
     logger: false,
     bodyLimit: 8 * 1024 * 1024,
+    // `AUTOGIT_TRUST_PROXY`: when TLS is terminated by a reverse proxy the
+    // process sees `http`, so `request.protocol` has to come from
+    // `X-Forwarded-Proto` for the session cookie to be marked `Secure`. Off by
+    // default: a directly reachable instance must not let a client header pick
+    // the cookie flags. See `config.ts` and the README's proxy section.
+    trustProxy: config.trustProxy,
   });
 
   // No CORS plugin on purpose. The console is served from this very origin (dev

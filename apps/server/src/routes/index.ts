@@ -4,7 +4,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import type { AppContext } from '../context.js';
 import { AUTH_SESSION_COOKIE, sessionCookieMaxAge } from '../services/auth.js';
 import { readCookie, serializeCookie } from '../util/cookies.js';
-import { API_PREFIX, decodeRequestPath, isApiPath } from '../util/http.js';
+import { API_PREFIX, decodeRequestPath, isApiPath, isSecureRequest } from '../util/http.js';
 import { logger } from '../util/logger.js';
 import { isTrustedOrigin, isWebSocketUpgrade } from '../util/origin.js';
 import { registerAccountRoutes } from './accounts.js';
@@ -197,7 +197,7 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
       'set-cookie',
       serializeCookie(AUTH_SESSION_COOKIE, token, {
         maxAgeSeconds: sessionCookieMaxAge(session),
-        secure: request.protocol === 'https',
+        secure: isSecureRequest(request),
       }),
     );
   });

@@ -1305,6 +1305,131 @@ async function main(): Promise<void> {
       return `${SESSION_GONE_CLOSE_CODE} 关闭`;
     });
 
+    process.stdout.write('\n反向代理终结 TLS（AUTOGIT_TRUST_PROXY）：\n');
+
+    await expect('AUTOGIT_TRUST_PROXY 解析：默认关闭，开 / 关 / 地址列表', async () => {
+      const saved = process.env.AUTOGIT_TRUST_PROXY;
+      try {
+        delete process.env.AUTOGIT_TRUST_PROXY;
+        assert(loadRuntimeConfig().trustProxy === false, '默认值不再是「不信任代理」');
+        for (const value of ['1', 'true', 'yes', 'on']) {
+          process.env.AUTOGIT_TRUST_PROXY = value;
+          assert(loadRuntimeConfig().trustProxy === true, `AUTOGIT_TRUST_PROXY=${value} 未开启`);
+        }
+        for (const value of ['0', 'false', 'no', 'off']) {
+          process.env.AUTOGIT_TRUST_PROXY = value;
+          assert(loadRuntimeConfig().trustProxy === false, `AUTOGIT_TRUST_PROXY=${value} 未关闭`);
+        }
+        process.env.AUTOGIT_TRUST_PROXY = '127.0.0.1,::1';
+        const listed = loadRuntimeConfig().trustProxy;
+        assert(listed === '127.0.0.1,::1', `地址列表被改写：${String(listed)}`);
+      } finally {
+        restoreEnv('AUTOGIT_TRUST_PROXY', saved);
+      }
+      return '默认 false、1/true/yes/on → true、0/false/no/off → false、地址列表原样透传';
+    });
+
+    await expect('代理终结 TLS 时会话 Cookie 带 Secure（含续期与清除）', async () => {
+      // The session cookie used to decide `Secure` from `request.protocol` alone,
+      // and behind a TLS-terminating proxy that is always `http`. With the switch
+      // on, Fastify folds `X-Forwarded-Proto` in, so login, the sliding renewal
+      // (the `onSend` hook) and the logout clearing counter-part all carry it.
+      const proxiedHome = mkdtempSync(path.join(tmpdir(), 'autogit-auth-proxy-'));
+      const savedTrust = process.env.AUTOGIT_TRUST_PROXY;
+      const savedHome = process.env.AUTOGIT_HOME;
+      process.env.AUTOGIT_TRUST_PROXY = '1';
+      process.env.AUTOGIT_HOME = proxiedHome;
+      let proxied: Awaited<ReturnType<typeof buildServer>> | null = null;
+      try {
+        const proxiedConfig = loadRuntimeConfig();
+        // 生产模式的日志是 JSON，别让「已创建默认账号」的告警混进自检输出。
+        proxiedConfig.logLevel = 'error';
+        assert(proxiedConfig.trustProxy === true, '配置没有把 trustProxy 交给 Fastify');
+        proxied = await buildServer(proxiedConfig);
+        await proxied.app.ready();
+
+        const login = await proxied.app.inject({
+          method: 'POST',
+          url: '/api/auth/login',
+          headers: { 'x-forwarded-proto': 'https' },
+          payload: { username: 'admin', password: 'admin', remember: true },
+        });
+        assert(login.statusCode === 200, `代理后登录失败：${login.statusCode}`);
+        const loginCookie = String(login.headers['set-cookie'] ?? '');
+        assert(/;\s*Secure/i.test(loginCookie), `登录 Cookie 缺少 Secure：${loginCookie}`);
+        const token = cookieToken(login.headers['set-cookie']);
+        const tokenHash = hashSessionToken(token);
+
+        const stored = proxied.ctx.store.getAuthSession(tokenHash);
+        assert(stored, '登录后没有会话记录');
+        proxied.ctx.store.touchAuthSession(
+          tokenHash,
+          new Date(Date.now() - 10 * 60_000).toISOString(),
+          new Date(Date.now() + 20 * 24 * 60 * 60 * 1000).toISOString(),
+        );
+        const renewed = await proxied.app.inject({
+          method: 'GET',
+          url: '/api/system/overview',
+          headers: { cookie: cookieHeader(token), 'x-forwarded-proto': 'https' },
+        });
+        assert(renewed.statusCode === 200, `代理后读取失败：${renewed.statusCode}`);
+        const renewedCookie = String(renewed.headers['set-cookie'] ?? '');
+        assert(/max-age=\d+/i.test(renewedCookie), `续期未下发 Cookie：${renewedCookie || '(空)'}`);
+        assert(/;\s*Secure/i.test(renewedCookie), `续期 Cookie 缺少 Secure：${renewedCookie}`);
+
+        // 清除 Cookie 的属性要和下发时一致，否则同名 Cookie 可能留在浏览器里。
+        const logout = await proxied.app.inject({
+          method: 'POST',
+          url: '/api/auth/logout',
+          headers: { cookie: cookieHeader(token), 'x-forwarded-proto': 'https' },
+        });
+        assert(logout.statusCode === 200, `代理后退出登录失败：${logout.statusCode}`);
+        const cleared = String(logout.headers['set-cookie'] ?? '');
+        assert(/max-age=0/i.test(cleared), `清除 Cookie 缺少 Max-Age=0：${cleared}`);
+        assert(/;\s*Secure/i.test(cleared), `清除 Cookie 缺少 Secure：${cleared}`);
+
+        // 代理报告明文时不能标 Secure：那会把纯 HTTP 部署（含 127.0.0.1）
+        // 直接锁在登录页外。
+        const plainLogin = await proxied.app.inject({
+          method: 'POST',
+          url: '/api/auth/login',
+          headers: { 'x-forwarded-proto': 'http' },
+          payload: { username: 'admin', password: 'admin', remember: true },
+        });
+        assert(plainLogin.statusCode === 200, `明文代理登录失败：${plainLogin.statusCode}`);
+        const plainCookie = String(plainLogin.headers['set-cookie'] ?? '');
+        assert(!/;\s*Secure/i.test(plainCookie), `明文代理被标成 Secure：${plainCookie}`);
+        return '登录 / 续期 / 清除 Cookie 带 Secure，x-forwarded-proto: http 不带';
+      } finally {
+        restoreEnv('AUTOGIT_TRUST_PROXY', savedTrust);
+        restoreEnv('AUTOGIT_HOME', savedHome);
+        if (proxied) {
+          await proxied.app.close().catch(() => undefined);
+          proxied.ctx.dispose();
+        }
+        rmSync(proxiedHome, { recursive: true, force: true });
+      }
+    });
+
+    await expect('未开启开关时忽略 X-Forwarded-Proto（直连不可被伪造）', async () => {
+      // 默认部署下这个请求头只是客户端输入：能直连端口的人不该能决定 Cookie
+      // 属性（`Secure` 会让同一个 Cookie 在明文回环上失效；反过来把它去掉也
+      // 不该由外部输入决定）。
+      const response = await app.inject({
+        method: 'POST',
+        url: '/api/auth/login',
+        headers: { 'x-forwarded-proto': 'https' },
+        payload: { username: 'moln', password: 's3cret-pw-3', remember: true },
+      });
+      assert(response.statusCode === 200, `登录失败：${response.statusCode}`);
+      const header = String(response.headers['set-cookie'] ?? '');
+      assert(
+        !/;\s*Secure/i.test(header),
+        `默认配置就采信了转发头，Cookie 带上了 Secure：${header}`,
+      );
+      return 'Cookie 仍是 HttpOnly; SameSite=Lax（无 Secure）';
+    });
+
     process.stdout.write('\n登录失败限速（暴力破解成本）：\n');
 
     await expect('连续登录失败后限速 429，窗口过后自动恢复并清零', async () => {

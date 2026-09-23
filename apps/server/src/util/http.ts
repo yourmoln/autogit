@@ -1,3 +1,4 @@
+import type { FastifyRequest } from 'fastify';
 import type { ZodType } from 'zod';
 
 /** Prefix of every JSON endpoint; static assets and the SPA stay outside of it. */
@@ -25,6 +26,20 @@ export function decodeRequestPath(url: string): string {
 /** `true` for the API prefix itself and everything below it. */
 export function isApiPath(path: string): boolean {
   return path === API_PREFIX || path.startsWith(`${API_PREFIX}/`);
+}
+
+/**
+ * `true` when the browser reached this instance over HTTPS.
+ *
+ * Behind a TLS-terminating reverse proxy the process itself only sees `http`,
+ * so `request.protocol` answers `http` and the session cookie would lose
+ * `Secure`. With `AUTOGIT_TRUST_PROXY` on, Fastify folds `X-Forwarded-Proto`
+ * into `request.protocol` (see `app.ts`) and this helper reports `https` for
+ * proxied requests; with the option off the header stays ignored, so a client
+ * that can reach the port directly cannot pick the cookie flags.
+ */
+export function isSecureRequest(request: FastifyRequest): boolean {
+  return request.protocol === 'https';
 }
 
 export class HttpError extends Error {

@@ -35,6 +35,20 @@ export class ApiRequestError extends Error {
   }
 }
 
+/**
+ * Public auth endpoints, whose `401` is an ordinary credential error.
+ *
+ * Everything else — `PUT /api/auth/credentials` included, it sits behind the
+ * login gate — answers `401` only when the session cookie is gone, so that
+ * status has to reach the auth context.
+ */
+const PUBLIC_AUTH_ROUTES = new Set(['/api/auth/login', '/api/auth/session', '/api/auth/logout']);
+
+/** `true` for the public auth routes above (query string ignored). */
+export function isPublicAuthRoute(path: string): boolean {
+  return PUBLIC_AUTH_ROUTES.has(path.split('?')[0] ?? path);
+}
+
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const response = await fetch(path, {
     ...init,
@@ -63,9 +77,11 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
         ? String((payload as { error: unknown }).error)
         : `请求失败（HTTP ${response.status}）`;
     // The session cookie expired (or was revoked elsewhere): tell the auth
-    // context so the router can bounce back to the login page. `/api/auth/*`
-    // 401s are ordinary validation errors (wrong password) and stay local.
-    if (response.status === 401 && !path.startsWith('/api/auth/')) {
+    // context so the router can bounce back to the login page. Only the public
+    // auth endpoints answer 401 for a credential mistake (wrong password,
+    // missing session); the guarded ones (`/api/auth/credentials`) mean the
+    // session is gone and must not be swallowed by a path prefix check.
+    if (response.status === 401 && !isPublicAuthRoute(path)) {
       notifyUnauthorized();
     }
     throw new ApiRequestError(response.status, message);

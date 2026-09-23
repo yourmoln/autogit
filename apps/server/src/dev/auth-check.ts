@@ -514,6 +514,96 @@ async function main(): Promise<void> {
       return '无 CORS 响应头';
     });
 
+    await expect('跨站 Origin 的状态变更请求被拒绝（403，未登录仍 401）', async () => {
+      // Writes used to stand on the session cookie alone, and `SameSite=Lax` only
+      // keeps *cross-site* pages from attaching it: a page on the same site but
+      // another port (127.0.0.1:9999 here, the Vite dev server keeps 5173) sends
+      // the cookie along, and a request without a body is a simple request the
+      // browser performs without a preflight. So `Origin` has to be checked
+      // server-side; the session check still runs first, so an anonymous caller
+      // cannot use the status code to learn whether an origin is trusted.
+      const login = await app.inject({
+        method: 'POST',
+        url: '/api/auth/login',
+        payload: { username: 'admin', password: 'admin' },
+      });
+      const token = cookieToken(login.headers['set-cookie']);
+
+      const writes = [
+        '/api/orchestrator/tick',
+        '/api/orchestrator/restart',
+        '/api/codex/invalidate',
+      ];
+      const origins = ['https://evil.example', 'http://127.0.0.1:9999'];
+      for (const url of writes) {
+        for (const origin of origins) {
+          const response = await app.inject({
+            method: 'POST',
+            url,
+            headers: { cookie: cookieHeader(token), origin },
+          });
+          assert(response.statusCode === 403, `POST ${url}（${origin}）→ ${response.statusCode}`);
+        }
+      }
+
+      // Public writes are inside the gate as well: `POST /api/auth/login` has no
+      // session to check, and a cross-site page that could trigger it would log
+      // this browser into an account the attacker controls.
+      const publicWrite = await app.inject({
+        method: 'POST',
+        url: '/api/auth/login',
+        headers: { origin: 'https://evil.example' },
+        payload: { username: 'admin', password: 'admin' },
+      });
+      assert(
+        publicWrite.statusCode === 403,
+        `跨站 POST /api/auth/login → ${publicWrite.statusCode}`,
+      );
+
+      const anonymous = await app.inject({
+        method: 'POST',
+        url: '/api/orchestrator/tick',
+        headers: { origin: 'https://evil.example' },
+      });
+      assert(anonymous.statusCode === 401, `未登录的跨站写请求 → ${anonymous.statusCode}`);
+      return `HTTP 403 ×${writes.length * origins.length}（公开写请求 403、未登录 401）`;
+    });
+
+    await expect('同源、Vite 开发来源与无 Origin 的写请求仍然放行', async () => {
+      const login = await app.inject({
+        method: 'POST',
+        url: '/api/auth/login',
+        payload: { username: 'admin', password: 'admin' },
+      });
+      const cookie = cookieHeader(cookieToken(login.headers['set-cookie']));
+
+      // 浏览器里最普通的写法：`Origin` 与请求到达的 `Host` 一致。
+      const sameOrigin = await app.inject({
+        method: 'POST',
+        url: '/api/orchestrator/restart',
+        headers: { cookie, host: '127.0.0.1:4711', origin: 'http://127.0.0.1:4711' },
+      });
+      assert(sameOrigin.statusCode === 200, `同源写请求 → ${sameOrigin.statusCode}`);
+
+      // 开发模式：Vite 代理用 changeOrigin 把 `Host` 改写成后端地址，控制台自己
+      // 的来源必须放行，否则本地开发时每个按钮都会 403。
+      const devOrigin = await app.inject({
+        method: 'POST',
+        url: '/api/orchestrator/restart',
+        headers: { cookie, origin: 'http://localhost:5173' },
+      });
+      assert(devOrigin.statusCode === 200, `Vite 开发来源 → ${devOrigin.statusCode}`);
+
+      // 非浏览器调用方（curl、探针、脚本）不发 `Origin`，继续可用。
+      const noOrigin = await app.inject({
+        method: 'POST',
+        url: '/api/orchestrator/tick',
+        headers: { cookie },
+      });
+      assert(noOrigin.statusCode === 200, `无 Origin 的写请求 → ${noOrigin.statusCode}`);
+      return 'HTTP 200 ×3';
+    });
+
     await expect('保持登录续期时同步续期浏览器 Cookie', async () => {
       const login = await app.inject({
         method: 'POST',
@@ -1106,6 +1196,49 @@ async function main(): Promise<void> {
         );
         assert(!downgraded.upgraded, '允许列表只比对了主机，http:// 来源被放行');
         assert(downgraded.statusCode === 403, `协议降级 → ${downgraded.statusCode}`);
+
+        // 写请求用的是同一个策略对象，生产模式下开发来源与本地端口同样进不来，
+        // 允许列表与同源的写请求照常放行。
+        const devWrite = await prod.app.inject({
+          method: 'POST',
+          url: '/api/orchestrator/restart',
+          headers: { cookie, origin: 'http://localhost:5173' },
+        });
+        assert(
+          devWrite.statusCode === 403,
+          `生产模式放行开发来源的写请求 → ${devWrite.statusCode}`,
+        );
+
+        const localWrite = await prod.app.inject({
+          method: 'POST',
+          url: '/api/orchestrator/restart',
+          headers: { cookie, origin: 'http://127.0.0.1:9999' },
+        });
+        assert(
+          localWrite.statusCode === 403,
+          `生产模式放行本地端口的写请求 → ${localWrite.statusCode}`,
+        );
+
+        const listedWrite = await prod.app.inject({
+          method: 'POST',
+          url: '/api/orchestrator/restart',
+          headers: { cookie, origin: 'https://autogit.example.com' },
+        });
+        assert(listedWrite.statusCode === 200, `允许列表内的写请求 → ${listedWrite.statusCode}`);
+
+        const prodSameOriginWrite = await prod.app.inject({
+          method: 'POST',
+          url: '/api/orchestrator/restart',
+          headers: {
+            cookie,
+            host: `127.0.0.1:${prodPort}`,
+            origin: `http://127.0.0.1:${prodPort}`,
+          },
+        });
+        assert(
+          prodSameOriginWrite.statusCode === 200,
+          `生产模式同源写请求 → ${prodSameOriginWrite.statusCode}`,
+        );
       } finally {
         restoreEnv('NODE_ENV', savedNodeEnv);
         restoreEnv('AUTOGIT_HOME', savedHome);
@@ -1118,7 +1251,7 @@ async function main(): Promise<void> {
         }
         rmSync(prodHome, { recursive: true, force: true });
       }
-      return '开发来源 403、本地端口 403、同源 101、允许列表 101、允许列表协议降级 403';
+      return '开发来源 403、本地端口 403、同源 101、允许列表 101、协议降级 403、写请求同一策略（开发来源与本地端口 403、允许列表与同源 200）';
     });
 
     let rotatedToken = '';

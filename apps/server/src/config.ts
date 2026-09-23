@@ -29,15 +29,15 @@ export interface RuntimeConfig {
   defaultMaxConcurrent: number;
   defaultMaxConcurrentPerRepo: number;
   /**
-   * Extra origins the realtime upgrade accepts although they do not name the
-   * host the request arrived on (reverse proxies that rewrite `Host`, or a dev
-   * server on another machine). See `util/origin.ts`.
+   * Extra origins the realtime upgrade and the write gate accept although they
+   * do not name the host the request arrived on (reverse proxies that rewrite
+   * `Host`, or a dev server on another machine). See `util/origin.ts`.
    */
   allowedOrigins: string[];
   /**
    * Origins of the local Vite dev console (`AUTOGIT_DEV_ORIGINS`), trusted only
    * while {@link RuntimeConfig.isDev} is set. Empty in production, so a
-   * self-hosted instance accepts same-origin handshakes plus
+   * self-hosted instance accepts same-origin handshakes and writes plus
    * `AUTOGIT_ALLOWED_ORIGINS` and nothing else. See `util/origin.ts`.
    */
   devOrigins: string[];
@@ -94,11 +94,13 @@ const DEFAULT_DEV_ORIGINS = ['http://localhost:5173', 'http://127.0.0.1:5173'];
  *
  * Vite proxies `/api` with `changeOrigin: true`, so the backend sees
  * `Origin: http://localhost:5173` next to `Host: 127.0.0.1:4711` and a strict
- * same-origin comparison would lock the dev console out of its realtime
- * channel. The allowance is deliberately narrower than "any loopback origin"
- * (the previous behaviour): a page served on *any* other local port is
- * same-site for `127.0.0.1`, so the `SameSite=Lax` session cookie travels with
- * its WebSocket handshake and it could read task logs. `AUTOGIT_DEV_ORIGINS`
+ * same-origin comparison would lock the dev console out of its realtime channel
+ * and reject every write it makes. The allowance is deliberately narrower than
+ * "any loopback origin" (the previous behaviour): a page served on *any* other
+ * local port is same-site for `127.0.0.1`, so the `SameSite=Lax` session cookie
+ * travels with its requests — the WebSocket handshake that would read task logs,
+ * and the body-less `POST`s that would start a poll or a restart.
+ * `AUTOGIT_DEV_ORIGINS`
  * replaces the defaults — list the port Vite actually bound when 5173 was
  * taken. The entries are compared as complete origins, so a dev server served
  * over HTTPS belongs here as `https://localhost:5173`; `http://…` and `https://…`

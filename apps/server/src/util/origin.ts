@@ -8,11 +8,14 @@ import type { IncomingHttpHeaders } from 'node:http';
  * registers no CORS layer, so a legitimate `Origin` always names the host the
  * request arrived on. The session cookie is `HttpOnly; SameSite=Lax`, which is
  * what keeps a browser from *attaching* it to cross-site subrequests — but that
- * is a browser-side decision the server never sees. The realtime upgrade is the
- * one request where nothing else stands behind the cookie (no CORS layer, no
- * readable response, and WebSocket `SameSite` handling has varied between
- * engines), so it compares `Origin` with `Host` itself instead of trusting the
- * browser to have withheld the credential.
+ * is a browser-side decision the server never sees, and `Lax` only withholds the
+ * cookie from *cross-site* requests: a page on the same site but another port
+ * still carries it. Nothing else stands behind those requests either — no CORS
+ * layer reads them out, the realtime upgrade answers with an opaque `101`, and
+ * the body-less `POST`s that drive the API are simple requests no browser
+ * preflights — so the upgrade and every non-safe method under `/api` compare
+ * `Origin` with the host the request arrived on instead of trusting the browser
+ * to have withheld the credential. The two callers live in `routes/index.ts`.
  *
  * Two different comparisons live here, and they answer different questions:
  *

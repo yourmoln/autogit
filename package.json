@@ -17,6 +17,7 @@
     "typecheck": "pnpm -r typecheck",
     "check": "biome check .",
     "repo:check": "node scripts/check-repo-hygiene.mjs",
+    "repo:purge": "node scripts/purge-pnpm-store-history.mjs",
     "format": "biome format --write .",
     "simulate": "pnpm --filter @autogit/server simulate"
   },

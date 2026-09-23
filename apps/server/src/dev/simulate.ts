@@ -28,7 +28,7 @@ import websocket from '@fastify/websocket';
 import Fastify from 'fastify';
 
 import { ensureRuntimeDirectories, loadRuntimeConfig } from '../config.js';
-import { createContext, type AppContext } from '../context.js';
+import { type AppContext, createContext } from '../context.js';
 import { Db } from '../db/database.js';
 import { migrate } from '../db/migrations.js';
 import { Store } from '../db/store.js';

@@ -29,6 +29,7 @@ import {
   hashSessionToken,
 } from '../services/auth.js';
 import { HttpError } from '../util/http.js';
+import { isTrustedOrigin } from '../util/origin.js';
 import { nowIso } from '../util/time.js';
 
 interface Check {
@@ -985,7 +986,19 @@ async function main(): Promise<void> {
       );
       assert(!otherLocalPort.upgraded, '其它本地端口仍然可以建立实时连接');
       assert(otherLocalPort.statusCode === 403, `其它本地端口 → ${otherLocalPort.statusCode}`);
-      return 'HTTP 101 ×2、其它本地端口 403';
+
+      // 开发来源写成 `http://localhost:5173`，比较的就是完整 origin：同一主机的
+      // `https://localhost:5173` 是另一个 origin，旧实现只比 host[:port]，会把它
+      // 和真正的开发来源一起放行（README 的措辞是「只接受同源与显式列出的来源」）。
+      const schemeMismatch = await upgradeRealtime(
+        realtimePort,
+        '/api/realtime',
+        cookieHeader(revokedToken),
+        'https://localhost:5173',
+      );
+      assert(!schemeMismatch.upgraded, '开发来源只比对了主机，协议不一致也被放行');
+      assert(schemeMismatch.statusCode === 403, `协议不一致 → ${schemeMismatch.statusCode}`);
+      return 'HTTP 101 ×2、其它本地端口 403、协议不一致 403';
     });
 
     await expect('生产模式不放行回环 Origin，显式允许列表可放行', async () => {
@@ -1009,6 +1022,28 @@ async function main(): Promise<void> {
         assert(
           prodConfig.devOrigins.length === 0,
           `生产模式仍然信任开发来源：${prodConfig.devOrigins.join('、')}`,
+        );
+
+        // `AUTOGIT_ALLOWED_ORIGINS` 按完整 origin（协议 + 主机 + 端口）比对：条目里
+        // 写了协议就锁定协议，同一主机的 `http://` 来源（降级页面、恶意页）不再自动
+        // 获得信任；只写主机名的条目保留「只比主机」的旧语义，避免旧配置被锁在实时
+        // 通道外，README 与 .env.example 都建议写全协议。
+        const listedOrigin = (origin: string, allowedOrigins: string[]): boolean =>
+          isTrustedOrigin(
+            { protocol: 'http', headers: { host: '127.0.0.1:4711', origin } },
+            { allowedOrigins },
+          );
+        assert(
+          listedOrigin('https://autogit.example.com', ['https://autogit.example.com']),
+          '允许列表没有放行同一 origin',
+        );
+        assert(
+          !listedOrigin('http://autogit.example.com', ['https://autogit.example.com']),
+          '允许列表忽略了协议差异（https 条目放行了 http 来源）',
+        );
+        assert(
+          listedOrigin('http://autogit.example.com', ['autogit.example.com']),
+          '裸主机条目不再放行，旧配置会被锁在实时通道外',
         );
 
         prod = await buildServer(prodConfig);
@@ -1061,6 +1096,16 @@ async function main(): Promise<void> {
         );
         assert(allowed.upgraded, '显式允许列表未生效');
         allowed.probe.destroy();
+
+        // 允许列表条目带协议后，同一主机的另一种协议不再被放行。
+        const downgraded = await upgradeRealtime(
+          prodPort,
+          '/api/realtime',
+          cookie,
+          'http://autogit.example.com',
+        );
+        assert(!downgraded.upgraded, '允许列表只比对了主机，http:// 来源被放行');
+        assert(downgraded.statusCode === 403, `协议降级 → ${downgraded.statusCode}`);
       } finally {
         restoreEnv('NODE_ENV', savedNodeEnv);
         restoreEnv('AUTOGIT_HOME', savedHome);
@@ -1073,7 +1118,7 @@ async function main(): Promise<void> {
         }
         rmSync(prodHome, { recursive: true, force: true });
       }
-      return '开发来源 403、本地端口 403、同源 101、允许列表 101';
+      return '开发来源 403、本地端口 403、同源 101、允许列表 101、允许列表协议降级 403';
     });
 
     let rotatedToken = '';

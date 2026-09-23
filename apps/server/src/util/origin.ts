@@ -13,6 +13,20 @@ import type { IncomingHttpHeaders } from 'node:http';
  * readable response, and WebSocket `SameSite` handling has varied between
  * engines), so it compares `Origin` with `Host` itself instead of trusting the
  * browser to have withheld the credential.
+ *
+ * Two different comparisons live here, and they answer different questions:
+ *
+ * - `Origin` vs the request's own `Host`: only the host (and port) has to match.
+ *   The scheme is left out on purpose — TLS normally terminates at a reverse
+ *   proxy, where this process reports `request.protocol === 'http'` while the
+ *   browser's `Origin` says `https://`, so comparing schemes would reject the
+ *   realtime channel of every such deployment.
+ * - `Origin` vs the configured lists (`AUTOGIT_ALLOWED_ORIGINS`,
+ *   `AUTOGIT_DEV_ORIGINS`): an entry that names a scheme pins that scheme, so
+ *   listing `https://autogit.example.com` no longer accepts
+ *   `http://autogit.example.com`. A bare `host[:port]` entry keeps the old
+ *   host-only meaning; writing the scheme is the stricter spelling and what the
+ *   docs recommend.
  */
 
 /** Request shape the helpers below need; Fastify's `request` satisfies it. */
@@ -21,19 +35,24 @@ export interface OriginAwareRequest {
   headers: Pick<IncomingHttpHeaders, 'host' | 'origin' | 'upgrade'>;
 }
 
-interface Authority {
+interface Origin {
+  /** `http` / `https`, the only schemes a browser `Origin` can have here. */
+  scheme: 'http' | 'https';
   /** `host[:port]`, lower-case, default ports dropped by `URL`. */
   host: string;
 }
 
 /** Parses an `Origin` header or a bare `Host` header into comparable parts. */
-function parseAuthority(value: string, fallbackScheme: string): Authority | null {
+function parseOrigin(value: string, fallbackScheme: string): Origin | null {
   const raw = value.trim();
   if (!raw) return null;
   try {
     const url = new URL(raw.includes('://') ? raw : `${fallbackScheme}://${raw}`);
     if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
-    return { host: url.host.toLowerCase() };
+    return {
+      scheme: url.protocol === 'https:' ? 'https' : 'http',
+      host: url.host.toLowerCase(),
+    };
   } catch {
     // `Origin: null` (sandboxed documents, `file://`) and malformed values must
     // never end up equalling a host.
@@ -56,21 +75,28 @@ export interface OriginPolicy {
   devOrigins?: readonly string[];
 }
 
-/** `true` when `host` matches one of the listed origin authorities. */
-function matchesOrigin(
-  candidates: readonly string[] | undefined,
-  host: string,
-  scheme: string,
-): boolean {
+/**
+ * `true` when `origin` is one of the listed origins.
+ *
+ * Entries are compared as complete origins (scheme + `host[:port]`, both
+ * lower-cased) as soon as they name a scheme, so an operator who listed
+ * `https://autogit.example.com` does not silently accept
+ * `http://autogit.example.com` too. A bare `host[:port]` entry is parsed with
+ * the request origin's own scheme and therefore keeps matching either scheme —
+ * the behaviour every configuration written before this rule relied on.
+ */
+function matchesListedOrigin(candidates: readonly string[] | undefined, origin: Origin): boolean {
   for (const candidate of candidates ?? []) {
-    if (parseAuthority(candidate, scheme)?.host === host) return true;
+    const listed = parseOrigin(candidate, origin.scheme);
+    if (listed && listed.scheme === origin.scheme && listed.host === origin.host) return true;
   }
   return false;
 }
 
 /**
- * `true` when the request's `Origin` names the host it actually arrived on (or a
- * host the operator listed in `AUTOGIT_ALLOWED_ORIGINS`).
+ * `true` when the request's `Origin` names the host it actually arrived on, or
+ * an origin the operator listed in `AUTOGIT_ALLOWED_ORIGINS` /
+ * `AUTOGIT_DEV_ORIGINS` (an entry that names a scheme has to name the same one).
  *
  * A missing `Origin` is allowed: browsers always send it on WebSocket handshakes
  * and on every non-`GET` request, so its absence means a non-browser client
@@ -78,19 +104,19 @@ function matchesOrigin(
  * set by the browser itself and is not scriptable.
  */
 export function isTrustedOrigin(request: OriginAwareRequest, policy: OriginPolicy = {}): boolean {
-  const origin = request.headers.origin?.trim();
-  if (!origin) return true;
+  const rawOrigin = request.headers.origin?.trim();
+  if (!rawOrigin) return true;
 
   const scheme = request.protocol === 'https' ? 'https' : 'http';
-  const source = parseAuthority(origin, scheme);
+  const source = parseOrigin(rawOrigin, scheme);
   if (!source) return false;
 
   const host = request.headers.host?.trim();
-  const target = host ? parseAuthority(host, scheme) : null;
+  const target = host ? parseOrigin(host, scheme) : null;
   if (target?.host === source.host) return true;
 
-  if (matchesOrigin(policy.allowedOrigins, source.host, scheme)) return true;
-  return matchesOrigin(policy.devOrigins, source.host, scheme);
+  if (matchesListedOrigin(policy.allowedOrigins, source)) return true;
+  return matchesListedOrigin(policy.devOrigins, source);
 }
 
 /** `true` for a WebSocket upgrade (`Upgrade: websocket`). */

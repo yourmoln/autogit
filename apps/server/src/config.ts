@@ -73,7 +73,15 @@ function splitList(value: string | undefined): string[] {
     .filter((item) => item.length > 0);
 }
 
-/** `AUTOGIT_ALLOWED_ORIGINS=a.example,b.example` → `['a.example', 'b.example']`. */
+/**
+ * `AUTOGIT_ALLOWED_ORIGINS=https://a.example,https://b.example` →
+ * `['https://a.example', 'https://b.example']`.
+ *
+ * `util/origin.ts` compares the listed entries as complete origins: an entry
+ * that names a scheme only matches that scheme (`https://a.example` no longer
+ * accepts `http://a.example`), which is why the docs spell the scheme out. A
+ * bare `host[:port]` entry keeps the older host-only meaning.
+ */
 function resolveAllowedOrigins(): string[] {
   return splitList(process.env.AUTOGIT_ALLOWED_ORIGINS);
 }
@@ -92,7 +100,9 @@ const DEFAULT_DEV_ORIGINS = ['http://localhost:5173', 'http://127.0.0.1:5173'];
  * same-site for `127.0.0.1`, so the `SameSite=Lax` session cookie travels with
  * its WebSocket handshake and it could read task logs. `AUTOGIT_DEV_ORIGINS`
  * replaces the defaults — list the port Vite actually bound when 5173 was
- * taken.
+ * taken. The entries are compared as complete origins, so a dev server served
+ * over HTTPS belongs here as `https://localhost:5173`; `http://…` and `https://…`
+ * of the same host are different origins (see `util/origin.ts`).
  *
  * Development only: production ignores this variable, list extra origins in
  * `AUTOGIT_ALLOWED_ORIGINS` there.

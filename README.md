@@ -25,6 +25,7 @@
 
 | 能力 | 说明 |
 | --- | --- |
+| 登录门禁 | 访问界面与所有接口都需要登录；默认账号 `admin` / 密码 `admin`，支持「保持登录」自动登录与退出登录，登录后可在设置页改账号与密码 |
 | 多平台账号 | GitHub / Gitea（含自建实例）/ Gitee，Token 本地加密存储，可随时测试连通性 |
 | 仓库托管 | 按账号浏览仓库并导入，单独控制启用/暂停轮询 |
 | 一键初始化标签 | 在目标仓库创建/校正全部 15 个 `ai/*` 标签（颜色、描述、单选语义） |
@@ -80,6 +81,13 @@ codex login            # 首次使用或凭证失效时执行一次设备授权
 ```
 
 在网页的 **Codex CLI** 页面可以查看版本、能力探测结果与模型响应探测结果，也可以直接触发安装/更新、测试模型响应和编辑 `config.toml`。AutoGit 不读取也不代管凭证，只用一次最小的 `codex exec` 探针判断模型能否响应。
+
+首次打开 http://127.0.0.1:4711 会跳转到登录页，默认账号与密码都是 `admin`：
+
+- **保持登录**：勾选后凭证以 HttpOnly Cookie 保存在浏览器中，30 天内打开页面会自动登录（每次访问滚动续期）；不勾选则只在当前浏览器会话内有效（12 小时）。
+- **修改账号密码**：登录后在「设置 → 登录与安全」中修改，需要验证当前密码；修改后其他设备上的登录状态立即失效，本机保持登录。
+- **退出登录**：左侧边栏底部或页面右上角的「退出登录」按钮会吊销当前会话并清除凭证。
+- **忘记密码**：停掉服务后删除 `~/.autogit/data/autogit.sqlite` 中 `auth_account` 与 `auth_sessions` 两张表的数据（或参照 [docs/RESET.md](docs/RESET.md) 重置整个数据目录），下次启动会恢复默认的 `admin` / `admin`。
 
 ## 使用流程
 
@@ -175,10 +183,11 @@ stateDiagram-v2
 
 ## HTTP API
 
-所有接口都在 `/api` 下，返回 JSON；实时事件走 WebSocket `/api/realtime`。
+所有接口都在 `/api` 下，返回 JSON；实时事件走 WebSocket `/api/realtime`。除 `POST /api/auth/login`、`GET /api/auth/session`、`POST /api/auth/logout` 外，**所有接口都需要有效的登录会话 Cookie**，否则返回 `401`。
 
 | 分类 | 方法与路径 |
 | --- | --- |
+| 登录 | `POST /api/auth/login`、`GET /api/auth/session`、`POST /api/auth/logout`、`PUT /api/auth/credentials` |
 | 系统 | `GET /api/health`、`GET /api/system/overview`、`GET /api/system/activity`、`GET /api/system/labels` |
 | 调度 | `GET /api/orchestrator`、`POST /api/orchestrator/tick`、`POST /api/orchestrator/restart` |
 | 账号 | `GET/POST /api/accounts`、`PATCH/DELETE /api/accounts/:id`、`POST /api/accounts/:id/test`、`GET /api/accounts/:id/repositories` |
@@ -192,6 +201,7 @@ stateDiagram-v2
 ## 数据与安全
 
 - **数据目录**：`~/.autogit`（可用 `AUTOGIT_HOME` 覆盖），包含 `data/autogit.sqlite`、`workspaces/`、`secret.key`、`logs/`。
+- **登录凭证**：账号只有一份，密码以 scrypt 哈希存放在 `auth_account` 表，明文不落库；登录会话的随机 token 只保存 SHA-256 摘要（`auth_sessions`），浏览器侧是 HttpOnly + SameSite=Lax 的 Cookie，脚本读不到。首次启动自动创建默认账号 `admin` / `admin`，接口只返回用户名与「是否仍为默认密码」的提示，不返回任何哈希。
 - **Token 加密**：使用 AES-256-GCM 加密后落库，密钥来自 `AUTOGIT_SECRET_KEY` 或自动生成的 `secret.key`；接口返回的只是掩码预览。
 - **Git 认证**：推送/拉取通过 `GIT_CONFIG_*` 环境变量注入 `http.extraheader`，Token 不会写进 `.git/config`，也不会出现在命令行参数里。
 - **代理地址**：HTTP(S) 与 SOCKS5 两个通道和账号级代理同样加密落库，接口只返回掩码；仅在配置了代理时注入 `http.proxy` 与代理环境变量，并清空凭据助手避免 Git Credential Manager 探测代理主机。
@@ -217,11 +227,14 @@ pnpm typecheck    # 三个包全量类型检查
 pnpm check        # Biome lint + 格式校验
 pnpm build        # shared → server → web
 pnpm simulate     # 端到端模拟：真实 git + 假 Codex + 假 Git 平台
+pnpm --filter @autogit/server auth:check            # 登录门禁自检（临时数据目录，真实 HTTP 路由）
 pnpm --filter @autogit/server proxy:check          # 代理链路自检（本地起 HTTP/SOCKS5 代理）
 pnpm --filter @autogit/server proxy:check -- --online  # 额外验证真实 HTTPS 隧道
 ```
 
 `pnpm simulate` 会在临时目录中创建裸仓库，跑完整链路（初始化 15 个标签 → 实现 → 建 PR → 评审不通过 → 修复 → 复审通过 → 合并 → `ai/verify`），并断言每一步的标签与产物，最后自动清理。
+
+`auth:check` 会在临时 `AUTOGIT_HOME` 中启动真实 HTTP 栈并断言 15 项行为：未登录访问接口与实时通道返回 401、默认账号可登录、勾选/不勾选「保持登录」的 Cookie 差异、过期会话被清理、修改账号密码的校验与会话轮换、旧密码失效、其他设备会话被吊销、退出登录清除凭据，最后自动清理。
 
 `proxy:check` 会启动一次性本地代理并断言 11 项行为（绝对形式转发、CONNECT 隧道、SOCKS5 用户名密码、认证失败提示、远程 DNS、重定向、gzip、错误码映射等），`--online` 会再追加两项真实 `https://api.github.com/` 隧道检查。
 
@@ -229,6 +242,9 @@ pnpm --filter @autogit/server proxy:check -- --online  # 额外验证真实 HTTP
 
 **轮询没有反应？**
 确认仓库「轮询已启用」、Issue 是 open 状态且带有 `ai/todo`，并且没有 `ai/paused` / `ai/stuck`。可在总览页点「立即轮询」手动触发一次，任务页会显示日志。
+
+**忘记登录密码了？**
+登录凭证存放在 `~/.autogit/data/autogit.sqlite` 的 `auth_account` 表中，删除该表（以及 `auth_sessions`）的数据后重启服务即恢复默认的 `admin` / `admin`；也可以在临时目录里用 `sqlite3` 或 Node 的 `node:sqlite` 执行 `DELETE FROM auth_account; DELETE FROM auth_sessions;`。这一步只影响登录账号，不会清空仓库、任务与代理配置。
 
 **任务失败并打上 `ai/stuck`？**
 任务日志（任务页 → 选中任务）会显示 Codex 的输出与错误。常见原因是模型响应探测未通过（凭证失效、模型权限不足）、Issue 描述信息不够。可先在 Codex CLI 页面点「测试模型响应」确认模型能回答，再移除 `ai/stuck`，打回 `ai/todo` 或 `ai/needs-review` 继续。

@@ -8,6 +8,7 @@
     "dev": "tsx watch --clear-screen=false src/index.ts",
     "simulate": "tsx src/dev/simulate.ts",
     "proxy:check": "tsx src/dev/proxy-check.ts",
+    "auth:check": "tsx src/dev/auth-check.ts",
     "build": "tsup",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit -p tsconfig.json"

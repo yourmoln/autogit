@@ -28,6 +28,33 @@ export interface RepositoryRecord extends Repository {}
 
 export interface TaskRecord extends Task {}
 
+export interface AuthAccountRecord {
+  username: string;
+  /** `scrypt:...` payload produced by the auth service. */
+  passwordHash: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AuthSessionRecord {
+  /** SHA-256 of the bearer token; the token itself is never stored. */
+  tokenHash: string;
+  username: string;
+  persistent: boolean;
+  createdAt: string;
+  lastSeenAt: string;
+  expiresAt: string;
+}
+
+interface AuthSessionDbRow {
+  token_hash: string;
+  username: string;
+  persistent: number;
+  created_at: string;
+  last_seen_at: string;
+  expires_at: string;
+}
+
 export interface TaskCreateInput {
   id: string;
   repositoryId: string;
@@ -882,6 +909,100 @@ export class Store {
     });
   }
 
+  // ------------------------------------------------------------------- auth
+
+  getAuthAccount(): AuthAccountRecord | null {
+    const row = this.db.get<{
+      username: string;
+      password_hash: string;
+      created_at: string;
+      updated_at: string;
+    }>(
+      "SELECT username, password_hash, created_at, updated_at FROM auth_account WHERE id = 'default'",
+    );
+    return row
+      ? {
+          username: row.username,
+          passwordHash: row.password_hash,
+          createdAt: row.created_at,
+          updatedAt: row.updated_at,
+        }
+      : null;
+  }
+
+  upsertAuthAccount(input: { username: string; passwordHash: string }): AuthAccountRecord {
+    const ts = nowIso();
+    this.db.run(
+      `INSERT INTO auth_account (id, username, password_hash, created_at, updated_at)
+       VALUES ('default', ?, ?, ?, ?)
+       ON CONFLICT (id) DO UPDATE SET
+         username = excluded.username,
+         password_hash = excluded.password_hash,
+         updated_at = excluded.updated_at`,
+      [input.username, input.passwordHash, ts, ts],
+    );
+    const record = this.getAuthAccount();
+    if (!record) throw new Error('Auth account insert failed');
+    return record;
+  }
+
+  createAuthSession(input: {
+    tokenHash: string;
+    username: string;
+    persistent: boolean;
+    createdAt: string;
+    expiresAt: string;
+  }): void {
+    this.db.run(
+      `INSERT INTO auth_sessions (token_hash, username, persistent, created_at, last_seen_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [
+        input.tokenHash,
+        input.username,
+        bool(input.persistent),
+        input.createdAt,
+        input.createdAt,
+        input.expiresAt,
+      ],
+    );
+  }
+
+  getAuthSession(tokenHash: string): AuthSessionRecord | null {
+    const row = this.db.get<AuthSessionDbRow>('SELECT * FROM auth_sessions WHERE token_hash = ?', [
+      tokenHash,
+    ]);
+    return row ? mapAuthSession(row) : null;
+  }
+
+  countAuthSessions(now: string): number {
+    const row = this.db.get<{ count: number }>(
+      'SELECT COUNT(*) AS count FROM auth_sessions WHERE expires_at > ?',
+      [now],
+    );
+    return Number(row?.count ?? 0);
+  }
+
+  touchAuthSession(tokenHash: string, lastSeenAt: string, expiresAt: string): void {
+    this.db.run('UPDATE auth_sessions SET last_seen_at = ?, expires_at = ? WHERE token_hash = ?', [
+      lastSeenAt,
+      expiresAt,
+      tokenHash,
+    ]);
+  }
+
+  deleteAuthSession(tokenHash: string): void {
+    this.db.run('DELETE FROM auth_sessions WHERE token_hash = ?', [tokenHash]);
+  }
+
+  /** Used after a credential change: every browser has to log in again. */
+  deleteAuthSessions(): void {
+    this.db.run('DELETE FROM auth_sessions');
+  }
+
+  deleteExpiredAuthSessions(now: string): number {
+    return this.db.run('DELETE FROM auth_sessions WHERE expires_at <= ?', [now]).changes;
+  }
+
   // ------------------------------------------------------------------ stats
 
   countTasksByStatus(): Record<string, number> {
@@ -968,6 +1089,17 @@ function normalizeProxyMode(value: string | null | undefined): ProxyMode {
   // and HTTPS channels; both now mean "use the merged HTTP(S) proxy".
   if (value === 'auto' || value === 'https') return 'http';
   return PROXY_MODES.includes(value as ProxyMode) ? (value as ProxyMode) : 'inherit';
+}
+
+function mapAuthSession(row: AuthSessionDbRow): AuthSessionRecord {
+  return {
+    tokenHash: row.token_hash,
+    username: row.username,
+    persistent: fromBool(row.persistent),
+    createdAt: row.created_at,
+    lastSeenAt: row.last_seen_at,
+    expiresAt: row.expires_at,
+  };
 }
 
 function mapRepository(row: RepositoryDbRow): RepositoryRecord {

@@ -2,6 +2,7 @@ import type {
   Account,
   ActivityEntry,
   AppSettings,
+  AuthSessionPayload,
   CodexConfigPayload,
   CodexInstallState,
   CodexModelProbe,
@@ -21,6 +22,8 @@ import type {
   TaskLogLine,
   TaskStatus,
 } from '@autogit/shared';
+
+import { notifyUnauthorized } from './session-events.js';
 
 export class ApiRequestError extends Error {
   constructor(
@@ -59,6 +62,12 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
       payload && typeof payload === 'object' && 'error' in payload
         ? String((payload as { error: unknown }).error)
         : `请求失败（HTTP ${response.status}）`;
+    // The session cookie expired (or was revoked elsewhere): tell the auth
+    // context so the router can bounce back to the login page. `/api/auth/*`
+    // 401s are ordinary validation errors (wrong password) and stay local.
+    if (response.status === 401 && !path.startsWith('/api/auth/')) {
+      notifyUnauthorized();
+    }
     throw new ApiRequestError(response.status, message);
   }
   return payload as T;
@@ -99,6 +108,26 @@ export interface AccountListPayload {
 
 export const api = {
   health: () => request<{ ok: boolean; version: string; node: string }>('/api/health'),
+
+  auth: {
+    session: () => request<AuthSessionPayload>('/api/auth/session'),
+    login: (body: { username: string; password: string; remember: boolean }) =>
+      request<AuthSessionPayload>('/api/auth/login', {
+        method: 'POST',
+        body: JSON.stringify(body),
+      }),
+    logout: () => request<{ ok: boolean }>('/api/auth/logout', { method: 'POST' }),
+    updateCredentials: (body: {
+      currentPassword: string;
+      username?: string | null;
+      /** 留空表示不修改密码。 */
+      password?: string | null;
+    }) =>
+      request<AuthSessionPayload>('/api/auth/credentials', {
+        method: 'PUT',
+        body: JSON.stringify(body),
+      }),
+  },
 
   overview: () => request<OverviewPayload>('/api/system/overview'),
   activity: (limit = 80) =>

@@ -10,6 +10,7 @@ class RealtimeClient {
   private state: ConnectionState = 'connecting';
   private retry = 0;
   private reconnectTimer: number | null = null;
+  private socket: WebSocket | null = null;
   private started = false;
 
   start(): void {
@@ -18,7 +19,21 @@ class RealtimeClient {
     this.connect();
   }
 
+  /** Closes the socket for good; used on logout and when a session expires. */
+  stop(): void {
+    this.started = false;
+    if (this.reconnectTimer !== null) {
+      window.clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.retry = 0;
+    this.socket?.close();
+    this.socket = null;
+    this.setState('offline');
+  }
+
   private connect(): void {
+    if (!this.started) return;
     const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
     const url = `${protocol}://${window.location.host}/api/realtime`;
     this.setState('connecting');
@@ -30,6 +45,7 @@ class RealtimeClient {
       this.scheduleReconnect();
       return;
     }
+    this.socket = socket;
     socket.onopen = () => {
       this.retry = 0;
       this.setState('online');
@@ -52,6 +68,7 @@ class RealtimeClient {
   }
 
   private scheduleReconnect(): void {
+    if (!this.started) return;
     if (this.reconnectTimer !== null) return;
     const delay = Math.min(1000 * 2 ** this.retry, 15_000);
     this.retry += 1;

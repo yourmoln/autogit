@@ -5,6 +5,7 @@ import { BrowserRouter } from 'react-router-dom';
 import { Toaster } from 'sonner';
 
 import { App } from './App.js';
+import { AuthProvider } from './lib/auth.js';
 import './styles.css';
 
 const queryClient = new QueryClient({
@@ -24,18 +25,20 @@ createRoot(container).render(
   <StrictMode>
     <QueryClientProvider client={queryClient}>
       <BrowserRouter>
-        <App />
-        <Toaster
-          theme="dark"
-          position="bottom-right"
-          toastOptions={{
-            style: {
-              background: 'rgba(15,18,26,0.96)',
-              border: '1px solid rgba(255,255,255,0.1)',
-              color: 'rgb(226 232 240)',
-            },
-          }}
-        />
+        <AuthProvider>
+          <App />
+          <Toaster
+            theme="dark"
+            position="bottom-right"
+            toastOptions={{
+              style: {
+                background: 'rgba(15,18,26,0.96)',
+                border: '1px solid rgba(255,255,255,0.1)',
+                color: 'rgb(226 232 240)',
+              },
+            }}
+          />
+        </AuthProvider>
       </BrowserRouter>
     </QueryClientProvider>
   </StrictMode>,

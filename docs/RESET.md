@@ -9,7 +9,7 @@ AutoGit 的全部状态都在一个目录里，**默认 `~/.autogit`**（可用 
 ```text
 ~/.autogit/                     # AUTOGIT_HOME 可覆盖
 ├── data/
-│   ├── autogit.sqlite          # 账号、Token 密文、仓库配置、Issue/PR 缓存、任务与日志、设置
+│   ├── autogit.sqlite          # 账号、Token 密文、仓库配置、Issue/PR 缓存、任务与日志、设置、登录账号与会话
 │   ├── autogit.sqlite-wal      # WAL 伴生文件，删除时一并处理
 │   └── autogit.sqlite-shm
 ├── workspaces/
@@ -20,7 +20,7 @@ AutoGit 的全部状态都在一个目录里，**默认 `~/.autogit`**（可用 
 
 | 路径 | 存了什么 | 删掉的后果 |
 | --- | --- | --- |
-| `data/autogit.sqlite` | 账号、Token 密文、仓库配置、Issue/PR 缓存、任务与逐行日志、全局设置 | 回到初始状态，需要重新添加账号和仓库 |
+| `data/autogit.sqlite` | 账号、Token 密文、仓库配置、Issue/PR 缓存、任务与逐行日志、全局设置、登录账号与会话 | 回到初始状态，需要重新添加账号和仓库；登录凭证恢复为默认 `admin` / `admin` |
 | `workspaces/<repoId>/` | 该仓库的克隆、`ai/*` 分支、提示词与 JSON Schema 等任务产物 | 下次任务重新克隆；**未推送的本地改动一并丢失** |
 | `secret.key` | 加解密 Token 的主密钥 | 库里已存的 Token 全部解不开（见下文） |
 | `logs/` | 服务日志 | 无影响，只丢历史日志 |
@@ -81,6 +81,7 @@ pnpm dev          # 或 pnpm build && pnpm start
 | 彻底重来（连密钥一起换） | 删整个 `~/.autogit` |
 | 强制作废旧 Token 密文 | 删 `secret.key`，再重新录入所有账号 Token |
 | 重置全局设置（轮询间隔、并发数） | 在「设置」页改回默认，或删库 |
+| 忘记登录密码 / 重置登录账号 | 在「设置 → 登录与安全」里改；已经进不去就删 `data/autogit.sqlite*`（会一并清空业务数据），或用 sqlite 客户端执行 `DELETE FROM auth_account; DELETE FROM auth_sessions;` 后重启服务，登录凭证恢复为 `admin` / `admin` |
 | 只清某个仓库的本地工作区 | 仓库页「移除仓库」勾选 purge，或单独删 `workspaces/<repoId>` |
 | 迁移到另一台机器 | 复制整个 `~/.autogit`（**含 `secret.key`**）；路径不同就用 `AUTOGIT_HOME` 指过去 |
 | 改端口 / 绑定地址 / 轮询 | 改 `.env` 或环境变量，**不需要删任何数据** |

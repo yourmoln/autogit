@@ -6,6 +6,7 @@ import {
   GitBranch,
   LayoutDashboard,
   ListChecks,
+  LogOut,
   Network,
   Plug,
   RefreshCw,
@@ -13,15 +14,17 @@ import {
   Tags,
   Terminal,
   TriangleAlert,
+  UserRound,
   Wifi,
   WifiOff,
 } from 'lucide-react';
 import { motion } from 'motion/react';
-import type { ReactNode } from 'react';
+import { type ReactNode, useState } from 'react';
 import { NavLink, Outlet, useLocation } from 'react-router-dom';
 import { toast } from 'sonner';
 import { useRealtimeBridge, useRealtimeConnection } from '../hooks/useRealtime.js';
 import { api, errorMessage } from '../lib/api.js';
+import { useAuth } from '../lib/auth.js';
 import { cn, formatRelative } from '../lib/utils.js';
 import { Spinner } from './primitives.js';
 
@@ -33,7 +36,7 @@ const NAV_ITEMS = [
   { to: '/codex', label: 'Codex CLI', icon: Terminal, hint: '安装、版本与配置' },
   { to: '/proxy', label: '代理配置', icon: Network, hint: 'HTTP(S) / SOCKS5 代理与连通性' },
   { to: '/labels', label: '标签规范', icon: Tags, hint: 'ai/* 标签语义与流转' },
-  { to: '/settings', label: '设置', icon: SettingsIcon, hint: '轮询、并发与提示词' },
+  { to: '/settings', label: '设置', icon: SettingsIcon, hint: '登录账号、轮询与并发' },
 ] as const;
 
 const PAGE_TITLES: Record<string, { title: string; subtitle: string }> = {
@@ -53,7 +56,7 @@ const PAGE_TITLES: Record<string, { title: string; subtitle: string }> = {
     subtitle: '为 git 与平台接口配置 HTTP(S) / SOCKS5 代理，并测试 GitHub 连通性',
   },
   '/labels': { title: '标签规范', subtitle: '15 个 ai/* 标签的语义、单选分组与流转规则' },
-  '/settings': { title: '设置', subtitle: '调度节奏、并发、沙箱与提交身份' },
+  '/settings': { title: '设置', subtitle: '登录账号、调度节奏、并发、沙箱与提交身份' },
 };
 
 export function AppShell(): ReactNode {
@@ -61,6 +64,8 @@ export function AppShell(): ReactNode {
   const connection = useRealtimeConnection();
   const location = useLocation();
   const queryClient = useQueryClient();
+  const { session, credentials, logout } = useAuth();
+  const [loggingOut, setLoggingOut] = useState(false);
 
   const overview = useQuery({
     queryKey: ['overview'],
@@ -90,6 +95,18 @@ export function AppShell(): ReactNode {
       toast.success('已完成一次手动轮询');
     } catch (error) {
       toast.error(errorMessage(error));
+    }
+  };
+
+  const signOut = async (): Promise<void> => {
+    setLoggingOut(true);
+    try {
+      await logout();
+      toast.success('已退出登录');
+    } catch (error) {
+      toast.error(errorMessage(error));
+    } finally {
+      setLoggingOut(false);
     }
   };
 
@@ -141,6 +158,28 @@ export function AppShell(): ReactNode {
         </nav>
 
         <div className="space-y-3 border-t border-white/6 px-3 py-4">
+          <div className="flex items-center justify-between gap-2 rounded-xl border border-white/8 bg-white/[0.025] px-3 py-2.5">
+            <span className="flex min-w-0 items-center gap-2 text-[11.5px] text-slate-300">
+              <UserRound className="h-3.5 w-3.5 shrink-0 text-indigo-300" />
+              <span className="min-w-0">
+                <span className="block truncate font-medium">{credentials?.username ?? '—'}</span>
+                <span className="block text-[10.5px] text-slate-500">
+                  {session?.persistent ? '保持登录' : '本次会话'}
+                </span>
+              </span>
+            </span>
+            <button
+              type="button"
+              className="btn btn-ghost px-2 py-1 text-[11px]"
+              onClick={signOut}
+              disabled={loggingOut}
+              title="退出登录"
+            >
+              <LogOut className="h-3.5 w-3.5" />
+              退出
+            </button>
+          </div>
+
           <div className="rounded-xl border border-white/8 bg-white/[0.025] px-3 py-2.5">
             <div className="flex items-center justify-between">
               <span className="flex items-center gap-1.5 text-[11px] font-medium text-slate-300">
@@ -211,6 +250,29 @@ export function AppShell(): ReactNode {
                   轮询异常
                 </span>
               )}
+              {credentials?.defaultCredentials && (
+                <NavLink
+                  to="/settings"
+                  className="chip border-amber-400/30 bg-amber-400/10 text-amber-200"
+                  title="仍在使用默认账号，点此前往设置修改"
+                >
+                  <TriangleAlert className="h-3 w-3" />
+                  默认账号 {credentials.username}
+                </NavLink>
+              )}
+              <span className="chip border-white/10 text-slate-300" title="当前登录账号">
+                <UserRound className="h-3 w-3" />
+                {credentials?.username ?? session?.username ?? '已登录'}
+              </span>
+              <button
+                type="button"
+                className="btn px-2.5 py-1.5 text-[11.5px]"
+                onClick={signOut}
+                disabled={loggingOut}
+              >
+                <LogOut className="h-3.5 w-3.5" />
+                退出登录
+              </button>
             </div>
           </div>
         </header>

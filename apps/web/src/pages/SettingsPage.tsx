@@ -1,6 +1,12 @@
-import type { AppSettings } from '@autogit/shared';
+import {
+  AUTH_MAX_PASSWORD_LENGTH,
+  AUTH_MAX_USERNAME_LENGTH,
+  AUTH_MIN_PASSWORD_LENGTH,
+  AUTH_MIN_USERNAME_LENGTH,
+  type AppSettings,
+} from '@autogit/shared';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { RefreshCw, Save, Server } from 'lucide-react';
+import { KeyRound, LogOut, RefreshCw, Save, Server, ShieldAlert, ShieldCheck } from 'lucide-react';
 import { type ReactNode, useEffect, useState } from 'react';
 import { toast } from 'sonner';
 import {
@@ -12,6 +18,8 @@ import {
   Toggle,
 } from '../components/primitives.js';
 import { api, errorMessage } from '../lib/api.js';
+import { useAuth } from '../lib/auth.js';
+import { formatDateTime } from '../lib/utils.js';
 
 export function SettingsPage(): ReactNode {
   const queryClient = useQueryClient();
@@ -63,6 +71,8 @@ export function SettingsPage(): ReactNode {
 
   return (
     <div className="space-y-4">
+      <AccountSecurityCard />
+
       <SectionCard
         title="调度设置"
         description="轮询节奏与并发上限：全局并发决定同时运行的任务总数，单仓库并发决定同一个仓库能同时跑几个任务（每个任务有独立工作区）。修改后点击保存，必要时重启调度器立即生效。"
@@ -326,5 +336,190 @@ export function SettingsPage(): ReactNode {
         </div>
       </SectionCard>
     </div>
+  );
+}
+
+/**
+ * 登录账号管理。
+ *
+ * AutoGit 是单用户工具，账号只有一份：这里改掉的用户名/密码就是下次登录要
+ * 用的凭据。修改需要验证当前密码，保存后其他设备上的登录状态会立即失效。
+ */
+function AccountSecurityCard(): ReactNode {
+  const { credentials, session, updateCredentials, logout } = useAuth();
+
+  const [username, setUsername] = useState('');
+  const [usernameEdited, setUsernameEdited] = useState(false);
+  const [currentPassword, setCurrentPassword] = useState('');
+  const [nextPassword, setNextPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+
+  useEffect(() => {
+    // 服务端账号变化时回填，但不覆盖用户正在输入的内容。
+    if (credentials && !usernameEdited) setUsername(credentials.username);
+  }, [credentials, usernameEdited]);
+
+  const trimmedUsername = username.trim();
+  const usernameTooShort = trimmedUsername.length < AUTH_MIN_USERNAME_LENGTH;
+  const passwordTooShort =
+    nextPassword.length > 0 &&
+    (nextPassword.length < AUTH_MIN_PASSWORD_LENGTH ||
+      nextPassword.length > AUTH_MAX_PASSWORD_LENGTH);
+  const mismatch = nextPassword.length > 0 && nextPassword !== confirmPassword;
+  const dirty =
+    (credentials !== null && trimmedUsername !== credentials.username) || nextPassword.length > 0;
+  const canSubmit =
+    dirty &&
+    currentPassword.length > 0 &&
+    !usernameTooShort &&
+    !passwordTooShort &&
+    !mismatch &&
+    trimmedUsername.length <= AUTH_MAX_USERNAME_LENGTH;
+
+  const save = useMutation({
+    mutationFn: () =>
+      updateCredentials({
+        currentPassword,
+        username: trimmedUsername,
+        password: nextPassword.length > 0 ? nextPassword : null,
+      }),
+    onSuccess: (updated) => {
+      toast.success(`登录账号已更新：${updated.username}`);
+      setUsername(updated.username);
+      setUsernameEdited(false);
+      setCurrentPassword('');
+      setNextPassword('');
+      setConfirmPassword('');
+    },
+    onError: (error) => toast.error(errorMessage(error)),
+  });
+
+  const signOut = useMutation({
+    mutationFn: logout,
+    onError: (error) => toast.error(errorMessage(error)),
+  });
+
+  return (
+    <SectionCard
+      title="登录与安全"
+      description="访问 AutoGit 的所有页面与接口都需要登录；首次使用的默认账号是 admin / admin，请在这里改成自己的账号与密码。"
+      actions={
+        <>
+          <button
+            type="button"
+            className="btn text-[11.5px]"
+            onClick={() => signOut.mutate()}
+            disabled={signOut.isPending}
+          >
+            <LogOut className="h-3.5 w-3.5" />
+            退出登录
+          </button>
+          <button
+            type="button"
+            className="btn btn-primary text-[11.5px]"
+            onClick={() => save.mutate()}
+            disabled={!canSubmit || save.isPending}
+          >
+            {save.isPending ? (
+              <Spinner className="h-3.5 w-3.5" />
+            ) : (
+              <Save className="h-3.5 w-3.5" />
+            )}
+            保存账号与密码
+          </button>
+        </>
+      }
+      bodyClassName="space-y-4"
+    >
+      {credentials?.defaultCredentials && (
+        <div className="flex items-start gap-2.5 rounded-xl border border-amber-400/25 bg-amber-400/8 px-3.5 py-3 text-[11.5px] leading-relaxed text-amber-100">
+          <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0 text-amber-300" />
+          <span>
+            当前仍在使用默认账号 admin /
+            admin。凡是能访问该端口的人都能登录，请立即修改用户名与密码。
+          </span>
+        </div>
+      )}
+
+      <div className="grid gap-4 md:grid-cols-2">
+        <Field
+          label="用户名"
+          hint={`${AUTH_MIN_USERNAME_LENGTH} - ${AUTH_MAX_USERNAME_LENGTH} 个字符`}
+          error={usernameTooShort ? '用户名太短' : undefined}
+        >
+          <input
+            className="input"
+            value={username}
+            autoComplete="username"
+            onChange={(event) => {
+              setUsername(event.target.value);
+              setUsernameEdited(true);
+            }}
+          />
+        </Field>
+        <Field label="当前密码" hint="修改任意一项都需要验证">
+          <input
+            className="input"
+            type="password"
+            value={currentPassword}
+            autoComplete="current-password"
+            placeholder="请输入当前登录密码"
+            onChange={(event) => setCurrentPassword(event.target.value)}
+          />
+        </Field>
+        <Field
+          label="新密码"
+          hint={`留空表示不修改 · ${AUTH_MIN_PASSWORD_LENGTH} - ${AUTH_MAX_PASSWORD_LENGTH} 个字符`}
+          error={passwordTooShort ? '新密码长度不符合要求' : undefined}
+        >
+          <input
+            className="input"
+            type="password"
+            value={nextPassword}
+            autoComplete="new-password"
+            placeholder="留空则只修改用户名"
+            onChange={(event) => setNextPassword(event.target.value)}
+          />
+        </Field>
+        <Field label="确认新密码" error={mismatch ? '两次输入的新密码不一致' : undefined}>
+          <input
+            className="input"
+            type="password"
+            value={confirmPassword}
+            autoComplete="new-password"
+            onChange={(event) => setConfirmPassword(event.target.value)}
+          />
+        </Field>
+      </div>
+
+      <div className="rounded-2xl border border-white/8 bg-white/[0.02] px-4 py-3 text-[11.5px] leading-relaxed text-slate-400">
+        <p className="flex items-center gap-2 text-[12px] font-medium text-slate-200">
+          <KeyRound className="h-3.5 w-3.5 text-indigo-300" />
+          会话信息
+        </p>
+        <div className="mt-1.5">
+          <InfoRow label="当前账号" value={credentials?.username ?? '—'} />
+          <InfoRow
+            label="登录方式"
+            value={
+              session?.persistent ? (
+                <span className="flex items-center justify-end gap-1.5 text-emerald-300">
+                  <ShieldCheck className="h-3.5 w-3.5" />
+                  保持登录（30 天滚动续期）
+                </span>
+              ) : (
+                '本次登录（关闭浏览器后失效）'
+              )
+            }
+          />
+          <InfoRow label="会话到期" value={formatDateTime(session?.expiresAt)} />
+          <InfoRow label="有效会话" value={`${credentials?.activeSessions ?? 0} 个`} />
+          <InfoRow label="账号最近修改" value={formatDateTime(credentials?.updatedAt)} />
+        </div>
+        <p className="mt-2 text-[11px] text-slate-500">
+          密码以 scrypt 哈希保存，会话 token 只保存 SHA-256 摘要；修改凭据后其他设备需要重新登录。
+        </p>
+      </div>
+    </SectionCard>
   );
 }

@@ -26,6 +26,13 @@ const REMEMBER_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 /** Only write a renewal back to SQLite when it is this old. */
 const TOUCH_INTERVAL_MS = 5 * 60 * 1000;
 
+/** Consecutive failed logins tolerated before the endpoint starts to slow down. */
+export const AUTH_LOGIN_FAILURE_LIMIT = 5;
+/** Length of the first penalty window; every further failure doubles it. */
+export const AUTH_LOGIN_BACKOFF_MS = 1_000;
+/** Longest penalty window, so a forgotten password only costs a short pause. */
+export const AUTH_LOGIN_MAX_BACKOFF_MS = 30_000;
+
 const SCRYPT_COST = 16384;
 const SCRYPT_BLOCK_SIZE = 8;
 const SCRYPT_PARALLELIZATION = 1;
@@ -100,6 +107,22 @@ export function verifyPasswordHash(password: string, stored: string): boolean {
   return derived.length === expected.length && timingSafeEqual(derived, expected);
 }
 
+/**
+ * Hash `login()` verifies against when the submitted username does not match.
+ *
+ * Every login attempt has to cost exactly one scrypt: bailing out early on an
+ * unknown username would make "wrong username" measurably faster than "wrong
+ * password" (~0ms vs ~25ms) and turn the endpoint into a username oracle. The
+ * value is irrelevant — nothing can match it — it only has to be a well formed
+ * payload with the same parameters, so it is built once, lazily.
+ */
+let decoyPasswordHash: string | null = null;
+
+function decoyHash(): string {
+  decoyPasswordHash ??= hashPassword(randomBytes(32).toString('base64url'));
+  return decoyPasswordHash;
+}
+
 function sessionTtlMs(persistent: boolean): number {
   return persistent ? REMEMBER_TTL_MS : SESSION_TTL_MS;
 }
@@ -165,8 +188,16 @@ export type RevokedSessions = readonly string[] | null;
  */
 export class AuthService {
   private readonly revocationListeners = new Set<(revoked: RevokedSessions) => void>();
+  /** Failed logins since the last success; drives the login backoff below. */
+  private loginFailures = 0;
+  /** Wall clock until which `login()` answers 429 instead of verifying. */
+  private loginBlockedUntil = 0;
 
-  constructor(private readonly store: Store) {}
+  constructor(private readonly store: Store) {
+    // Warm the decoy hash up front: built lazily, the very first unknown-username
+    // attempt would pay two scrypts and stand out from a wrong password.
+    decoyHash();
+  }
 
   /** Creates the factory `admin` / `admin` credentials on first start. */
   bootstrap(): void {
@@ -188,15 +219,26 @@ export class AuthService {
   }
 
   login(input: { username: string; password: string; remember: boolean }): AuthLoginResult {
+    const now = Date.now();
+    const blockedForMs = this.loginBlockedUntil - now;
+    if (blockedForMs > 0) {
+      throw new HttpError(429, `登录失败次数过多，请 ${Math.ceil(blockedForMs / 1000)} 秒后重试`);
+    }
+
     const account = this.store.getAuthAccount();
     const username = input.username.trim();
-    const valid =
-      account !== null &&
-      sameUsername(account.username, username) &&
-      verifyPasswordHash(input.password, account.passwordHash);
-    if (!account || !valid) {
+    const usernameMatches = account !== null && sameUsername(account.username, username);
+    // One scrypt either way: the decoy hash keeps an unknown username from being
+    // distinguishable from a wrong password by response time.
+    const passwordMatches = verifyPasswordHash(
+      input.password,
+      account !== null && usernameMatches ? account.passwordHash : decoyHash(),
+    );
+    if (!account || !usernameMatches || !passwordMatches) {
+      this.noteLoginFailure(now);
       throw new HttpError(401, '用户名或密码不正确');
     }
+    this.clearLoginFailures();
 
     this.pruneExpiredSessions();
 
@@ -301,8 +343,7 @@ export class AuthService {
       // stored hash whether it still verifies the factory password would mean a
       // blocking scrypt on each page load, so `password_changed_at` records it.
       defaultCredentials:
-        sameUsername(account.username, DEFAULT_AUTH_USERNAME) &&
-        account.passwordChangedAt === null,
+        sameUsername(account.username, DEFAULT_AUTH_USERNAME) && account.passwordChangedAt === null,
       activeSessions: this.store.countAuthSessions(nowIso()),
     };
   }
@@ -375,6 +416,28 @@ export class AuthService {
 
   private pruneExpiredSessions(): void {
     this.store.deleteExpiredAuthSessions(nowIso());
+  }
+
+  /**
+   * Slows down guessing. The first {@link AUTH_LOGIN_FAILURE_LIMIT} failures are
+   * free, then every further one pushes a penalty window that doubles up to
+   * {@link AUTH_LOGIN_MAX_BACKOFF_MS}. The window simply expires — a wrong
+   * password never locks the only account out permanently — and a successful
+   * login resets the counter.
+   */
+  private noteLoginFailure(now: number): void {
+    this.loginFailures += 1;
+    if (this.loginFailures < AUTH_LOGIN_FAILURE_LIMIT) return;
+    const penaltyMs = Math.min(
+      AUTH_LOGIN_BACKOFF_MS * 2 ** (this.loginFailures - AUTH_LOGIN_FAILURE_LIMIT),
+      AUTH_LOGIN_MAX_BACKOFF_MS,
+    );
+    this.loginBlockedUntil = now + penaltyMs;
+  }
+
+  private clearLoginFailures(): void {
+    this.loginFailures = 0;
+    this.loginBlockedUntil = 0;
   }
 
   /** Deletes a session and tells live streams that it is gone. */

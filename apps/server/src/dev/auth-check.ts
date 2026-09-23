@@ -21,7 +21,14 @@ import type { FastifyInstance } from 'fastify';
 import { buildServer } from '../app.js';
 import { loadRuntimeConfig } from '../config.js';
 import { migrate } from '../db/migrations.js';
-import { AUTH_SESSION_COOKIE, hashPassword, hashSessionToken } from '../services/auth.js';
+import {
+  AUTH_LOGIN_BACKOFF_MS,
+  AUTH_LOGIN_FAILURE_LIMIT,
+  AUTH_SESSION_COOKIE,
+  hashPassword,
+  hashSessionToken,
+} from '../services/auth.js';
+import { HttpError } from '../util/http.js';
 import { nowIso } from '../util/time.js';
 
 interface Check {
@@ -281,6 +288,40 @@ async function main(): Promise<void> {
       return 'HTTP 401';
     });
 
+    await expect('用户名不存在与密码错误不可区分（响应时间 + 文案）', async () => {
+      // `login()` used to short circuit on a mismatching username, so an unknown
+      // username answered in well under a millisecond while a wrong password
+      // paid a ~25ms scrypt — a username oracle. Both paths now run exactly one
+      // scrypt against the stored (or a decoy) hash.
+      const attempt = (username: string): { ms: number; status: number; message: string } => {
+        const started = performance.now();
+        let status = 200;
+        let message = '';
+        try {
+          ctx.auth.login({ username, password: 'wrong-password', remember: false });
+        } catch (error) {
+          status = error instanceof HttpError ? error.statusCode : 0;
+          message = error instanceof Error ? error.message : String(error);
+        }
+        return { ms: performance.now() - started, status, message };
+      };
+
+      const unknown = attempt('no-such-user');
+      const known = attempt('admin');
+      assert(unknown.status === 401, `未知用户名返回 ${unknown.status}`);
+      assert(known.status === 401, `错误密码返回 ${known.status}`);
+      assert(
+        unknown.message === known.message,
+        `错误文案不同：${unknown.message} / ${known.message}`,
+      );
+      assert(unknown.ms >= 8, `未知用户名单次 ${unknown.ms.toFixed(1)}ms，疑似跳过了 scrypt`);
+      assert(
+        unknown.ms >= known.ms * 0.3,
+        `未知用户名 ${unknown.ms.toFixed(1)}ms 明显快于已存在的用户名 ${known.ms.toFixed(1)}ms`,
+      );
+      return `未知 ${unknown.ms.toFixed(1)}ms / 已存在 ${known.ms.toFixed(1)}ms`;
+    });
+
     await expect('百分号编码路径不能绕过登录门禁（/%61pi/... → 401）', async () => {
       // The router matches percent-decoded paths while `request.url` keeps the raw
       // bytes; the guard used to compare the raw string and let every one of these
@@ -421,10 +462,15 @@ async function main(): Promise<void> {
       const stored = ctx.store.getAuthSession(tokenHash);
       assert(stored, '登录后没有会话记录');
       // "打开页面" a bit later: the sliding renewal is throttled to 5 minutes.
+      // The stored `expires_at` is aged together with `last_seen_at`, so the
+      // assertions below compare two different windows. "Renewal landed in the
+      // same millisecond as the login" used to produce the identical
+      // `now + 30 天` string and made the old string comparison flaky.
+      const agedExpiresAt = new Date(Date.now() + 20 * 24 * 60 * 60 * 1000).toISOString();
       ctx.store.touchAuthSession(
         tokenHash,
         new Date(Date.now() - 10 * 60_000).toISOString(),
-        stored.expiresAt,
+        agedExpiresAt,
       );
 
       const response = await app.inject({
@@ -436,12 +482,24 @@ async function main(): Promise<void> {
       const header = String(response.headers['set-cookie'] ?? '');
       const match = /max-age=(\d+)/i.exec(header);
       assert(match, `续期后没有下发新的 Cookie：${header || '(空)'}`);
-      const days = Number(match[1]) / 86_400;
-      assert(days > 29 && days <= 30, `续期后的 Max-Age 异常：${match[1]} 秒`);
+      const cookieMaxAgeMs = Number(match[1]) * 1000;
+      assert(
+        cookieMaxAgeMs > 29 * 86_400_000 && cookieMaxAgeMs <= 30 * 86_400_000,
+        `续期后的 Max-Age 异常：${match[1]} 秒`,
+      );
 
       const renewed = ctx.store.getAuthSession(tokenHash);
-      assert(renewed && renewed.expiresAt !== stored.expiresAt, '库里的过期时间没有顺延');
-      return `新 Cookie Max-Age ${match[1]} 秒`;
+      assert(renewed, '续期后会话记录消失了');
+      // The stored window has to move forward by the 10 days it was aged by,
+      // and it has to agree with the `Max-Age` the browser just received.
+      const forwardMs = Date.parse(renewed.expiresAt) - Date.parse(agedExpiresAt);
+      assert(
+        forwardMs > 9 * 86_400_000 && forwardMs < 10 * 86_400_000 + 60_000,
+        `库里的过期时间没有按 30 天窗口顺延：前移 ${(forwardMs / 86_400_000).toFixed(2)} 天`,
+      );
+      const skewMs = Math.abs(Date.parse(renewed.expiresAt) - (Date.now() + cookieMaxAgeMs));
+      assert(skewMs < 5_000, `库内 expires_at 与 Cookie Max-Age 相差 ${Math.round(skewMs)}ms`);
+      return `新 Cookie Max-Age ${match[1]} 秒，库内顺延 ${(forwardMs / 86_400_000).toFixed(1)} 天`;
     });
 
     await expect('非保持登录的会话不滚动续期（上限 12 小时）', async () => {
@@ -702,6 +760,66 @@ async function main(): Promise<void> {
       assert(outcome.closed, '退出登录后连接仍然存活');
       assert(outcome.code === SESSION_GONE_CLOSE_CODE, `关闭码 ${outcome.code}`);
       return `${SESSION_GONE_CLOSE_CODE} 关闭`;
+    });
+
+    process.stdout.write('\n登录失败限速（暴力破解成本）：\n');
+
+    await expect('连续登录失败后限速 429，窗口过后自动恢复并清零', async () => {
+      const attempt = async (password: string): Promise<number> => {
+        const response = await app.inject({
+          method: 'POST',
+          url: '/api/auth/login',
+          payload: { username: 'moln', password },
+        });
+        return response.statusCode;
+      };
+
+      // The pause only gates new logins: a browser that is already signed in keeps
+      // working, so nobody can use the backoff to lock the owner out.
+      const existing = await app.inject({
+        method: 'POST',
+        url: '/api/auth/login',
+        payload: { username: 'moln', password: 's3cret-pw-3' },
+      });
+      assert(existing.statusCode === 200, `准备已登录会话失败：${existing.statusCode}`);
+      const existingToken = cookieToken(existing.headers['set-cookie']);
+
+      const free: number[] = [];
+      for (let index = 0; index < AUTH_LOGIN_FAILURE_LIMIT; index += 1) {
+        free.push(await attempt('definitely-wrong'));
+      }
+      assert(
+        free.every((status) => status === 401),
+        `前 ${AUTH_LOGIN_FAILURE_LIMIT} 次应照常校验密码：${free.join('、')}`,
+      );
+
+      // Even the correct password waits out the window: the endpoint stops
+      // verifying anything until the pause expires.
+      const limited = await app.inject({
+        method: 'POST',
+        url: '/api/auth/login',
+        payload: { username: 'moln', password: 's3cret-pw-3' },
+      });
+      assert(limited.statusCode === 429, `超出失败次数后未限速：${limited.statusCode}`);
+      const { error: limitedMessage } = limited.json<{ error: string }>();
+      assert(/秒后重试/.test(limitedMessage), `限速提示文案异常：${limitedMessage}`);
+
+      const stillSignedIn = await app.inject({
+        method: 'GET',
+        url: '/api/system/overview',
+        headers: { cookie: cookieHeader(existingToken) },
+      });
+      assert(
+        stillSignedIn.statusCode === 200,
+        `限速期间已登录会话被拒：${stillSignedIn.statusCode}`,
+      );
+
+      // The penalty is a pause, not a lockout: it expires by itself, the right
+      // password works again, and that success clears the counter.
+      await delay(AUTH_LOGIN_BACKOFF_MS + 300);
+      assert((await attempt('s3cret-pw-3')) === 200, '限速窗口过后仍无法登录');
+      assert((await attempt('definitely-wrong')) === 401, '成功登录后失败计数未清零');
+      return `前 ${AUTH_LOGIN_FAILURE_LIMIT} 次 401 → 429（${limitedMessage}）→ 恢复`;
     });
 
     process.stdout.write('\n旧库升级：\n');

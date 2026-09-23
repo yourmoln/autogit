@@ -9,7 +9,7 @@ import {
   sessionCookieMaxAge,
 } from '../services/auth.js';
 import { clearCookie, readCookie, serializeCookie } from '../util/cookies.js';
-import { parseOrThrow } from '../util/http.js';
+import { HttpError, parseOrThrow } from '../util/http.js';
 
 const loginSchema = z.object({
   username: z.string().min(1, '请输入用户名').max(64),
@@ -64,11 +64,14 @@ export function registerAuthRoutes(app: FastifyInstance, ctx: AppContext): void 
         remember,
       });
     } catch (error) {
+      const throttled = error instanceof HttpError && error.statusCode === 429;
       ctx.store.addActivity({
         level: 'warning',
         scope: 'auth',
         repositoryId: null,
-        message: `登录失败：用户名或密码不正确（${body.username.trim() || '未填写用户名'}）`,
+        message: throttled
+          ? `登录被限速：连续失败次数过多（${body.username.trim() || '未填写用户名'}）`
+          : `登录失败：用户名或密码不正确（${body.username.trim() || '未填写用户名'}）`,
       });
       throw error;
     }
@@ -107,9 +110,7 @@ export function registerAuthRoutes(app: FastifyInstance, ctx: AppContext): void 
   });
 
   /** Public endpoint: the SPA asks who it is before rendering any page. */
-  app.get('/api/auth/session', async (request) =>
-    sessionPayload(ctx, request),
-  );
+  app.get('/api/auth/session', async (request) => sessionPayload(ctx, request));
 
   app.put('/api/auth/credentials', async (request, reply) => {
     const body = parseOrThrow(credentialsSchema, request.body, '账号信息');

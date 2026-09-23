@@ -134,7 +134,8 @@ export function LoginPage(): ReactNode {
             <span className="min-w-0">
               <span className="block text-xs font-medium text-slate-200">保持登录</span>
               <span className="mt-0.5 block text-[11px] leading-relaxed text-slate-500">
-                勾选后登录凭证会保存在浏览器中，下次打开自动登录（30 天内有效，期间使用会自动续期）。
+                勾选后登录凭证会保存在浏览器中，下次打开自动登录（30
+                天内有效，期间使用会自动续期）。
               </span>
             </span>
           </button>

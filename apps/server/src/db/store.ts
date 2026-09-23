@@ -966,7 +966,9 @@ export class Store {
 
   /** Records that the stored hash is no longer the factory password. */
   markAuthPasswordChanged(changedAt: string): void {
-    this.db.run("UPDATE auth_account SET password_changed_at = ? WHERE id = 'default'", [changedAt]);
+    this.db.run("UPDATE auth_account SET password_changed_at = ? WHERE id = 'default'", [
+      changedAt,
+    ]);
   }
 
   createAuthSession(input: {

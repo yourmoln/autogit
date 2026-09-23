@@ -28,6 +28,12 @@ export interface RuntimeConfig {
   defaultPollSeconds: number;
   defaultMaxConcurrent: number;
   defaultMaxConcurrentPerRepo: number;
+  /**
+   * Extra origins the realtime upgrade accepts although they do not name the
+   * host the request arrived on (reverse proxies that rewrite `Host`, or a dev
+   * server on another machine). See `util/origin.ts`.
+   */
+  allowedOrigins: string[];
   isDev: boolean;
   repoRoot: string;
 }
@@ -52,6 +58,14 @@ function resolveWebDist(): string | null {
   return existsSync(candidate) ? candidate : null;
 }
 
+/** `AUTOGIT_ALLOWED_ORIGINS=a.example,b.example` → `['a.example', 'b.example']`. */
+function resolveAllowedOrigins(): string[] {
+  return (process.env.AUTOGIT_ALLOWED_ORIGINS ?? '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0);
+}
+
 export function loadRuntimeConfig(): RuntimeConfig {
   const home = resolveHome();
   const codexHome = process.env.CODEX_HOME?.trim() || path.join(homedir(), '.codex');
@@ -72,6 +86,7 @@ export function loadRuntimeConfig(): RuntimeConfig {
     defaultPollSeconds: asNumber(process.env.AUTOGIT_POLL_SECONDS, 45),
     defaultMaxConcurrent: asNumber(process.env.AUTOGIT_MAX_CONCURRENT, 2),
     defaultMaxConcurrentPerRepo: asNumber(process.env.AUTOGIT_MAX_CONCURRENT_PER_REPO, 1),
+    allowedOrigins: resolveAllowedOrigins(),
     isDev: process.env.NODE_ENV !== 'production',
     repoRoot,
   };

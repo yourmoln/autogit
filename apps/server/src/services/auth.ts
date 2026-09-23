@@ -342,8 +342,14 @@ export class AuthService {
       // Cheap on purpose: this runs on every `GET /api/auth/session`. Asking the
       // stored hash whether it still verifies the factory password would mean a
       // blocking scrypt on each page load, so `password_changed_at` records it.
-      defaultCredentials:
-        sameUsername(account.username, DEFAULT_AUTH_USERNAME) && account.passwordChangedAt === null,
+      //
+      // The marker is about the *password* only. Renaming the account is what a
+      // cautious user does first ("admin" is the obvious target), and keying the
+      // hint on the username as well used to make it disappear at exactly that
+      // point — leaving the factory password in place with no reminder anywhere
+      // in the UI. `updateCredentials()` keeps the marker on a rename-only
+      // change, so binding the hint to it reports what it claims to report.
+      defaultCredentials: account.passwordChangedAt === null,
       activeSessions: this.store.countAuthSessions(nowIso()),
     };
   }

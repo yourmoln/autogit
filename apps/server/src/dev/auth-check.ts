@@ -82,6 +82,12 @@ function delay(ms: number): Promise<void> {
   });
 }
 
+/** Puts an env var back the way it was (including "was not set at all"). */
+function restoreEnv(name: string, value: string | undefined): void {
+  if (value === undefined) delete process.env[name];
+  else process.env[name] = value;
+}
+
 async function pollUntil<T>(read: () => T | null, timeoutMs: number): Promise<T | null> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
@@ -169,6 +175,7 @@ function upgradeRealtime(
   port: number,
   requestPath: string,
   cookie: string | null,
+  origin?: string | null,
 ): Promise<RealtimeUpgrade> {
   return new Promise<RealtimeUpgrade>((resolve, reject) => {
     const socket = net.connect(port, '127.0.0.1');
@@ -194,6 +201,9 @@ function upgradeRealtime(
         `Sec-WebSocket-Key: ${randomBytes(16).toString('base64')}`,
       ];
       if (cookie) lines.push(`Cookie: ${cookie}`);
+      // Browsers always send `Origin` on a WebSocket handshake; leaving it out
+      // stands in for a non-browser client (`curl`, a probe, a script).
+      if (origin) lines.push(`Origin: ${origin}`);
       socket.write(`${lines.join('\r\n')}\r\n\r\n`);
     });
 
@@ -291,6 +301,23 @@ async function main(): Promise<void> {
       });
       assert(preflight.statusCode === 401, `预检样式 OPTIONS → ${preflight.statusCode}`);
       return 'HTTP 401';
+    });
+
+    await expect('未登录也能探活（GET /api/health → 200，只回运行状态）', async () => {
+      // 探活接口是唯一为「没有会话的调用方」保留的业务接口：systemd、容器
+      // healthcheck 与外部监控都拿不到 Cookie，变成 401 就等于升级后静默失败。
+      const response = await app.inject({ method: 'GET', url: '/api/health' });
+      assert(response.statusCode === 200, `状态码 ${response.statusCode}`);
+      const payload = response.json<Record<string, unknown>>();
+      assert(payload.ok === true, `健康响应缺少 ok：${JSON.stringify(payload)}`);
+      assert(typeof payload.uptimeSeconds === 'number', '健康响应缺少 uptimeSeconds');
+      const keys = Object.keys(payload).sort().join(',');
+      assert(keys === 'node,ok,uptimeSeconds,version', `健康响应暴露了额外字段：${keys}`);
+
+      // 百分号编码命中的是同一条路由，因此同样放行；其它接口不受影响。
+      const encoded = await app.inject({ method: 'GET', url: '/%61pi/health' });
+      assert(encoded.statusCode === 200, `编码后的探活接口 → ${encoded.statusCode}`);
+      return 'HTTP 200';
     });
 
     await expect('GET /api/auth/session 未登录时返回 authenticated=false', async () => {
@@ -600,6 +627,49 @@ async function main(): Promise<void> {
       return 'HTTP 400';
     });
 
+    await expect('只改用户名不改密码时仍提示使用默认密码', async () => {
+      // 「仍在使用默认密码」是弱口令提示，只能由密码决定。原先的判定同时要求
+      // 用户名仍是 admin，于是「先改名、后改密码」的用户一改名提示就消失了，
+      // 出厂口令却还在。
+      const rename = await app.inject({
+        method: 'PUT',
+        url: '/api/auth/credentials',
+        headers: { cookie: cookieHeader(sessionToken) },
+        payload: { currentPassword: 'admin', username: 'ops' },
+      });
+      assert(rename.statusCode === 200, `状态码 ${rename.statusCode}`);
+      const renamed = rename.json<AuthSessionPayload>();
+      assert(renamed.session?.username === 'ops', '用户名未更新');
+      assert(
+        renamed.credentials?.defaultCredentials === true,
+        '改名后不再提示仍在使用默认密码（弱口令提示消失）',
+      );
+      sessionToken = cookieToken(rename.headers['set-cookie']);
+
+      // 密码确实没变，所以出厂口令仍能登录：提示与事实一致。
+      const login = await app.inject({
+        method: 'POST',
+        url: '/api/auth/login',
+        payload: { username: 'ops', password: 'admin' },
+      });
+      assert(login.statusCode === 200, `改名后默认密码无法登录（${login.statusCode}）`);
+
+      // 改回 admin，后续用例继续沿用出厂账号。
+      const restore = await app.inject({
+        method: 'PUT',
+        url: '/api/auth/credentials',
+        headers: { cookie: cookieHeader(sessionToken) },
+        payload: { currentPassword: 'admin', username: 'admin' },
+      });
+      assert(restore.statusCode === 200, `状态码 ${restore.statusCode}`);
+      assert(
+        restore.json<AuthSessionPayload>().credentials?.defaultCredentials === true,
+        '改回原名后默认密码提示消失',
+      );
+      sessionToken = cookieToken(restore.headers['set-cookie']);
+      return 'defaultCredentials 保持 true';
+    });
+
     await expect('修改账号与密码后当前浏览器继续可用，会话 token 已轮换', async () => {
       const response = await app.inject({
         method: 'PUT',
@@ -736,6 +806,138 @@ async function main(): Promise<void> {
       realtimeProbes.push(result.probe);
       assert(await result.probe.waitForFrame(3_000), '升级后没有收到服务端消息');
       return 'HTTP 101';
+    });
+
+    await expect('跨站 Origin 的实时升级被拒绝（403，未登录仍 401）', async () => {
+      // 升级请求拿不到 CORS 层，响应也是 101 而不是可读的 JSON，所以「浏览器
+      // 会不会带上 SameSite=Lax 的 Cookie」成了唯一防线。这里把 Origin 与 Host
+      // 的比对放进服务端自己的守卫里，跨站页面即使拿到有效 Cookie 也连不上。
+      const before = realtimeProbes.length;
+      const crossSite = await upgradeRealtime(
+        realtimePort,
+        '/api/realtime',
+        cookieHeader(revokedToken),
+        'https://evil.example',
+      );
+      assert(!crossSite.upgraded, '跨站来源仍能建立实时连接');
+      assert(crossSite.statusCode === 403, `状态码 ${crossSite.statusCode}`);
+
+      // 会话校验优先：没登录时仍是 401，不透露「这个来源可不可信」。
+      const anonymous = await upgradeRealtime(
+        realtimePort,
+        '/api/realtime',
+        null,
+        'https://evil.example',
+      );
+      assert(!anonymous.upgraded, '未登录的跨站升级被放行');
+      assert(anonymous.statusCode === 401, `未登录跨站升级 → ${anonymous.statusCode}`);
+
+      // 编码路径命中的是同一条路由，同样要过这道校验。
+      const encoded = await upgradeRealtime(
+        realtimePort,
+        '/%61pi/realtime',
+        cookieHeader(revokedToken),
+        'https://evil.example',
+      );
+      assert(!encoded.upgraded, '编码路径绕过了来源校验');
+      assert(encoded.statusCode === 403, `编码路径状态码 ${encoded.statusCode}`);
+      assert(realtimeProbes.length === before, '被拒绝的升级留下了连接');
+      return 'HTTP 403（未登录 401）';
+    });
+
+    await expect('同源与开发用回环 Origin 的实时升级正常（101）', async () => {
+      const sameOrigin = await upgradeRealtime(
+        realtimePort,
+        '/api/realtime',
+        cookieHeader(revokedToken),
+        `http://127.0.0.1:${realtimePort}`,
+      );
+      assert(sameOrigin.upgraded, '同源 Origin 被拒绝');
+      realtimeProbes.push(sameOrigin.probe);
+      assert(await sameOrigin.probe.waitForFrame(3_000), '同源连接没有收到服务端消息');
+
+      // 开发模式：Vite 代理用 changeOrigin 把 Host 改写成后端地址，Origin 仍是
+      // http://localhost:5173，所以回环来源要放行（生产模式见下一个用例）。
+      const devOrigin = await upgradeRealtime(
+        realtimePort,
+        '/api/realtime',
+        cookieHeader(revokedToken),
+        'http://localhost:5173',
+      );
+      assert(devOrigin.upgraded, '开发用回环 Origin 被拒绝');
+      realtimeProbes.push(devOrigin.probe);
+      assert(await devOrigin.probe.waitForFrame(3_000), '开发用连接没有收到服务端消息');
+      return 'HTTP 101 ×2';
+    });
+
+    await expect('生产模式不放行回环 Origin，显式允许列表可放行', async () => {
+      const prodHome = mkdtempSync(path.join(tmpdir(), 'autogit-auth-prod-'));
+      const savedNodeEnv = process.env.NODE_ENV;
+      const savedHome = process.env.AUTOGIT_HOME;
+      const savedAllowed = process.env.AUTOGIT_ALLOWED_ORIGINS;
+      let prod: Awaited<ReturnType<typeof buildServer>> | null = null;
+      process.env.NODE_ENV = 'production';
+      process.env.AUTOGIT_HOME = prodHome;
+      process.env.AUTOGIT_ALLOWED_ORIGINS = 'https://autogit.example.com';
+      try {
+        const prodConfig = loadRuntimeConfig();
+        // 生产模式的日志是 JSON，别让「已创建默认账号」的告警混进自检输出。
+        prodConfig.logLevel = 'error';
+        assert(prodConfig.isDev === false, '未按生产模式加载配置');
+        assert(
+          prodConfig.allowedOrigins.length === 1,
+          `允许列表解析异常：${prodConfig.allowedOrigins.join('、')}`,
+        );
+
+        prod = await buildServer(prodConfig);
+        await prod.app.listen({ host: '127.0.0.1', port: 0 });
+        const prodPort = listeningPort(prod.app);
+        const login = await prod.app.inject({
+          method: 'POST',
+          url: '/api/auth/login',
+          payload: { username: 'admin', password: 'admin' },
+        });
+        assert(login.statusCode === 200, `生产实例登录失败：${login.statusCode}`);
+        const cookie = cookieHeader(cookieToken(login.headers['set-cookie']));
+
+        const loopback = await upgradeRealtime(
+          prodPort,
+          '/api/realtime',
+          cookie,
+          'http://localhost:5173',
+        );
+        assert(!loopback.upgraded, '生产模式仍然放行回环来源');
+
+        const sameOrigin = await upgradeRealtime(
+          prodPort,
+          '/api/realtime',
+          cookie,
+          `http://127.0.0.1:${prodPort}`,
+        );
+        assert(sameOrigin.upgraded, '生产模式下同源被拒绝');
+        sameOrigin.probe.destroy();
+
+        const allowed = await upgradeRealtime(
+          prodPort,
+          '/api/realtime',
+          cookie,
+          'https://autogit.example.com',
+        );
+        assert(allowed.upgraded, '显式允许列表未生效');
+        allowed.probe.destroy();
+      } finally {
+        restoreEnv('NODE_ENV', savedNodeEnv);
+        restoreEnv('AUTOGIT_HOME', savedHome);
+        restoreEnv('AUTOGIT_ALLOWED_ORIGINS', savedAllowed);
+        // 关掉实例再删目录：断言失败时也要先释放 SQLite 句柄，否则 Windows
+        // 上 rmSync 会抛出 EBUSY 掩盖真正的失败原因。
+        if (prod) {
+          await prod.app.close().catch(() => undefined);
+          prod.ctx.dispose();
+        }
+        rmSync(prodHome, { recursive: true, force: true });
+      }
+      return '回环 403、同源 101、允许列表 101';
     });
 
     let rotatedToken = '';

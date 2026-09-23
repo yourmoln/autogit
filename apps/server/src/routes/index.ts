@@ -5,6 +5,7 @@ import type { AppContext } from '../context.js';
 import { AUTH_SESSION_COOKIE, sessionCookieMaxAge } from '../services/auth.js';
 import { readCookie, serializeCookie } from '../util/cookies.js';
 import { API_PREFIX, decodeRequestPath, isApiPath } from '../util/http.js';
+import { isTrustedOrigin, isWebSocketUpgrade } from '../util/origin.js';
 import { registerAccountRoutes } from './accounts.js';
 import { registerAuthRoutes } from './auth.js';
 import { registerCodexRoutes } from './codex.js';
@@ -30,6 +31,10 @@ declare module 'fastify' {
  *
  * Everything else under `/api` (including the realtime WebSocket) requires a
  * valid session cookie — AutoGit refuses to run a single operation without it.
+ * `health` is on the list because it is a probe endpoint: systemd, container
+ * healthchecks and uptime monitors run without a session, and returning `401`
+ * there turns "the process is up" into a permanently failing check. It answers
+ * with nothing but uptime, version and the Node version.
  * `logout` is public on purpose: it can only revoke the session named by the
  * request's own cookie, and it must still work when that session already
  * expired (clicking "退出登录" should never fail).
@@ -41,6 +46,7 @@ const PUBLIC_API_ROUTES = new Set([
   `${API_PREFIX}/auth/login`,
   `${API_PREFIX}/auth/session`,
   `${API_PREFIX}/auth/logout`,
+  `${API_PREFIX}/health`,
 ]);
 
 export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
@@ -85,6 +91,23 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
     if (PUBLIC_API_ROUTES.has(path)) return;
     if (!resolved) {
       return reply.code(401).send({ error: '登录状态已失效，请重新登录' });
+    }
+    // A valid cookie is not by itself proof of a same-origin console. The
+    // realtime upgrade is replied to with a `101`, so it cannot be protected the
+    // way the JSON API is (no readable response, no CORS layer to fall back on)
+    // and `SameSite=Lax` is enforced by the browser, not by this process. Compare
+    // `Origin` with the host the handshake arrived on and refuse the upgrade
+    // otherwise — authenticated cross-site pages then get a `403` instead of a
+    // socket that streams every task log to them. Non-browser clients send no
+    // `Origin` at all and keep working; see `util/origin.ts` for the details.
+    if (
+      isWebSocketUpgrade(request) &&
+      !isTrustedOrigin(request, {
+        allowedOrigins: ctx.config.allowedOrigins,
+        allowLoopback: ctx.config.isDev,
+      })
+    ) {
+      return reply.code(403).send({ error: '跨站来源的实时连接已被拒绝' });
     }
   });
 

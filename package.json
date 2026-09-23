@@ -16,6 +16,7 @@
     "start": "pnpm --filter @autogit/server start",
     "typecheck": "pnpm -r typecheck",
     "check": "biome check .",
+    "repo:check": "node scripts/check-repo-hygiene.mjs",
     "format": "biome format --write .",
     "simulate": "pnpm --filter @autogit/server simulate"
   },

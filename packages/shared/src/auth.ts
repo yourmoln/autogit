@@ -27,7 +27,9 @@ export interface AuthSession {
 export interface AuthCredentialsSummary {
   username: string;
   updatedAt: string;
-  /** 仍是出厂默认的 `admin` / `admin`，界面上会提示尽快修改。 */
+  /**
+   * 密码仍是出厂默认的 `admin`（用户名可以已经改过），界面上会提示尽快修改。
+   */
   defaultCredentials: boolean;
   /** 当前有效的会话数（包含发起请求的这一条）。 */
   activeSessions: number;

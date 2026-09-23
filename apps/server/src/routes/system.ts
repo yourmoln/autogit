@@ -2,6 +2,28 @@ import { AI_LABELS, PROVIDER_META } from '@autogit/shared';
 import type { FastifyInstance } from 'fastify';
 
 import type { AppContext } from '../context.js';
+import { AUTH_SESSION_COOKIE } from '../services/auth.js';
+import { readCookie } from '../util/cookies.js';
+
+/**
+ * Close code for "the session behind this socket is gone".
+ *
+ * The SPA treats it like any other disconnect and reconnects, which fails at the
+ * handshake while the cookie stays invalid, so the user lands back on the login
+ * page after the next API call.
+ */
+const SESSION_GONE_CLOSE_CODE = 4401;
+/**
+ * Close code for "this browser just rotated its own credentials".
+ *
+ * The request that rotated them answers the same browser with a replacement
+ * cookie, so the tab has to reconnect rather than sign out — `lib/realtime.ts`
+ * knows not to touch the login state on this code. Every other session really is
+ * gone and keeps getting {@link SESSION_GONE_CLOSE_CODE}.
+ */
+const SESSION_ROTATED_CLOSE_CODE = 4402;
+/** How often an open socket re-checks that its own session is still valid. */
+const SESSION_RECHECK_MS = 30_000;
 
 export function registerSystemRoutes(app: FastifyInstance, ctx: AppContext): void {
   app.get('/api/health', async () => ({
@@ -82,8 +104,52 @@ export function registerSystemRoutes(app: FastifyInstance, ctx: AppContext): voi
       socket.send(JSON.stringify(event));
     });
 
-    socket.on('close', unsubscribe);
-    socket.on('error', unsubscribe);
+    // The handshake only proves the session once. A session that disappears
+    // afterwards — logout, credential rotation — has to close the sockets it
+    // already authorised, otherwise a browser that lost its session keeps
+    // receiving task logs. The one exception is the browser that performs the
+    // rotation: it gets its replacement cookie from that same request, so it is
+    // told to reconnect (see `SESSION_ROTATED_CLOSE_CODE`).
+    const sessionHash = request.authSessionHash;
+    const closeForSession = (code: number, reason: string): void => {
+      try {
+        socket.close(code, reason);
+      } catch {
+        // The socket is already gone; nothing left to close.
+      }
+    };
+
+    const unsubscribeRevocation = ctx.auth.onSessionRevoked(({ revoked, rotatedFrom }) => {
+      if (!sessionHash) return;
+      if (revoked !== null && !revoked.includes(sessionHash)) return;
+      if (rotatedFrom && rotatedFrom === sessionHash) {
+        // The browser that ran the rotation keeps a live tab: closing it with
+        // "signed out" made the console flash the login page in front of a user
+        // who never lost their session (the replacement cookie arrives with the
+        // answer to that same request).
+        closeForSession(SESSION_ROTATED_CLOSE_CODE, '登录凭据已更新，正在用新会话重新连接');
+        return;
+      }
+      closeForSession(SESSION_GONE_CLOSE_CODE, '登录状态已失效，请重新登录');
+    });
+
+    // Backstop for what the revocation hook cannot see: the session expired (or
+    // was pruned) while this socket sat idle.
+    const recheck = setInterval(() => {
+      const token = readCookie(request.headers.cookie, AUTH_SESSION_COOKIE);
+      if (!ctx.auth.resolveSession(token)) {
+        closeForSession(SESSION_GONE_CLOSE_CODE, '登录状态已失效，请重新登录');
+      }
+    }, SESSION_RECHECK_MS);
+    recheck.unref();
+
+    const cleanup = (): void => {
+      clearInterval(recheck);
+      unsubscribeRevocation();
+      unsubscribe();
+    };
+    socket.on('close', cleanup);
+    socket.on('error', cleanup);
     request.log.debug('realtime client connected');
   });
 }

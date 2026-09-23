@@ -24,6 +24,7 @@ import {
   normalizeBaseUrl,
   type ProviderAccount,
   type RepoRef,
+  type UpdatePullRequestInput,
 } from './types.js';
 
 interface GiteaUser {
@@ -584,6 +585,23 @@ export class GiteaProvider implements GitProvider {
         base: input.base,
       },
     });
+    return this.mapPullRequest(pr);
+  }
+
+  /**
+   * Rewrites the title and/or body of an existing PR. Gitea uses the same
+   * endpoint as creation, so only the supplied fields are sent (`undefined`
+   * keys are dropped by the JSON serialiser).
+   */
+  async updatePullRequest(
+    ref: RepoRef,
+    number: number,
+    input: UpdatePullRequestInput,
+  ): Promise<RemotePullRequest> {
+    const pr = await this.client.patch<GiteaPullRequest>(
+      `/repos/${ref.owner}/${ref.name}/pulls/${number}`,
+      { body: { ...input } },
+    );
     return this.mapPullRequest(pr);
   }
 }

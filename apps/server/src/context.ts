@@ -2,6 +2,7 @@ import type { RuntimeConfig } from './config.js';
 import { Db } from './db/database.js';
 import { migrate } from './db/migrations.js';
 import { Store } from './db/store.js';
+import { AuthService } from './services/auth.js';
 import { CodexService } from './services/codex.js';
 import { EventBus } from './services/events.js';
 import { LabelService } from './services/labels.js';
@@ -18,6 +19,7 @@ export interface AppContext {
   config: RuntimeConfig;
   db: Db;
   store: Store;
+  auth: AuthService;
   settings: SettingsService;
   proxy: ProxyService;
   events: EventBus;
@@ -39,6 +41,8 @@ export function createContext(config: RuntimeConfig): AppContext {
   );
 
   const store = new Store(db);
+  const auth = new AuthService(store);
+  auth.bootstrap();
   const secretKey = loadOrCreateSecretKey(config.secretKeyPath, process.env.AUTOGIT_SECRET_KEY);
   const settings = new SettingsService(store, config);
   const proxy = new ProxyService(store, secretKey);
@@ -64,6 +68,7 @@ export function createContext(config: RuntimeConfig): AppContext {
     config,
     db,
     store,
+    auth,
     settings,
     proxy,
     events,

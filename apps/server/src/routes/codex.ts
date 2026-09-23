@@ -3,8 +3,9 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 
 import type { AppContext } from '../context.js';
-import { findLatestReviewComment, mergeReviewDiscussion } from '../services/orchestrator.js';
+import { findLatestReviewComment } from '../services/orchestrator.js';
 import { buildFixPrompt, buildImplementPrompt, buildReviewPrompt } from '../services/prompts.js';
+import { mergeReviewDiscussion } from '../services/review-findings.js';
 import { HttpError, parseOrThrow } from '../util/http.js';
 import { logger } from '../util/logger.js';
 

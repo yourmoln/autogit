@@ -23,6 +23,7 @@ import {
   normalizeBaseUrl,
   type ProviderAccount,
   type RepoRef,
+  type UpdatePullRequestInput,
 } from './types.js';
 
 interface GiteeUser {
@@ -569,6 +570,23 @@ export class GiteeProvider implements GitProvider {
         body: input.body,
       },
     });
+    return this.mapPullRequest(pr);
+  }
+
+  /**
+   * Rewrites the title and/or body of an existing PR. Gitee's v5 API takes the
+   * same parameters as creation, so only the supplied fields are sent
+   * (`undefined` keys are dropped by the JSON serialiser).
+   */
+  async updatePullRequest(
+    ref: RepoRef,
+    number: number,
+    input: UpdatePullRequestInput,
+  ): Promise<RemotePullRequest> {
+    const pr = await this.client.patch<GiteePullRequest>(
+      `/repos/${ref.owner}/${ref.name}/pulls/${number}`,
+      { body: { ...input } },
+    );
     return this.mapPullRequest(pr);
   }
 }

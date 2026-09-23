@@ -23,6 +23,7 @@ import {
   normalizeBaseUrl,
   type ProviderAccount,
   type RepoRef,
+  type UpdatePullRequestInput,
 } from './types.js';
 
 const ACCEPT = 'application/vnd.github+json';
@@ -440,6 +441,25 @@ export class GitHubProvider implements GitProvider {
       },
       accept: ACCEPT,
     });
+    return this.mapPullRequest(pr);
+  }
+
+  /**
+   * Rewrites the title and/or body of an existing PR.
+   *
+   * Only the fields AutoGit passes are sent (`undefined` keys are dropped by
+   * the JSON serialiser), so repairing a title never clobbers a body someone
+   * edited by hand.
+   */
+  async updatePullRequest(
+    ref: RepoRef,
+    number: number,
+    input: UpdatePullRequestInput,
+  ): Promise<RemotePullRequest> {
+    const pr = await this.client.patch<GitHubPullRequest>(
+      `/repos/${ref.owner}/${ref.name}/pulls/${number}`,
+      { body: { ...input }, accept: ACCEPT },
+    );
     return this.mapPullRequest(pr);
   }
 }

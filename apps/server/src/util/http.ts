@@ -1,4 +1,46 @@
+import type { FastifyRequest } from 'fastify';
 import type { ZodType } from 'zod';
+
+/** Prefix of every JSON endpoint; static assets and the SPA stay outside of it. */
+export const API_PREFIX = '/api';
+
+/**
+ * Percent-decodes the path part of a request URL.
+ *
+ * The router (`find-my-way`) matches routes against the *decoded* path, while
+ * `request.url` still carries the raw bytes, so `/%61pi/system/overview` reaches
+ * the `/api/system/overview` handler. Any string comparison on a path — the auth
+ * guard above all — has to decode first, otherwise the encoded spelling walks
+ * straight past the check.
+ */
+export function decodeRequestPath(url: string): string {
+  const raw = url.split('?')[0] ?? '';
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    // Malformed escapes (`/%zz`) never match a route; keep the raw form.
+    return raw;
+  }
+}
+
+/** `true` for the API prefix itself and everything below it. */
+export function isApiPath(path: string): boolean {
+  return path === API_PREFIX || path.startsWith(`${API_PREFIX}/`);
+}
+
+/**
+ * `true` when the browser reached this instance over HTTPS.
+ *
+ * Behind a TLS-terminating reverse proxy the process itself only sees `http`,
+ * so `request.protocol` answers `http` and the session cookie would lose
+ * `Secure`. With `AUTOGIT_TRUST_PROXY` on, Fastify folds `X-Forwarded-Proto`
+ * into `request.protocol` (see `app.ts`) and this helper reports `https` for
+ * proxied requests; with the option off the header stays ignored, so a client
+ * that can reach the port directly cannot pick the cookie flags.
+ */
+export function isSecureRequest(request: FastifyRequest): boolean {
+  return request.protocol === 'https';
+}
 
 export class HttpError extends Error {
   readonly statusCode: number;

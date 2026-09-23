@@ -89,7 +89,7 @@ codex login            # 首次使用或凭证失效时执行一次设备授权
 首次打开 http://127.0.0.1:4711 会跳转到登录页，默认账号与密码都是 `admin`：
 
 - **保持登录**：勾选后凭证以 HttpOnly Cookie 保存在浏览器中，30 天内打开页面会自动登录（每次访问滚动续期，Cookie 的有效期同步顺延；页面长时间只挂着实时连接时，前端每 12 小时发一次会话查询让 Cookie 一起顺延）；不勾选则只在当前浏览器会话内有效（上限 12 小时，不滚动续期）。
-- **修改账号密码**：登录后在「设置 → 登录与安全」中修改，需要验证当前密码；修改后其他设备上的登录状态立即失效（包括已经建立的实时连接），本机保持登录。被吊销的页面会立刻退回登录页：实时连接收到服务端的 `4401` 关闭帧时广播一次「会话失效」并停止重连，受保护接口返回 `401`（含 `PUT /api/auth/credentials`）时同样广播，而不是停在一个看起来仍然登录的页面上。
+- **修改账号密码**：登录后在「设置 → 登录与安全」中修改，需要验证当前密码；修改后其他设备上的登录状态立即失效（包括已经建立的实时连接），本机保持登录 —— 发起这次修改的浏览器（含它的其它标签页）收到的是 `4402`「凭据已更新，用新会话重连」，前端只重连、不动登录态，所以改密码成功后不会闪一下登录页；只有修改请求本身失败（例如响应丢失）时，前端才会再用一次 `GET /api/auth/session` 确认会话，避免拿着已经被轮换掉的 Cookie 停在「看起来仍然登录」的状态。被吊销的其它页面会立刻退回登录页：实时连接收到服务端的 `4401` 关闭帧时广播一次「会话失效」并停止重连，受保护接口返回 `401`（含 `PUT /api/auth/credentials`）时同样广播，而不是停在一个看起来仍然登录的页面上。
 - **退出登录**：左侧边栏底部或页面右上角的「退出登录」按钮会吊销当前会话并清除凭证。
 - **登录失败限速**：连续失败 5 次后进入退避窗口，窗口内一律返回 `429` 与「请 N 秒后重试」，每次再失败窗口翻倍（最长 30 秒）；窗口会自动过期，成功登录立即清零，所以忘记密码不会把自己永久锁在外面。
 - **忘记密码**：停掉服务后删除 `~/.autogit/data/autogit.sqlite` 中 `auth_account` 与 `auth_sessions` 两张表的数据（或参照 [docs/RESET.md](docs/RESET.md) 重置整个数据目录），下次启动会恢复默认的 `admin` / `admin`。
@@ -245,7 +245,7 @@ pnpm repo:check   # 仓库历史里没有 .pnpm-store（合并前必跑；先自
 pnpm build        # shared → server → web
 pnpm simulate     # 端到端模拟：真实 git + 假 Codex + 假 Git 平台
 pnpm --filter @autogit/server auth:check            # 登录门禁自检（临时数据目录，真实 HTTP 路由）
-pnpm --filter @autogit/web client:check            # 前端会话生命周期自检（4401 关闭与 401 的登录态广播）
+pnpm --filter @autogit/web client:check            # 前端会话生命周期自检（4401 登出 / 4402 轮换重连 / 401 的登录态广播）
 pnpm --filter @autogit/server proxy:check          # 代理链路自检（本地起 HTTP/SOCKS5 代理）
 pnpm --filter @autogit/server proxy:check -- --online  # 额外验证真实 HTTPS 隧道
 ```
@@ -254,9 +254,9 @@ pnpm --filter @autogit/server proxy:check -- --online  # 额外验证真实 HTTP
 
 `proxy:check` 会启动一次性本地代理并断言 11 项行为（绝对形式转发、CONNECT 隧道、SOCKS5 用户名密码、认证失败提示、远程 DNS、重定向、gzip、错误码映射等），`--online` 会再追加两项真实 `https://api.github.com/` 隧道检查。
 
-`auth:check` 会在临时 `AUTOGIT_HOME` 中启动真实 HTTP 栈并断言 43 项行为：未登录访问接口与实时通道返回 401（`OPTIONS` 与预检样式请求同样需要会话）、探活接口 `GET /api/health`（含编码写法）未登录可访问且只回运行状态、百分号编码路径（`/%61pi/...`，含 `OPTIONS`）同样被拦下、默认账号可登录、用户名不存在与密码错误在响应时间与文案上不可区分、勾选/不勾选「保持登录」的 Cookie 差异与滚动续期（续期时同步续期浏览器 Cookie，并核对库内 `expires_at` 前移的幅度与 Cookie `Max-Age` 一致；非保持登录保持 12 小时上限）、跨源请求不返回 CORS 头、写请求的来源校验（跨站与同站其它端口的 `POST /api/orchestrator/tick`、`POST /api/orchestrator/restart`、`POST /api/codex/invalidate` 全部 403，跨站 `POST /api/auth/login` 同样 403，未登录的跨站写请求仍是 401，同源 / Vite 开发来源 / 无 `Origin` 的写请求 200）、会话摘要不再同步跑 scrypt、过期会话被清理、修改账号密码的校验与会话轮换、只改用户名时仍提示「仍在使用默认密码」、把密码显式改回出厂值后提示恢复（`password_changed_at` 被清空）、旧密码失效、其他设备会话被吊销、退出登录清除凭据、连续登录失败触发 `429` 且窗口过期后自动恢复并清零、编译产物（`pnpm start`）默认按生产模式启动且显式 `NODE_ENV` 优先、`AUTOGIT_DEV_ORIGINS` 只在开发模式生效、真实 WebSocket 升级路径（未登录 401、跨站 `Origin` 403、同源与 Vite 开发来源 101、其它本地端口与生产模式的开发来源 403、生产模式只放行显式允许列表、白名单与开发来源的协议必须一致（`https://` 条目不放行 `http://` 来源，反之亦然）、只写主机名的条目仍按主机比对、改凭据/退出登录后已建立的连接被 4401 关闭）、`AUTOGIT_TRUST_PROXY` 的解析（默认关闭、开 / 关写法、地址列表）与反向代理下的 `Secure` Cookie（登录、滚动续期、退出登录清除三处都带，代理报告明文时不带；开关关闭时 `X-Forwarded-Proto` 一律忽略），以及旧库升级时 `password_changed_at` 的回填，最后自动清理。
+`auth:check` 会在临时 `AUTOGIT_HOME` 中启动真实 HTTP 栈并断言 43 项行为：未登录访问接口与实时通道返回 401（`OPTIONS` 与预检样式请求同样需要会话）、探活接口 `GET /api/health`（含编码写法）未登录可访问且只回运行状态、百分号编码路径（`/%61pi/...`，含 `OPTIONS`）同样被拦下、默认账号可登录、用户名不存在与密码错误在响应时间与文案上不可区分、勾选/不勾选「保持登录」的 Cookie 差异与滚动续期（续期时同步续期浏览器 Cookie，并核对库内 `expires_at` 前移的幅度与 Cookie `Max-Age` 一致；非保持登录保持 12 小时上限）、跨源请求不返回 CORS 头、写请求的来源校验（跨站与同站其它端口的 `POST /api/orchestrator/tick`、`POST /api/orchestrator/restart`、`POST /api/codex/invalidate` 全部 403，跨站 `POST /api/auth/login` 同样 403，未登录的跨站写请求仍是 401，同源 / Vite 开发来源 / 无 `Origin` 的写请求 200）、会话摘要不再同步跑 scrypt、过期会话被清理、修改账号密码的校验与会话轮换、只改用户名时仍提示「仍在使用默认密码」、把密码显式改回出厂值后提示恢复（`password_changed_at` 被清空）、旧密码失效、其他设备会话被吊销、退出登录清除凭据、连续登录失败触发 `429` 且窗口过期后自动恢复并清零、编译产物（`pnpm start`）默认按生产模式启动且显式 `NODE_ENV` 优先、`AUTOGIT_DEV_ORIGINS` 只在开发模式生效、真实 WebSocket 升级路径（未登录 401、跨站 `Origin` 403、同源与 Vite 开发来源 101、其它本地端口与生产模式的开发来源 403、生产模式只放行显式允许列表、白名单与开发来源的协议必须一致（`https://` 条目不放行 `http://` 来源，反之亦然）、只写主机名的条目仍按主机比对、改凭据时发起这次请求的浏览器收到 4402（重连）、其它设备与退出登录后的连接被 4401 关闭）、`AUTOGIT_TRUST_PROXY` 的解析（默认关闭、开 / 关写法、地址列表）与反向代理下的 `Secure` Cookie（登录、滚动续期、退出登录清除三处都带，代理报告明文时不带；开关关闭时 `X-Forwarded-Proto` 一律忽略），以及旧库升级时 `password_changed_at` 的回填，最后自动清理。
 
-`client:check` 用 `window` / `WebSocket` / `fetch` 三个桩件跑前端会话生命周期的 6 项断言：实时连接收到 `4401`（改凭据、退出登录、会话过期）时广播一次 `autogit:unauthorized` 并停止重连；其它关闭码先按 5 分钟节流核对一次会话（会话已失效同样广播）再退避重连，会话仍有效时不广播；受保护接口（含 `PUT /api/auth/credentials`）返回 `401` 时广播失效，而公开的登录 / 会话查询 / 退出登录接口返回 `401`（密码错误）与其它状态码（如 `403`）不广播。
+`client:check` 用 `window` / `WebSocket` / `fetch` 三个桩件跑前端会话生命周期的 7 项断言：实时连接收到 `4401`（其他设备改凭据、退出登录、会话过期）时广播一次 `autogit:unauthorized` 并停止重连；收到 `4402`（本机改凭据，新 Cookie 就在同一个响应里）时不广播、只退避重连，登录态原地不动（否则改密码成功会先闪一下登录页）；其它关闭码先按 5 分钟节流核对一次会话（会话已失效同样广播）再退避重连，会话仍有效时不广播；受保护接口（含 `PUT /api/auth/credentials`）返回 `401` 时广播失效，而公开的登录 / 会话查询 / 退出登录接口返回 `401`（密码错误）与其它状态码（如 `403`）不广播。
 
 ### 合并 PR 前：确认分支历史干净
 
@@ -272,6 +272,8 @@ pnpm repo:purge                    # 预演：列出会被改写的对象数量�
 
 1. **改写历史**（有远端写权限时首选）：先 `pnpm repo:purge` 预演（只读，不动任何引用），确认对象数量后 `pnpm repo:purge --apply`；脚本用 git 自带的 `filter-branch` 把 `.pnpm-store` 从整条历史里去掉，先在临时分支上改写、比对 tip 树一字未变才移动真正的分支，旧历史留在 `refs/autogit-backup/<分支>/<时间戳>`（`git update-ref refs/heads/<分支> <备份引用>` 即可回退）。改写完推送并复核：`git fetch origin && git push --force-with-lease origin <分支>`，再跑 `pnpm repo:check` 确认本地可达历史归零。习惯 `git filter-repo` 的话 `git filter-repo --path .pnpm-store --invert-paths` 与脚本等价（`filter-repo` 不随 git 发布，需要自己安装）。
 2. **Squash and merge**：GitHub 的合并按钮选 `Squash and merge`（只取 PR 的最终树），**不要**选 `Create a merge commit` 或 `Rebase and merge`；合并后删除该分支（`refs/pull/<n>` 仍会短暂保留这些对象，之后随 GC 回收）。
+
+**本次收口决策（PR #8，`ai/issue-4-新增登录密码`）**：合并侧走第 2 条 —— 用 `Squash and merge` 合并并删除分支；若希望保留这条分支的逐个提交，必须先在有写权限的环境执行第 1 条（`pnpm repo:purge --apply` 后 `git push --force-with-lease`），确认 `pnpm repo:check` 归零，再改用普通合并。修复代理只改工作树里的源码、不重写历史（沙箱里 `.git` 只读，也没有推送权限），所以这条决策只能落在合并侧：仓库自身无法把已经提交过的对象从 `HEAD` 可达集合里摘掉。
 
 「评审通过只打 `ai/approved`、合并动作留给人工」的约定不变，人工额外要确认的就是这里的合并方式。AutoGit 的修复代理跑在 `.git` 只读、也没有远端写权限的沙箱里，所以第 1 条只能由有推送权限的一侧执行；两条路都没走就合并，等于把这份包缓存写进 `main` 的祖先链。
 

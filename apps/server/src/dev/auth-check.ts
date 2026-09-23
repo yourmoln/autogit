@@ -59,6 +59,8 @@ async function expect(name: string, run: () => Promise<string>): Promise<void> {
 
 /** Close code the server sends when the session behind a socket is gone. */
 const SESSION_GONE_CLOSE_CODE = 4401;
+/** Close code the server sends to the browser that rotated its own credentials. */
+const SESSION_ROTATED_CLOSE_CODE = 4402;
 
 interface RealtimeCloseOutcome {
   closed: boolean;
@@ -1255,7 +1257,25 @@ async function main(): Promise<void> {
     });
 
     let rotatedToken = '';
-    await expect('改凭据后已建立的实时连接被服务端关闭（4401）', async () => {
+    await expect('改凭据只让发起方重连（4402），其他设备的连接被吊销（4401）', async () => {
+      // 另一台设备的会话：它的 Cookie 与发起方不同，改密码后必须真的掉线。
+      const other = await app.inject({
+        method: 'POST',
+        url: '/api/auth/login',
+        payload: { username: 'moln', password: 's3cret-pw-2' },
+      });
+      assert(other.statusCode === 200, `另一台设备登录失败：${other.statusCode}`);
+      const otherToken = cookieToken(other.headers['set-cookie']);
+      const otherUpgrade = await upgradeRealtime(
+        realtimePort,
+        '/api/realtime',
+        cookieHeader(otherToken),
+      );
+      assert(otherUpgrade.upgraded, '另一台设备未能升级实时通道');
+      const otherProbe = otherUpgrade.probe;
+      realtimeProbes.push(otherProbe);
+      assert(await otherProbe.waitForFrame(3_000), '另一台设备的连接没有收到服务端消息');
+
       const result = await upgradeRealtime(
         realtimePort,
         '/api/realtime',
@@ -1277,8 +1297,17 @@ async function main(): Promise<void> {
 
       const outcome = await probe.waitForClose(3_000);
       assert(outcome.closed, '改凭据后旧连接仍然存活');
-      assert(outcome.code === SESSION_GONE_CLOSE_CODE, `关闭码 ${outcome.code}`);
-      return `${SESSION_GONE_CLOSE_CODE} 关闭`;
+      // 发起方拿到的是「重连」而不是「登出」：同一个 200 响应里带着新 Cookie，
+      // 用 4401 关掉它会让用户在改密码成功的一瞬间看到登录页闪一下。
+      assert(outcome.code === SESSION_ROTATED_CLOSE_CODE, `发起方关闭码 ${outcome.code}`);
+
+      const otherOutcome = await otherProbe.waitForClose(3_000);
+      assert(otherOutcome.closed, '另一台设备改凭据后连接仍然存活');
+      assert(
+        otherOutcome.code === SESSION_GONE_CLOSE_CODE,
+        `另一台设备关闭码 ${otherOutcome.code}`,
+      );
+      return `发起方 ${SESSION_ROTATED_CLOSE_CODE}、另一台设备 ${SESSION_GONE_CLOSE_CODE}`;
     });
 
     await expect('轮换后的新会话可继续使用，退出登录时关闭连接（4401）', async () => {

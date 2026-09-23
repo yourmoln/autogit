@@ -11,14 +11,31 @@ export type ConnectionState = 'connecting' | 'online' | 'offline';
  * Close code the server sends when the session behind a socket is gone.
  *
  * `routes/system.ts` closes established connections with it on logout, on a
- * credential change (which revokes every session) and when a reconnect hits an
- * expired session.
+ * credential change made somewhere else (which revokes every session but the
+ * rotating browser) and when a reconnect hits an expired session.
  */
 export const SESSION_GONE_CLOSE_CODE = 4401;
 
 /** `true` when a close means "the cookie is gone", so reconnecting cannot help. */
 export function isSessionGoneCloseCode(code: number): boolean {
   return code === SESSION_GONE_CLOSE_CODE;
+}
+
+/**
+ * Close code the server sends when this browser rotated its own credentials.
+ *
+ * `PUT /api/auth/credentials` revokes every session, including the one the
+ * requesting tab's socket was opened with, and hands that same browser a
+ * replacement cookie. This code therefore means "reconnect with the cookie that
+ * is already on its way" — the login state must not move, otherwise the user sees
+ * the login page flash by in the middle of a successful change. Sessions revoked
+ * from elsewhere still arrive as {@link SESSION_GONE_CLOSE_CODE}.
+ */
+export const SESSION_ROTATED_CLOSE_CODE = 4402;
+
+/** `true` when a close is this browser replacing its own session cookie. */
+export function isSessionRotatedCloseCode(code: number): boolean {
+  return code === SESSION_ROTATED_CLOSE_CODE;
 }
 
 /** How long a live socket may go without refreshing its session cookie. */
@@ -91,6 +108,15 @@ class RealtimeClient {
     socket.onclose = (event: CloseEvent) => {
       if (this.socket === socket) this.socket = null;
       this.setState('offline');
+      // This tab just replaced its own cookie (the credential change it asked
+      // for), so the session behind the socket is gone while the session itself
+      // is not: reconnect with the new cookie instead of signing the tab out.
+      // Backoff starts over because that cookie is already in flight.
+      if (isSessionRotatedCloseCode(event.code)) {
+        this.retry = 0;
+        this.scheduleReconnect();
+        return;
+      }
       // A revoked session (logout elsewhere, credential change, expiry) closes
       // the socket with 4401. The cookie is gone, so the usual backoff would
       // keep reconnecting into `401` forever while the tab still looks signed

@@ -191,6 +191,21 @@ export interface ResolvedAuthSession {
 export type RevokedSessions = readonly string[] | null;
 
 /**
+ * One revocation announcement.
+ *
+ * `rotatedFrom` names the session the announcing request replaces with a fresh
+ * one. `PUT /api/auth/credentials` answers the browser that called it with a
+ * replacement cookie, and that browser shares its token with every tab it has
+ * open, so live streams close those sockets with `4402` ("reconnect, the new
+ * cookie is on its way") instead of `4401` ("you are signed out"). Every other
+ * session is revoked for good.
+ */
+export interface SessionRevocation {
+  revoked: RevokedSessions;
+  rotatedFrom?: string | null;
+}
+
+/**
  * Login gate for the whole app.
  *
  * One credential pair lives in SQLite (`auth_account`), sessions are stored as
@@ -199,7 +214,7 @@ export type RevokedSessions = readonly string[] | null;
  * "one account, no user table".
  */
 export class AuthService {
-  private readonly revocationListeners = new Set<(revoked: RevokedSessions) => void>();
+  private readonly revocationListeners = new Set<(revocation: SessionRevocation) => void>();
   /** Failed logins since the last success; drives the login backoff below. */
   private loginFailures = 0;
   /** Wall clock until which `login()` answers 429 instead of verifying. */
@@ -332,7 +347,7 @@ export class AuthService {
    * Observes revocation, so an already established realtime connection can be
    * closed the moment its session disappears.
    */
-  onSessionRevoked(listener: (revoked: RevokedSessions) => void): () => void {
+  onSessionRevoked(listener: (revocation: SessionRevocation) => void): () => void {
     this.revocationListeners.add(listener);
     return () => {
       this.revocationListeners.delete(listener);
@@ -371,7 +386,9 @@ export class AuthService {
    *
    * The current password is mandatory, and every session is rotated: other
    * browsers are logged out immediately, while the caller receives a fresh
-   * session so it stays signed in on the device where the change happened.
+   * session so it stays signed in on the device where the change happened. The
+   * caller passes the hash of the session it is rotating away from, so its own
+   * sockets can be told to reconnect instead of being signed out.
    */
   updateCredentials(input: {
     currentPassword: string;
@@ -379,6 +396,8 @@ export class AuthService {
     password?: string | null;
     /** Keeps the caller's current "保持登录" preference for the new session. */
     persistent?: boolean;
+    /** Token hash the caller is replacing, i.e. the session behind its own sockets. */
+    rotatedFrom?: string | null;
   }): AuthLoginResult {
     const account = this.store.getAuthAccount();
     if (!account) throw new HttpError(500, '登录账号尚未初始化');
@@ -410,7 +429,7 @@ export class AuthService {
     // Rotate every session: other browsers lose access immediately, and the
     // caller gets a fresh token below.
     this.store.deleteAuthSessions();
-    this.announceRevocation(null);
+    this.announceRevocation({ revoked: null, rotatedFrom: input.rotatedFrom ?? null });
 
     const persistent = input.persistent ?? false;
     const token = randomBytes(32).toString('base64url');
@@ -465,13 +484,13 @@ export class AuthService {
   /** Deletes a session and tells live streams that it is gone. */
   private dropSession(tokenHash: string): void {
     if (this.store.deleteAuthSession(tokenHash) === 0) return;
-    this.announceRevocation([tokenHash]);
+    this.announceRevocation({ revoked: [tokenHash] });
   }
 
-  private announceRevocation(revoked: RevokedSessions): void {
+  private announceRevocation(revocation: SessionRevocation): void {
     for (const listener of [...this.revocationListeners]) {
       try {
-        listener(revoked);
+        listener(revocation);
       } catch {
         // A broken socket must never break a logout or a credential change.
       }

@@ -103,12 +103,23 @@ export function AuthProvider({ children }: { children: ReactNode }): ReactNode {
 
   const updateCredentials = useCallback<AuthContextValue['updateCredentials']>(
     async (input) => {
-      const payload = await api.auth.updateCredentials(input);
-      applyPayload(payload);
-      if (!payload.session) throw new Error('保存响应缺少会话信息');
-      return payload.session;
+      try {
+        const payload = await api.auth.updateCredentials(input);
+        applyPayload(payload);
+        if (!payload.session) throw new Error('保存响应缺少会话信息');
+        return payload.session;
+      } catch (error) {
+        // The rotation revokes the old sessions before it answers, so a request
+        // that fails or never arrives can leave this tab holding a cookie that no
+        // longer exists — and the server no longer closes its socket as "signed
+        // out" either. Ask the server again instead of trusting the cached
+        // session: a live session leaves the state alone, a dead cookie sends the
+        // tab to the login page.
+        await queryClient.invalidateQueries({ queryKey: AUTH_SESSION_KEY }).catch(() => undefined);
+        throw error;
+      }
     },
-    [applyPayload],
+    [applyPayload, queryClient],
   );
 
   const value = useMemo<AuthContextValue>(

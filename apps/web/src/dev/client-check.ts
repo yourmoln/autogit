@@ -7,21 +7,29 @@
  * past the console:
  *
  * - `lib/realtime.ts` reconnecting forever after the server closed the socket
- *   with `4401` (logout elsewhere, credential change, expiry) — the tab kept
- *   looking signed in while every reconnect answered `401`;
+ *   with `4401` (logout, a credential change on another device, expiry) — the tab
+ *   kept looking signed in while every reconnect answered `401`;
+ * - `lib/realtime.ts` treating `4402` — the close the server sends to the browser
+ *   that rotated its *own* credentials — as "signed out", which flashed the login
+ *   page in the middle of a successful change;
  * - `lib/api.ts` skipping the unauthorized broadcast for every `/api/auth/*`
  *   401, including the guarded `PUT /api/auth/credentials`, which only answers
  *   `401` when the session cookie is gone.
  *
- * Both have to end in the `autogit:unauthorized` broadcast the auth context
- * listens for (`AuthProvider` then stops the realtime client and drops the
- * session, so the router bounces back to the login page).
+ * A revoked session has to end in the `autogit:unauthorized` broadcast the auth
+ * context listens for (`AuthProvider` then stops the realtime client and drops
+ * the session, so the router bounces back to the login page); a local rotation
+ * must not, because the session it ends is replaced by the answer to the same
+ * request.
  *
  * Usage: pnpm --filter @autogit/web client:check
  */
 
 /** Event name the auth context listens for; mirrored to catch accidental drift. */
 const UNAUTHORIZED_EVENT_NAME = 'autogit:unauthorized';
+
+/** Close code the server sends to the browser that rotated its own credentials. */
+const SESSION_ROTATED_CLOSE_CODE = 4402;
 
 /** Longest delay the realtime client uses between reconnects. */
 const MAX_RECONNECT_DELAY_MS = 15_000;
@@ -187,7 +195,9 @@ globals.fetch = fetchStub;
 const nodeProcess = (globalThis as unknown as { process: { exitCode?: number } }).process;
 
 const { UNAUTHORIZED_EVENT } = await import('../lib/session-events.js');
-const { realtime } = await import('../lib/realtime.js');
+const { SESSION_ROTATED_CLOSE_CODE: CLIENT_ROTATED_CLOSE_CODE, realtime } = await import(
+  '../lib/realtime.js'
+);
 const { ApiRequestError, api } = await import('../lib/api.js');
 
 /** Waits for the promise chains behind a stubbed request. */
@@ -237,6 +247,10 @@ async function main(): Promise<void> {
   assert(
     UNAUTHORIZED_EVENT === UNAUTHORIZED_EVENT_NAME,
     `会话失效事件名变了：${UNAUTHORIZED_EVENT}`,
+  );
+  assert(
+    CLIENT_ROTATED_CLOSE_CODE === SESSION_ROTATED_CLOSE_CODE,
+    `轮换关闭码变了：${CLIENT_ROTATED_CLOSE_CODE}`,
   );
 
   console.log('\n实时连接：');
@@ -289,6 +303,38 @@ async function main(): Promise<void> {
 
     realtime.stop();
     return '广播 1 次，未重连';
+  });
+
+  await expect('收到 4402（本机改凭据）→ 不广播失效，用新会话立即重连', async () => {
+    realtime.stop();
+    resetTimers();
+    StubWebSocket.instances.length = 0;
+    broadcasts = 0;
+    advanceClock(6);
+    routes.set('/api/auth/session', { status: 200, payload: LIVE_SESSION });
+
+    realtime.start();
+    const socket = StubWebSocket.instances[0];
+    assert(socket, 'start() 没有建立实时连接');
+    socket.serverOpen();
+    await flush();
+    assert(unauthorizedCount() === 0, '连接建立时的正常会话被误判为失效');
+
+    // 改凭据时服务端先关掉发起方的连接，新 Cookie 随后才随 200 响应到达：
+    // 这个关闭帧说明「换一个 Cookie 再连」，不是「你被登出了」。
+    socket.serverClose(SESSION_ROTATED_CLOSE_CODE);
+    assert(unauthorizedCount() === 0, `本机轮换被当成会话失效（广播 ${unauthorizedCount()} 次）`);
+    const reconnects = pendingReconnects();
+    assert(reconnects.length === 1, `轮换后没有安排重连：${reconnects.length} 个定时器`);
+    const timer = reconnects[0];
+    assert(timer, '没有重连定时器');
+    assert(timer.delayMs <= 1_000, `轮换后的重连被拖慢到 ${timer.delayMs}ms`);
+    runTimer(timer);
+    await flush();
+    assert(StubWebSocket.instances.length === 2, '轮换后没有重新建立连接');
+
+    realtime.stop();
+    return '0 次广播，重连 1 次';
   });
 
   await expect('普通断开且会话仍有效时不广播，仍退避重连', async () => {

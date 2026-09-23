@@ -119,6 +119,10 @@ export function registerAuthRoutes(app: FastifyInstance, ctx: AppContext): void 
       username: body.username ?? null,
       password: body.password ?? null,
       persistent: request.authSession?.persistent ?? false,
+      // The sockets of this very browser are told to reconnect instead of being
+      // signed out: they share the cookie this request replaces, and the answer
+      // below carries its replacement.
+      rotatedFrom: request.authSessionHash,
     });
     sendSessionCookie(reply, result, isSecureRequest(request));
     ctx.store.addActivity({

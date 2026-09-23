@@ -84,7 +84,7 @@ PR 正文由 `buildPullRequestBody()` 生成，按仓库约定固定包含 `## �
 
 ## 4. Provider 抽象
 
-`GitProvider` 接口把三个平台的差异收敛成 16 个方法（用户、仓库、标签、Issue、评论、PR、Git 认证头）。共同点：
+`GitProvider` 接口把三个平台的差异收敛成 17 个方法（用户、仓库、标签、Issue、评论、PR 的读写，含 `updatePullRequest` 改写已有 PR 的标题/正文，以及 Git 认证头）。共同点：
 
 - 使用 `fetch` + 统一重试（429/5xx，最多 3 次），超时 30s；
 - 未配置代理时走平台 `fetch`；配置了代理则改走 `util/proxy-http.ts` 的代理客户端（HTTP 绝对形式 / CONNECT 隧道 / SOCKS5），行为与重试策略一致；
@@ -112,6 +112,18 @@ PR 正文由 `buildPullRequestBody()` 生成，按仓库约定固定包含 `## �
 工作区是可丢弃的克隆，切换分支前先把它恢复成干净状态：常规路径 `clean -fd` + `reset --hard` 丢掉上一次运行留下的改动与未跟踪文件；失败或 `checkout` 仍然被挡时升级为强制清理 —— `clean -fdx`、回滚未完成的 merge/rebase/cherry-pick、删除残留的 `.git/*.lock` —— 再重试一次 `checkout --force`。克隆与 `fetch` 遇到网络类错误（连接重置、超时、5xx）或 ref 抢锁（`cannot lock ref` / `unable to update local ref`，重试时会重新读取引用）会退避重试 2 次，认证与权限错误依旧立即失败。
 
 `CodexService.modelProbe()` 是唯一的可用性判据：用固定提示词执行一次最小的 `codex exec`（只读沙箱、`--ephemeral`，跑在 AutoGit 数据目录里），按退出码与输出判断模型能否响应，结果缓存 5 分钟。同一时刻只跑一次探测，并在进行中时报告 `probing`：`POST /api/codex/invalidate`（「重新检测」）只清缓存、把探测放到后台，避免请求最长阻塞 3 分钟，`POST /api/codex/probe`（「测试模型响应」）才会等待结果；两个入口都会在探测结束后写入活动记录。AutoGit 不读取 `auth.json`，也不判断登录态 —— 凭证与授权全由 Codex CLI 自己管理。
+
+### 修复代理的动作通道
+
+修复代理在沙箱里只能改文件，但评审意见不一定都能靠改文件解决。两类常见意见——PR 标题不合规、分支历史里误提交了包缓存——如果只能由人工处理，`review → fix` 就会一直空转（线上 PR #8 连续 20 轮后才以失败收场）。因此 AutoGit 把「模型决定、AutoGit 执行」做成一条显式通道：
+
+- 代理在总结末尾附一个 `autogit` JSON 代码块（`prTitle` / `prBody` / `purgePaths` / `reason`，字段都可省略）。解析按**整行**查找围栏（`services/fix-actions.ts`），因为代理给出的正文里通常还有 ```` ```mermaid ```` 代码块——用惰性正则匹配第一个结束围栏会把 JSON 截断并静默丢弃整个请求。
+- 校验通过后由 AutoGit 执行：标题/正文走 Provider 的 `updatePullRequest`（标题先按 `<英文类型>: <描述>` 归一化，正文必须含 `## 实现假设清单` 与 `## 代码逻辑图` 各一次，否则忽略并记日志）；`purgePaths` 走 `WorkspaceManager.purgePathsFromHistory()`。
+- `purgePathsFromHistory()` 只改写 `<merge base>..HEAD`（本分支自己新增的提交），因为 `git filter-branch` 会重建它走到的每个提交、重建会丢 `gpgsig`，把基准分支的提交也一并重建会让合并基准后退、把可合并的 PR 变成有冲突的。改写后两条不变量必须成立：tip 的**树**逐字节不变、与基准分支的**合并基准**不变；任何一条不成立就 `reset --hard` 回原 tip 并抛错，分支绝不移动。强推沿用统一的 `--force-with-lease`。
+- 执行结果会写进任务日志、任务总结与 PR 留言；「本轮没有文件改动但执行了动作」仍算有进展，PR 回到 `ai/needs-review`。
+- 既没有文件改动、也没有动作请求的修复任务**不判失败**：任务记为成功并带上代理给出的理由，PR 打 `ai/stuck` 交回人工，避免继续空转。
+
+PR 标题与正文本身也归 AutoGit 维护：`services/pr-metadata.ts` 提供纯函数规则（类型前缀归一化、必需小节校验/抽取/剔除），`Orchestrator` 在创建 PR 时补齐类型前缀，并在每轮修复结束时再校验一次（代理通过动作块给出的内容优先，其次才是 AutoGit 的兜底修正）。
 
 ## 6. 前端
 

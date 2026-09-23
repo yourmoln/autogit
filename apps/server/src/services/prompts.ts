@@ -20,6 +20,41 @@ const WORK_RULES = `工作规范：
 4. 如果仓库提供了测试 / 类型检查脚本，运行与改动相关的部分并修复失败。
 5. 不要执行 git commit、git push、git checkout，AutoGit 会统一处理版本控制。`;
 
+/**
+ * PR title and body belong to AutoGit, not to the agents.
+ *
+ * A fix agent has no platform credentials and cannot change them, so a review
+ * that blocks on the title (or on missing body sections) deadlocks the loop:
+ * the reviewer keeps asking, every fix run correctly reports nothing to change
+ * in the repository. AutoGit therefore repairs both itself at the end of each
+ * run, and both prompts say so.
+ */
+const PR_METADATA_NOTE = `PR 的标题与正文由 AutoGit 自动维护：标题会补成 \`<英文类型>: <描述>\`，正文保证包含 \`## 实现假设清单\` 与 \`## 代码逻辑图\` 两节（每轮任务结束时自动修正）。`;
+
+/**
+ * The agent's escape hatch for everything its sandbox cannot do.
+ *
+ * File edits are not the only kind of finding: a review can also demand a
+ * compliant PR title or a branch history without the committed package cache.
+ * Both need credentials the agent does not have, so it asks AutoGit to run them
+ * instead of being blocked — the model still decides what should happen.
+ */
+const FIX_ACTION_CHANNEL = `## 你做不到的事：交给 AutoGit 执行
+你在沙箱里只能改文件。如果某条意见需要修改 PR 标题/正文，或需要把误提交的路径（例如包缓存目录）从本分支历史里删掉，不要放弃，也不要用无意义的文件改动去凑：在总结最后附一个 \`\`\`autogit 代码块，AutoGit 会用凭据替你执行。
+
+\`\`\`autogit
+{
+  "prTitle": "feat: 期望的最终标题（不需要就省略）",
+  "prBody": "完整正文，必须包含 ## 实现假设清单 与 ## 代码逻辑图 各一次（不需要就省略）",
+  "purgePaths": [".pnpm-store"],
+  "reason": "为什么需要这些动作"
+}
+\`\`\`
+
+- \`purgePaths\` 只会把该路径从**本分支自己新增的提交**（合并基准之后）里删除，且必须保证 tip 的树内容不变，随后由 AutoGit 强推；
+- 整个代码块必须是**合法 JSON**：换行写成 JSON 的 \`\\n\` 转义（不要出现真正的多行字符串），正文里可以照常包含 \`\`\`mermaid 代码块；
+- 只有确实需要、并且你已经核实过时才写进这个块；不需要就完全不要写这个块。`;
+
 function truncate(text: string, max: number): string {
   if (text.length <= max) return text;
   return `${text.slice(0, max)}\n…（内容已截断）`;
@@ -68,6 +103,8 @@ ${commentsSection(input.comments)}
 5. 当前工作分支是 ${input.branch}，不要切换分支。
 
 ${WORK_RULES}
+
+${PR_METADATA_NOTE}
 
 ## 输出要求
 最后用中文输出一段简短总结，要求覆盖本次分支上的全部改动（不要只描述其中一部分），包含：
@@ -167,7 +204,8 @@ ${input.diff}
 2. 你可以读取工作区中的完整代码验证 diff，也可以运行构建、测试、lint 来确认结论。
 3. 只有存在真实缺陷时才给 needs_fix；风格偏好或可选优化记为 minor，不作为阻塞项。
 4. 不要修改任何文件，只做评审。
-5. 按给定的 JSON Schema 输出结论（verdict / summary / issues / tests），issues 中每条都要能直接指导修复。`;
+5. 按给定的 JSON Schema 输出结论（verdict / summary / issues / tests），issues 中每条都要能直接指导修复。
+6. ${PR_METADATA_NOTE}所以标题格式、正文小节这类问题记为 minor 并在总结里说明即可，不要作为 needs_fix 的阻塞理由。`;
 }
 
 /** Human-readable shape of `REVIEW_SCHEMA`, restated in the repair prompt. */
@@ -249,9 +287,13 @@ ${truncate(input.reviewComment, 8000)}
 2. 补齐或更新对应测试，避免同类问题回归。
 3. 当前分支已经是 ${pullRequest.headRef}，直接在该分支上修改，不要切换分支。
 4. 完成后运行相关验证命令。
+5. 如果某条意见属于平台元数据（PR 标题不合规、正文缺少小节），不需要改动仓库文件：${PR_METADATA_NOTE}需要改的话按下面的动作块交给 AutoGit。
+6. 如果所有意见都不落在仓库文件上，优先用下面的动作块让 AutoGit 执行；确实无法执行（例如需要人工决定的事）才把理由写清楚，AutoGit 会按「无需改动」记录并交回人工确认。
+
+${FIX_ACTION_CHANNEL}
 
 ${WORK_RULES}
 
 ## 输出要求
-最后用中文输出：每条评审意见的处理结论（已修复 / 不适用 + 原因）、验证命令与结果、剩余风险。`;
+最后用中文输出：每条评审意见的处理结论（已修复 / 不适用 + 原因）、验证命令与结果、剩余风险；并用 \`## 实现假设清单\`（列出本轮修复依赖的假设，没有额外假设就明确写明）与 \`## 代码逻辑图\`（mermaid 代码块）两节收尾，AutoGit 会用它们维护 PR 正文。`;
 }

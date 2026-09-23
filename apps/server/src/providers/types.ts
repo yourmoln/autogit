@@ -56,6 +56,17 @@ export interface CreatePullRequestInput {
   draft?: boolean;
 }
 
+/**
+ * Fields AutoGit may rewrite on an existing pull request.
+ *
+ * A fix agent runs in a sandbox without platform credentials, so the title and
+ * body of a PR it is asked to "fix" can only be changed here, by AutoGit.
+ */
+export interface UpdatePullRequestInput {
+  title?: string;
+  body?: string;
+}
+
 export interface CreateLabelInput {
   name: string;
   color: string;
@@ -94,6 +105,11 @@ export interface GitProvider {
   getPullRequest(ref: RepoRef, number: number): Promise<RemotePullRequest>;
   findPullRequestByHead(ref: RepoRef, headRef: string): Promise<RemotePullRequest | null>;
   createPullRequest(ref: RepoRef, input: CreatePullRequestInput): Promise<RemotePullRequest>;
+  updatePullRequest(
+    ref: RepoRef,
+    number: number,
+    input: UpdatePullRequestInput,
+  ): Promise<RemotePullRequest>;
 
   /** Value for `git -c http.extraHeader=<value>`, or null when unsupported. */
   gitAuthorizationHeader(): string | null;

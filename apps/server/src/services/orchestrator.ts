@@ -24,14 +24,24 @@ import {
 import type { RuntimeConfig } from '../config.js';
 import type { RepositoryRecord, Store, TaskLookup } from '../db/store.js';
 import { isApiError } from '../providers/http.js';
-import type { GitProvider, RepoRef } from '../providers/index.js';
+import type { GitProvider, RepoRef, UpdatePullRequestInput } from '../providers/index.js';
 import { childLogger } from '../util/logger.js';
 import { taskDirectory } from '../util/paths.js';
 import { idStamp, nowIso, slugify } from '../util/time.js';
 import type { CodexService } from './codex.js';
 import type { EventBus } from './events.js';
-import { buildGitEnv } from './git.js';
+import { describeFixActions, type FixActions, parseFixActions } from './fix-actions.js';
+import { buildGitEnv, shortSha } from './git.js';
 import type { LabelService } from './labels.js';
+import {
+  ASSUMPTIONS_SECTION,
+  bodyProblems,
+  conventionalTitle,
+  DIAGRAM_SECTION,
+  dropSections,
+  extractSection,
+  titleProblem,
+} from './pr-metadata.js';
 import {
   buildFixPrompt,
   buildImplementPrompt,
@@ -1466,22 +1476,71 @@ export class Orchestrator {
       provider,
       log,
     );
-    if (!commit.committed) {
-      throw new Error('修复任务没有产生文件改动，可能评审意见已被处理或需要人工确认。');
+
+    // Whatever the agent could not do itself (change the PR title/body, rewrite
+    // the branch) it asks for in an `autogit` block; AutoGit runs those here.
+    const requested = parseFixActions(result.summary);
+    for (const problem of requested.problems) {
+      this.appendLog(entry.taskId, 'stderr', `动作请求已忽略：${problem}`);
+    }
+    const executed = await this.executeFixActions({
+      taskId: entry.taskId,
+      provider,
+      ref,
+      cwd,
+      pullRequest,
+      actions: requested.actions,
+      log,
+    });
+
+    // Safety net for what AutoGit itself wrote: the default title template and
+    // the generated body can still break the repository convention, and the
+    // review would keep asking for them. The agent's own request wins.
+    const synced = await this.syncPullRequestMetadata({
+      repository,
+      provider,
+      ref,
+      pullRequest: executed.pullRequest,
+      issue,
+      summary: requested.actions.prBody ?? result.summary,
+      files: commit.files,
+      log,
+    });
+
+    const changes = [...executed.changes, ...synced.changes];
+    if (!commit.committed && changes.length === 0) {
+      await this.closeFixWithoutChanges(entry, {
+        repository,
+        provider,
+        ref,
+        prNumber,
+        pullRequest: synced.pullRequest,
+        summary: result.summary,
+      });
+      return;
     }
 
-    await workspace.pushBranch(cwd, pullRequest.headRef, provider, log, { force: true });
-    const fresh = await provider.getPullRequest(ref, prNumber);
-    await this.transitionPull(repository.id, provider, ref, fresh, 'ai/needs-review', {
+    if (commit.committed || executed.rewritten) {
+      await workspace.pushBranch(cwd, pullRequest.headRef, provider, log, { force: true });
+    }
+    await this.transitionPull(repository.id, provider, ref, synced.pullRequest, 'ai/needs-review', {
       clearStuck: true,
     });
+
+    const head = commit.committed
+      ? `提交：\`${shortSha(commit.sha) || 'unknown'}\`\n文件：${commit.files.length} 个`
+      : '本轮提交：无（文件未变）';
+    const actionList =
+      changes.length > 0
+        ? `\n\n### AutoGit 代为执行的动作\n\n${changes.map((item) => `- ${item}`).join('\n')}`
+        : '';
     await provider.createComment(
       ref,
       prNumber,
-      `${AI_MARKER}\n## 🛠️ AI 已提交修复\n\n提交：\`${commit.sha?.slice(0, 7) ?? 'unknown'}\`\n文件：${commit.files.length} 个\n\n任务已完成，重新进入 AI 评审队列。\n\n<details><summary>修复总结</summary>\n\n${result.summary.slice(0, 4000)}\n\n</details>`,
+      `${AI_MARKER}\n## 🛠️ AI 已提交修复\n\n${head}${actionList}\n\n任务已完成，重新进入 AI 评审队列。\n\n<details><summary>修复总结</summary>\n\n${result.summary.slice(0, 4000)}\n\n</details>`,
     );
 
-    this.finishTask(entry.taskId, 'succeeded', result.summary, {
+    this.finishTask(entry.taskId, 'succeeded', `${result.summary}${actionList}`, {
       prNumber,
       prUrl: pullRequest.htmlUrl,
     });
@@ -1490,6 +1549,223 @@ export class Orchestrator {
       scope: 'fix',
       repositoryId: repository.id,
       message: `PR #${prNumber} 修复完成，已转回 ai/needs-review`,
+    });
+  }
+
+  /**
+   * Executes the actions a fix agent asked for.
+   *
+   * Everything here needs credentials the agent's sandbox does not have, so the
+   * model decides and AutoGit carries it out: the PR title/body through the
+   * provider API, and a history purge through a bounded `filter-branch` plus the
+   * ordinary force-with-lease push. Requests that fail validation are logged and
+   * skipped rather than failing the run — the agent's file edits stay valid.
+   */
+  private async executeFixActions(input: {
+    taskId: string;
+    provider: GitProvider;
+    ref: RepoRef;
+    cwd: string;
+    pullRequest: RemotePullRequest;
+    actions: FixActions;
+    log: TaskLogger;
+  }): Promise<{ changes: string[]; rewritten: boolean; pullRequest: RemotePullRequest }> {
+    const { provider, ref, actions, log } = input;
+    const changes: string[] = [];
+    let current = input.pullRequest;
+
+    const requested = describeFixActions(actions);
+    if (requested.length > 0) {
+      log('system', `修复代理请求 AutoGit 执行：${requested.join('；')}`);
+    }
+
+    const metadataChanges: string[] = [];
+    const patch: UpdatePullRequestInput = {};
+    if (actions.prTitle) {
+      const complained = titleProblem(actions.prTitle);
+      const next = complained ? conventionalTitle(actions.prTitle) : actions.prTitle;
+      const remaining = titleProblem(next);
+      if (remaining) {
+        log('stderr', `已忽略标题修改请求：${remaining}`);
+      } else if (next !== current.title) {
+        patch.title = next;
+        metadataChanges.push(`标题「${current.title}」→「${next}」`);
+      }
+    }
+    if (actions.prBody) {
+      const problems = bodyProblems(actions.prBody);
+      if (problems.length > 0) {
+        log('stderr', `已忽略正文替换请求：${problems.join('；')}`);
+      } else if (actions.prBody !== current.body) {
+        patch.body = actions.prBody;
+        metadataChanges.push('正文按修复代理的请求替换');
+      }
+    }
+    if (metadataChanges.length > 0) {
+      try {
+        current = await provider.updatePullRequest(ref, current.number, patch);
+        changes.push(...metadataChanges);
+        log('system', `已按修复代理的请求修改 PR：${metadataChanges.join('；')}`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        log('stderr', `按请求修改 PR 失败：${message}`);
+      }
+    }
+
+    let rewritten = false;
+    if (actions.purgePaths.length > 0) {
+      try {
+        const result = await this.deps.workspace.purgePathsFromHistory(
+          input.cwd,
+          `origin/${current.baseRef}`,
+          actions.purgePaths,
+          provider,
+          log,
+        );
+        if (result.rewritten) {
+          rewritten = true;
+          changes.push(
+            `分支历史已改写：\`${shortSha(result.from)}\` → \`${shortSha(result.to)}\`（${actions.purgePaths
+              .map((item) => `\`${item}\``)
+              .join('、')} 不再可达，tip 树保持不变）`,
+          );
+        } else {
+          log('system', `分支历史里没有可删除的 ${actions.purgePaths.join('、')}，未改写`);
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        log('stderr', `改写分支历史失败：${message}`);
+      }
+    }
+
+    if (actions.reason) log('system', `代理给出的理由：${actions.reason}`);
+    return { changes, rewritten, pullRequest: current };
+  }
+
+  /**
+   * Keeps the PR title and body aligned with the repository convention.
+   *
+   * Neither field is a repository file: the default title template renders
+   * `新增登录密码 (#4)`, which breaks the mandatory `<英文类型>: <描述>` rule,
+   * and a fix agent has no credentials to change it. Without this the pipeline
+   * deadlocks — the review keeps demanding a compliant title while every fix
+   * run correctly reports "nothing to change in the repository".
+   *
+   * The patch is only sent when something is genuinely wrong (a compliant
+   * title or body is never touched, so hand-written bodies that keep the
+   * required sections survive), and every applied change is logged and
+   * returned so the caller can report it to the reviewer.
+   */
+  private async syncPullRequestMetadata(input: {
+    repository: RepositoryRecord;
+    provider: GitProvider;
+    ref: RepoRef;
+    pullRequest: RemotePullRequest;
+    issue: RemoteIssue | null;
+    summary: string;
+    files: string[];
+    log: TaskLogger;
+  }): Promise<{ changes: string[]; pullRequest: RemotePullRequest }> {
+    const { provider, ref, pullRequest } = input;
+    const patch: UpdatePullRequestInput = {};
+    const changes: string[] = [];
+
+    const problem = titleProblem(pullRequest.title);
+    if (problem) {
+      const normalized = conventionalTitle(pullRequest.title);
+      if (normalized && normalized !== pullRequest.title) {
+        patch.title = normalized;
+        changes.push(`标题「${pullRequest.title}」→「${normalized}」：${problem}`);
+      }
+    }
+
+    const problems = bodyProblems(pullRequest.body);
+    if (problems.length > 0) {
+      // A rebuild with no fresh file list keeps the previous one, so a run that
+      // changed nothing does not blank out the `## 改动文件` section.
+      const files = input.files.length > 0 ? input.files : listFromSection(pullRequest.body);
+      const body = buildPullRequestBody(
+        input.issue,
+        input.summary,
+        files,
+        input.repository.defaultBranch,
+      );
+      if (body !== pullRequest.body) {
+        patch.body = body;
+        changes.push(`正文：${problems.join('；')}`);
+      }
+    }
+
+    if (changes.length === 0) return { changes, pullRequest };
+
+    try {
+      const updated = await provider.updatePullRequest(ref, pullRequest.number, patch);
+      input.log('system', `已修正 PR 标题/正文：${changes.join('；')}`);
+      return { changes, pullRequest: updated };
+    } catch (error) {
+      // A failed metadata patch must not fail the run: any file changes are
+      // still valid, and the next round (or a human) can retry the rest.
+      const message = error instanceof Error ? error.message : String(error);
+      input.log('stderr', `修正 PR 标题/正文失败：${message}`);
+      return { changes: [], pullRequest };
+    }
+  }
+
+  /**
+   * Closes a fix run that changed nothing at all.
+   *
+   * Reached only when the agent edited no file *and* asked for no action — in
+   * other words, when it concluded the findings are already handled or need
+   * something AutoGit cannot do either. That used to fail the task, which
+   * surfaced as an error badge and parked the PR even though the agent was
+   * right; now the run is recorded as a success carrying the agent's reasoning,
+   * and the PR waits for a human instead of spinning through review → fix
+   * forever.
+   */
+  private async closeFixWithoutChanges(
+    entry: QueueEntry,
+    input: {
+      repository: RepositoryRecord;
+      provider: GitProvider;
+      ref: RepoRef;
+      prNumber: number;
+      pullRequest: RemotePullRequest;
+      summary: string;
+    },
+  ): Promise<void> {
+    const { repository, provider, ref, prNumber, pullRequest, summary } = input;
+    const prUrl = pullRequest.htmlUrl;
+
+    // Nothing at all changed: explain why and hand the decision to a human.
+    // The label stays on `ai/needs-fix` so the next person sees where the
+    // pipeline stopped, and the task is *not* a failure.
+    const reason = [
+      '本轮修复没有改动任何文件：评审意见可能已经被处理，或只能由人工/合并侧执行（例如改写分支历史、修改仓库之外的东西）。',
+      '',
+      '自动流水线在此等待人工确认，确认后请移除 `ai/stuck`。',
+      '',
+      '修复代理给出的理由：',
+      '',
+      summary.trim().slice(0, 2000),
+    ].join('\n');
+    await this.markStuck(
+      repository.id,
+      provider,
+      ref,
+      { number: prNumber, labels: pullRequest.labels, isPullRequest: true },
+      reason,
+    );
+    this.finishTask(
+      entry.taskId,
+      'succeeded',
+      `${summary}\n\n---\n\n本轮修复没有产生文件改动：已记录理由并转人工确认（PR 内容未变，任务不判失败）。`,
+      { prNumber, prUrl },
+    );
+    this.deps.store.addActivity({
+      level: 'warning',
+      scope: 'fix',
+      repositoryId: repository.id,
+      message: `PR #${prNumber} 修复没有产生文件改动，已说明理由并转人工确认`,
     });
   }
 
@@ -1772,57 +2048,20 @@ function buildVerificationHints(repository: RepositoryRecord): string[] {
 }
 
 /** Pull request sections the repository convention requires in every PR body. */
-const ASSUMPTIONS_HEADING = '实现假设清单';
-const DIAGRAM_HEADING = '代码逻辑图';
+const ASSUMPTIONS_HEADING = ASSUMPTIONS_SECTION;
+const DIAGRAM_HEADING = DIAGRAM_SECTION;
 
 /** Used when the implement agent did not report any assumption of its own. */
 const FALLBACK_ASSUMPTIONS = '- 无额外假设：按 Issue 描述与仓库既有约定实现。';
 
-/** Title of a Markdown heading line, `null` when the line is not a heading. */
-function headingTitle(line: string): string | null {
-  const match = line.match(/^\s*#{1,6}\s*(.+?)\s*$/);
-  // A trailing ":" / "：" is common when a model writes headings by hand.
-  return match?.[1] ? match[1].replace(/[:：]\s*$/, '') : null;
-}
-
-/**
- * Reads one `## 标题` section out of the implement agent's summary.
- *
- * The summary is free-form prose written by the model, so both required PR
- * sections are extracted by their heading and the rest stays in 改动说明.
- */
+/** Section rules live in `pr-metadata.ts`, next to the title rules. */
 function extractSummarySection(summary: string, heading: string): string | null {
-  const lines = summary.split(/\r?\n/);
-  const start = lines.findIndex((line) => headingTitle(line) === heading);
-  if (start === -1) return null;
-
-  const body: string[] = [];
-  for (const line of lines.slice(start + 1)) {
-    if (headingTitle(line) !== null) break;
-    body.push(line);
-  }
-
-  const text = body.join('\n').trim();
-  return text.length > 0 ? text : null;
+  return extractSection(summary, heading);
 }
 
 /** Drops the extracted sections so they are not repeated in 改动说明. */
 function withoutSummarySections(summary: string, headings: string[]): string {
-  const kept: string[] = [];
-  let skipping = false;
-
-  for (const line of summary.split(/\r?\n/)) {
-    const title = headingTitle(line);
-    if (title !== null) {
-      skipping = headings.includes(title);
-      if (skipping) continue;
-    } else if (skipping) {
-      continue;
-    }
-    kept.push(line);
-  }
-
-  return kept.join('\n').trim();
+  return dropSections(summary, headings);
 }
 
 /**
@@ -1831,10 +2070,11 @@ function withoutSummarySections(summary: string, headings: string[]): string {
  * Only used when the implement agent reported no diagram of its own: the
  * repository convention wants 代码逻辑图 in every PR body, non-empty.
  */
-function buildPipelineDiagram(issue: RemoteIssue, baseBranch: string): string {
+function buildPipelineDiagram(issue: RemoteIssue | null, baseBranch: string): string {
+  const source = issue ? `Issue #${issue.number} 打上 ai/todo` : 'Issue 打上 ai/todo';
   return `\`\`\`mermaid
 flowchart TD
-    A["Issue #${issue.number} 打上 ai/todo"] --> B["Orchestrator 轮询领取"]
+    A["${source}"] --> B["Orchestrator 轮询领取"]
     B --> C["Codex 实现改动并运行验证"]
     C --> D["提交并推送分支"]
     D --> E["创建 PR → ai/needs-review"]
@@ -1856,29 +2096,38 @@ function buildCommitMessage(issue: RemoteIssue, summary: string): string {
 }
 
 export function renderTitle(template: string, issue: RemoteIssue): string {
-  return template
+  const rendered = template
     .replaceAll('{issueTitle}', issue.title)
-    .replaceAll('{issueNumber}', String(issue.number))
-    .slice(0, 250);
+    .replaceAll('{issueNumber}', String(issue.number));
+  // The default template renders `新增登录密码 (#4)`, so every AutoGit PR used
+  // to start out breaking the `<英文类型>: <描述>` rule its own reviews enforce.
+  return conventionalTitle(rendered).slice(0, 250) || rendered.slice(0, 250);
 }
 
+/**
+ * Body of every AutoGit PR.
+ *
+ * `## 实现假设清单` and `## 代码逻辑图` are mandatory and must appear exactly
+ * once with content; the agent's own sections are reused when it wrote them,
+ * and otherwise AutoGit states the assumption explicitly and draws the
+ * pipeline view of this PR, so neither section is ever a placeholder.
+ */
 export function buildPullRequestBody(
-  issue: RemoteIssue,
+  issue: RemoteIssue | null,
   summary: string,
   files: string[],
   baseBranch: string,
 ): string {
-  const list = files.slice(0, 40).join('\n');
+  const list = files.slice(0, 40).join('\n') || '（本轮没有文件改动）';
   const assumptions = extractSummarySection(summary, ASSUMPTIONS_HEADING) ?? FALLBACK_ASSUMPTIONS;
   const diagram =
     extractSummarySection(summary, DIAGRAM_HEADING) ?? buildPipelineDiagram(issue, baseBranch);
   const description =
     withoutSummarySections(summary, [ASSUMPTIONS_HEADING, DIAGRAM_HEADING]) ||
     '由 AutoGit 自动生成。';
-
   return `## 关联 Issue
 
-Closes #${issue.number}
+${issue ? `Closes #${issue.number}` : '（未找到关联 Issue）'}
 
 ## 改动说明
 
@@ -1905,6 +2154,16 @@ ${list}
 - 本 PR 由 AI 自动创建，评审通过后会打上 \`ai/approved\`，需要人工确认后再合并。
 
 ${AI_MARKER}`;
+}
+
+/** File list from an existing `## 改动文件` block, used when a rebuild has no fresh list. */
+function listFromSection(body: string): string[] {
+  const section = extractSection(body, '改动文件');
+  if (!section) return [];
+  return section
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith('```'));
 }
 
 export function renderReviewComment(verdict: ReviewVerdict, durationMs: number): string {

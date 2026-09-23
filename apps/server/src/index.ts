@@ -1,80 +1,12 @@
-import { existsSync } from 'node:fs';
+import { buildServer } from './app.js';
+import { applyDefaultNodeEnv, loadRuntimeConfig } from './config.js';
+import { logger } from './util/logger.js';
 
-import cors from '@fastify/cors';
-import fastifyStatic from '@fastify/static';
-import websocket from '@fastify/websocket';
-import Fastify, { type FastifyInstance } from 'fastify';
-import { ensureRuntimeDirectories, loadRuntimeConfig } from './config.js';
-import { type AppContext, createContext } from './context.js';
-import { ApiError } from './providers/index.js';
-import { registerRoutes } from './routes/index.js';
-import { HttpError } from './util/http.js';
-import { initLogger, logger } from './util/logger.js';
-
-async function buildServer(config: ReturnType<typeof loadRuntimeConfig>): Promise<{
-  app: FastifyInstance;
-  ctx: AppContext;
-}> {
-  ensureRuntimeDirectories(config);
-  initLogger(config.logLevel, config.isDev);
-
-  const ctx = createContext(config);
-  const app = Fastify({
-    logger: false,
-    bodyLimit: 8 * 1024 * 1024,
-  });
-
-  await app.register(cors, {
-    origin: true,
-    credentials: true,
-  });
-  await app.register(websocket);
-
-  if (config.webDist && existsSync(config.webDist)) {
-    await app.register(fastifyStatic, {
-      root: config.webDist,
-      prefix: '/',
-      wildcard: false,
-    });
-  }
-
-  registerRoutes(app, ctx);
-
-  // SPA fallback: everything that is not an API call renders the web app.
-  app.setNotFoundHandler((request, reply) => {
-    if (request.url.startsWith('/api/')) {
-      return reply.code(404).send({ error: `接口不存在：${request.method} ${request.url}` });
-    }
-    if (config.webDist && existsSync(config.webDist)) {
-      return reply.sendFile('index.html');
-    }
-    return reply
-      .code(404)
-      .send({ error: '前端尚未构建，请先执行 pnpm build 或使用 pnpm dev:web 启动开发服务器。' });
-  });
-
-  app.setErrorHandler((error: unknown, request, reply) => {
-    const message = error instanceof Error ? error.message : String(error);
-
-    if (error instanceof HttpError) {
-      return reply.code(error.statusCode).send({ error: error.message });
-    }
-    if (error instanceof ApiError) {
-      return reply.code(502).send({ error: `${error.message}：${error.detail}` });
-    }
-    const rawStatus = (error as { statusCode?: unknown }).statusCode;
-    if (typeof rawStatus === 'number' && rawStatus >= 400 && rawStatus < 600) {
-      return reply.code(rawStatus).send({ error: message });
-    }
-    logger().error({ err: error, url: request.url }, '请求处理失败');
-    return reply.code(500).send({ error: message || '服务器内部错误' });
-  });
-
-  return {
-    app,
-    ctx,
-  };
-}
+// `pnpm start` runs this module from the compiled bundle without setting
+// `NODE_ENV`, while `pnpm dev` loads the TypeScript source through tsx: the
+// compiled entry defaults to production so the documented self-hosted start
+// gets the strict realtime origin policy. An explicit `NODE_ENV` still wins.
+applyDefaultNodeEnv(import.meta.url);
 
 async function main(): Promise<void> {
   const config = loadRuntimeConfig();

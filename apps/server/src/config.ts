@@ -28,6 +28,30 @@ export interface RuntimeConfig {
   defaultPollSeconds: number;
   defaultMaxConcurrent: number;
   defaultMaxConcurrentPerRepo: number;
+  /**
+   * Extra origins the realtime upgrade and the write gate accept although they
+   * do not name the host the request arrived on (reverse proxies that rewrite
+   * `Host`, or a dev server on another machine). See `util/origin.ts`.
+   */
+  allowedOrigins: string[];
+  /**
+   * Origins of the local Vite dev console (`AUTOGIT_DEV_ORIGINS`), trusted only
+   * while {@link RuntimeConfig.isDev} is set. Empty in production, so a
+   * self-hosted instance accepts same-origin handshakes and writes plus
+   * `AUTOGIT_ALLOWED_ORIGINS` and nothing else. See `util/origin.ts`.
+   */
+  devOrigins: string[];
+  /**
+   * Fastify `trustProxy`, driven by `AUTOGIT_TRUST_PROXY`.
+   *
+   * When a reverse proxy terminates TLS, this process sees `http` while the
+   * browser used `https`, so `request.protocol` answers `http` and the session
+   * cookie loses `Secure`. Turning the switch on makes Fastify honor
+   * `X-Forwarded-Proto` (see `routes/auth.ts` for the cookie); `false` (the
+   * default) keeps the header ignored, so a directly reachable instance cannot
+   * be tricked into setting `Secure` by anyone who can send that header.
+   */
+  trustProxy: boolean | string;
   isDev: boolean;
   repoRoot: string;
 }
@@ -52,9 +76,116 @@ function resolveWebDist(): string | null {
   return existsSync(candidate) ? candidate : null;
 }
 
+/** Splits a comma separated env var into trimmed, non empty entries. */
+function splitList(value: string | undefined): string[] {
+  return (value ?? '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+}
+
+/**
+ * `AUTOGIT_ALLOWED_ORIGINS=https://a.example,https://b.example` →
+ * `['https://a.example', 'https://b.example']`.
+ *
+ * `util/origin.ts` compares the listed entries as complete origins: an entry
+ * that names a scheme only matches that scheme (`https://a.example` no longer
+ * accepts `http://a.example`), which is why the docs spell the scheme out. A
+ * bare `host[:port]` entry keeps the older host-only meaning.
+ */
+function resolveAllowedOrigins(): string[] {
+  return splitList(process.env.AUTOGIT_ALLOWED_ORIGINS);
+}
+
+/** Values of `AUTOGIT_TRUST_PROXY` that switch the option on / off. */
+const TRUST_PROXY_ON = new Set(['1', 'true', 'yes', 'on']);
+const TRUST_PROXY_OFF = new Set(['0', 'false', 'no', 'off']);
+
+/**
+ * `AUTOGIT_TRUST_PROXY` → Fastify's `trustProxy`.
+ *
+ * `1` / `true` trusts `X-Forwarded-Proto` (and `X-Forwarded-For`) from every
+ * hop, which is what a single reverse proxy on the same host needs. A value
+ * that is neither on nor off is handed to Fastify as an address list
+ * (`127.0.0.1,::1`), so only those proxies may set the forwarded headers —
+ * the narrow form, and the one to prefer when the backend port is reachable
+ * from more than the proxy.
+ */
+function resolveTrustProxy(): boolean | string {
+  const raw = process.env.AUTOGIT_TRUST_PROXY?.trim();
+  if (!raw) return false;
+  const normalized = raw.toLowerCase();
+  if (TRUST_PROXY_ON.has(normalized)) return true;
+  if (TRUST_PROXY_OFF.has(normalized)) return false;
+  return raw;
+}
+
+/** Origins the local Vite dev server is served from unless told otherwise. */
+const DEFAULT_DEV_ORIGINS = ['http://localhost:5173', 'http://127.0.0.1:5173'];
+
+/**
+ * Origins the Vite dev console is reached from.
+ *
+ * Vite proxies `/api` with `changeOrigin: true`, so the backend sees
+ * `Origin: http://localhost:5173` next to `Host: 127.0.0.1:4711` and a strict
+ * same-origin comparison would lock the dev console out of its realtime channel
+ * and reject every write it makes. The allowance is deliberately narrower than
+ * "any loopback origin" (the previous behaviour): a page served on *any* other
+ * local port is same-site for `127.0.0.1`, so the `SameSite=Lax` session cookie
+ * travels with its requests — the WebSocket handshake that would read task logs,
+ * and the body-less `POST`s that would start a poll or a restart.
+ * `AUTOGIT_DEV_ORIGINS`
+ * replaces the defaults — list the port Vite actually bound when 5173 was
+ * taken. The entries are compared as complete origins, so a dev server served
+ * over HTTPS belongs here as `https://localhost:5173`; `http://…` and `https://…`
+ * of the same host are different origins (see `util/origin.ts`).
+ *
+ * Development only: production ignores this variable, list extra origins in
+ * `AUTOGIT_ALLOWED_ORIGINS` there.
+ */
+function resolveDevOrigins(isDev: boolean): string[] {
+  if (!isDev) return [];
+  const configured = splitList(process.env.AUTOGIT_DEV_ORIGINS);
+  return configured.length > 0 ? configured : [...DEFAULT_DEV_ORIGINS];
+}
+
+/**
+ * `true` when a module url names JavaScript emitted by the build (`dist`)
+ * instead of TypeScript source loaded by `tsx`.
+ */
+export function isCompiledEntry(entryUrl: string): boolean {
+  try {
+    return /\.(?:[cm]?js)$/i.test(new URL(entryUrl).pathname);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Defaults `NODE_ENV` for a process that never set it.
+ *
+ * `pnpm start` runs `node dist/index.js` and `pnpm dev` runs `tsx
+ * src/index.ts`, but only the first is the documented production start, and npm
+ * scripts cannot portably export `NODE_ENV`. Left to the old implicit default
+ * (`NODE_ENV !== 'production'`), a self-hosted install that follows the README
+ * silently ran the development policy, which also trusted the loopback origins
+ * of a dev server. A compiled entry therefore defaults to `production`; an
+ * explicit `NODE_ENV` always wins and the TypeScript entry keeps the
+ * development default.
+ */
+export function applyDefaultNodeEnv(
+  /** `import.meta.url` of the executing entry point, not of this module. */
+  entryUrl: string,
+  env: Record<string, string | undefined> = process.env,
+): void {
+  if (env.NODE_ENV?.trim()) return;
+  if (isCompiledEntry(entryUrl)) env.NODE_ENV = 'production';
+}
+
 export function loadRuntimeConfig(): RuntimeConfig {
   const home = resolveHome();
   const codexHome = process.env.CODEX_HOME?.trim() || path.join(homedir(), '.codex');
+  const isDev = process.env.NODE_ENV !== 'production';
 
   return {
     home,
@@ -72,7 +203,10 @@ export function loadRuntimeConfig(): RuntimeConfig {
     defaultPollSeconds: asNumber(process.env.AUTOGIT_POLL_SECONDS, 45),
     defaultMaxConcurrent: asNumber(process.env.AUTOGIT_MAX_CONCURRENT, 2),
     defaultMaxConcurrentPerRepo: asNumber(process.env.AUTOGIT_MAX_CONCURRENT_PER_REPO, 1),
-    isDev: process.env.NODE_ENV !== 'production',
+    allowedOrigins: resolveAllowedOrigins(),
+    devOrigins: resolveDevOrigins(isDev),
+    trustProxy: resolveTrustProxy(),
+    isDev,
     repoRoot,
   };
 }

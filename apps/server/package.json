@@ -8,13 +8,14 @@
     "dev": "tsx watch --clear-screen=false src/index.ts",
     "simulate": "tsx src/dev/simulate.ts",
     "proxy:check": "tsx src/dev/proxy-check.ts",
+    "auth:check": "tsx src/dev/auth-check.ts",
+    "title:check": "tsx src/dev/title-check.ts",
     "build": "tsup",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
     "@autogit/shared": "workspace:*",
-    "@fastify/cors": "^11.3.0",
     "@fastify/static": "^10.1.4",
     "@fastify/websocket": "^11.3.1",
     "fastify": "^5.12.5",

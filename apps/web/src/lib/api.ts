@@ -2,6 +2,8 @@ import type {
   Account,
   ActivityEntry,
   AppSettings,
+  AuthCredentialsPayload,
+  AuthSessionPayload,
   CodexConfigPayload,
   CodexInstallState,
   CodexModelProbe,
@@ -22,6 +24,8 @@ import type {
   TaskStatus,
 } from '@autogit/shared';
 
+import { notifyUnauthorized } from './session-events.js';
+
 export class ApiRequestError extends Error {
   constructor(
     readonly status: number,
@@ -30,6 +34,20 @@ export class ApiRequestError extends Error {
     super(message);
     this.name = 'ApiRequestError';
   }
+}
+
+/**
+ * Public auth endpoints, whose `401` is an ordinary credential error.
+ *
+ * Everything else — `PUT /api/auth/credentials` included, it sits behind the
+ * login gate — answers `401` only when the session cookie is gone, so that
+ * status has to reach the auth context.
+ */
+const PUBLIC_AUTH_ROUTES = new Set(['/api/auth/login', '/api/auth/session', '/api/auth/logout']);
+
+/** `true` for the public auth routes above (query string ignored). */
+export function isPublicAuthRoute(path: string): boolean {
+  return PUBLIC_AUTH_ROUTES.has(path.split('?')[0] ?? path);
 }
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
@@ -59,6 +77,14 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
       payload && typeof payload === 'object' && 'error' in payload
         ? String((payload as { error: unknown }).error)
         : `请求失败（HTTP ${response.status}）`;
+    // The session cookie expired (or was revoked elsewhere): tell the auth
+    // context so the router can bounce back to the login page. Only the public
+    // auth endpoints answer 401 for a credential mistake (wrong password,
+    // missing session); the guarded ones (`/api/auth/credentials`) mean the
+    // session is gone and must not be swallowed by a path prefix check.
+    if (response.status === 401 && !isPublicAuthRoute(path)) {
+      notifyUnauthorized();
+    }
     throw new ApiRequestError(response.status, message);
   }
   return payload as T;
@@ -99,6 +125,26 @@ export interface AccountListPayload {
 
 export const api = {
   health: () => request<{ ok: boolean; version: string; node: string }>('/api/health'),
+
+  auth: {
+    session: () => request<AuthSessionPayload>('/api/auth/session'),
+    login: (body: { username: string; password: string; remember: boolean }) =>
+      request<AuthSessionPayload>('/api/auth/login', {
+        method: 'POST',
+        body: JSON.stringify(body),
+      }),
+    logout: () => request<{ ok: boolean }>('/api/auth/logout', { method: 'POST' }),
+    updateCredentials: (body: {
+      currentPassword: string;
+      username?: string | null;
+      /** 留空表示不修改密码。 */
+      password?: string | null;
+    }) =>
+      request<AuthCredentialsPayload>('/api/auth/credentials', {
+        method: 'PUT',
+        body: JSON.stringify(body),
+      }),
+  },
 
   overview: () => request<OverviewPayload>('/api/system/overview'),
   activity: (limit = 80) =>

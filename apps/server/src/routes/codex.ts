@@ -122,11 +122,23 @@ export function registerCodexRoutes(app: FastifyInstance, ctx: AppContext): void
       if (!prNumber) throw new HttpError(400, '缺少 prNumber');
       const pullRequest = await provider.getPullRequest(ref, prNumber);
       const comments = await provider.listComments(ref, prNumber);
-      const digests = comments.map((comment) => ({
-        author: comment.author,
-        body: comment.body,
-        createdAt: comment.createdAt,
-      }));
+      // Inline comments are a separate resource, and the prompt preview must
+      // show the same discussion the real run gets.
+      const inline = await provider.listReviewComments(ref, prNumber).catch(() => []);
+      const digests = [
+        ...comments.map((comment) => ({
+          author: comment.author,
+          body: comment.body,
+          createdAt: comment.createdAt,
+        })),
+        ...inline.map((comment) => ({
+          author: comment.author,
+          body: comment.path
+            ? `\`${comment.path}${comment.line ? `:${comment.line}` : ''}\`\n${comment.body}`
+            : comment.body,
+          createdAt: comment.createdAt,
+        })),
+      ];
 
       const prompt =
         kind === 'review'
@@ -142,6 +154,11 @@ export function registerCodexRoutes(app: FastifyInstance, ctx: AppContext): void
               pullRequest,
               issue: null,
               reviewComment: digests.at(-1)?.body ?? '（没有找到评审评论）',
+              inlineComments: inline.map((comment) => ({
+                path: comment.path ?? null,
+                line: comment.line ?? null,
+                body: comment.body,
+              })),
               diffStat: '（预览模式下不包含真实 diffstat）',
             });
 

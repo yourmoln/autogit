@@ -30,6 +30,7 @@
 | 一键初始化标签 | 在目标仓库创建/校正全部 15 个 `ai/*` 标签（颜色、描述、单选语义） |
 | Issue 自动实现 | `ai/todo` → 领取 → `ai/doing` → Codex 实现 → 分支推送 → 创建 PR → `ai/needs-review` |
 | PR 自动评审 | 结构化评审结论（JSON Schema），通过 → `ai/approved`，有问题 → `ai/needs-fix` |
+| 行内评审评论 | 结论里能定位到代码行的 issue 直接贴在对应行上（GitHub / Gitea / Gitee），锚定不到或平台拒绝时退回汇总评论 |
 | 自动修复回路 | 按评审意见修复并回推分支，修复完成自动回到 `ai/needs-review` |
 | 合并后处理 | 检测到 PR 合并 → Issue 转 `ai/verify`，等待人工验证关闭 |
 | 阻塞与暂停 | 失败自动打 `ai/stuck` 并留言原因；`ai/paused` 人工暂停，轮询器跳过 |

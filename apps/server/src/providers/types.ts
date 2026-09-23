@@ -70,6 +70,27 @@ export interface LabelTargetInput {
   isPullRequest: boolean;
 }
 
+/**
+ * One inline (line level) review comment.
+ *
+ * Platforms disagree on how a line is addressed: GitHub takes the line number
+ * of the new file version, Gitea the same number under a misleading
+ * `new_position` field, and Gitee a position inside the patch. `diffPosition`
+ * therefore travels next to `line` so a provider can use whichever one it
+ * needs without re-parsing the diff.
+ */
+export interface CreateReviewCommentInput {
+  body: string;
+  /** Repository relative path of the commented file, without `a/` or `b/`. */
+  path: string;
+  /** Line number in the new version of the file. */
+  line: number;
+  /** 1-based index of that line in the raw diff of the file. */
+  diffPosition: number;
+  /** Head commit the comment should be anchored to, when the platform wants it. */
+  commitId: string | null;
+}
+
 export interface GitProvider {
   readonly kind: ProviderKind;
   readonly baseUrl: string;
@@ -88,6 +109,13 @@ export interface GitProvider {
   getIssue(ref: RepoRef, number: number): Promise<RemoteIssue>;
   listComments(ref: RepoRef, number: number): Promise<Comment[]>;
   createComment(ref: RepoRef, number: number, body: string): Promise<Comment>;
+  /** Inline review comments (`path` / `line` filled in); `[]` when unsupported. */
+  listReviewComments(ref: RepoRef, number: number): Promise<Comment[]>;
+  createReviewComment(
+    ref: RepoRef,
+    number: number,
+    input: CreateReviewCommentInput,
+  ): Promise<Comment>;
   setLabels(ref: RepoRef, target: LabelTargetInput): Promise<void>;
 
   listPullRequests(ref: RepoRef, options?: ListPullRequestOptions): Promise<RemotePullRequest[]>;

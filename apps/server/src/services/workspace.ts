@@ -628,6 +628,26 @@ export class WorkspaceManager {
     return result.stdout.trim();
   }
 
+  /**
+   * Raw patch of the branch against its base, used to resolve the lines an
+   * inline review comment may be anchored to. `diffAgainstBase()` prepends a
+   * stat block and truncates, which would silently shift or drop hunks, so the
+   * anchors are computed from this untouched patch instead.
+   */
+  async diffPatch(
+    dir: string,
+    baseRef: string,
+    provider: GitProvider,
+    maxChars = 2_000_000,
+  ): Promise<string> {
+    const result = await git(['diff', '--no-color', `${baseRef}...HEAD`], {
+      cwd: dir,
+      ...this.netFor(provider),
+    });
+    if (result.code !== 0) return '';
+    return result.stdout.length > maxChars ? result.stdout.slice(0, maxChars) : result.stdout;
+  }
+
   async currentBranch(dir: string, provider: GitProvider): Promise<string> {
     const result = await git(['rev-parse', '--abbrev-ref', 'HEAD'], {
       cwd: dir,

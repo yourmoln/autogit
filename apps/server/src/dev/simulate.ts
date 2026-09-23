@@ -58,6 +58,8 @@ interface StubState {
   issues: Map<number, RemoteIssue>;
   pullRequests: Map<number, RemotePullRequest>;
   comments: Map<number, Comment[]>;
+  /** Inline (line anchored) review comments, kept apart from the comments above. */
+  reviewComments: Map<number, Comment[]>;
   nextCommentId: number;
 }
 
@@ -70,6 +72,7 @@ class StubProvider implements GitProvider {
     issues: new Map(),
     pullRequests: new Map(),
     comments: new Map(),
+    reviewComments: new Map(),
     nextCommentId: 1,
   };
   private nextPullRequest = 1;
@@ -167,6 +170,31 @@ class StubProvider implements GitProvider {
       url: null,
     };
     this.state.comments.set(number, [...(this.state.comments.get(number) ?? []), comment]);
+    return comment;
+  }
+
+  async listReviewComments(_ref: RepoRef, number: number): Promise<Comment[]> {
+    return this.state.reviewComments.get(number) ?? [];
+  }
+
+  async createReviewComment(
+    _ref: RepoRef,
+    number: number,
+    input: { body: string; path: string; line: number },
+  ): Promise<Comment> {
+    const comment: Comment = {
+      id: String(this.state.nextCommentId++),
+      author: 'autogit-bot',
+      body: input.body,
+      createdAt: new Date().toISOString(),
+      url: null,
+      path: input.path,
+      line: input.line,
+    };
+    this.state.reviewComments.set(number, [
+      ...(this.state.reviewComments.get(number) ?? []),
+      comment,
+    ]);
     return comment;
   }
 
@@ -275,6 +303,8 @@ class SimulationRunner extends EngineRunner {
   verdictRepairs = 0;
   /** How many following implement runs fail, to exercise the retry budget. */
   failImplementTimes = 0;
+  /** Prompt of the most recent fix run, so the inline findings can be asserted. */
+  lastFixPrompt: string | null = null;
   /** Wall-clock deadline every following run waits for before doing its work. */
   private holdUntil = 0;
 
@@ -324,7 +354,9 @@ class SimulationRunner extends EngineRunner {
             title: '缺少标题行',
             detail: 'feature.txt 需要包含一行标题，便于后续渲染。',
             file: 'src/feature.txt',
-            line: null,
+            // Resolvable against the diff, so the finding becomes an inline
+            // comment instead of a bullet in the summary comment.
+            line: 1,
             suggestion: '在第一行写入 "AutoGit Feature"。',
           },
         ],
@@ -352,6 +384,7 @@ class SimulationRunner extends EngineRunner {
     }
 
     if (input.prompt.includes('修复代理')) {
+      this.lastFixPrompt = input.prompt;
       input.log('command', '$ write src/feature.txt');
       writeFileSync(
         path.join(input.cwd, 'src', 'feature.txt'),
@@ -682,6 +715,25 @@ async function main(): Promise<void> {
     '实现代理没给出两节时，PR 正文也必须补全且非空',
   );
   log.warn('PR 正文：实现假设清单 / 代码逻辑图两节齐全（含回落路径）✅');
+
+  const inlineComments = provider.state.reviewComments.get(pr.number) ?? [];
+  assert(inlineComments.length === 1, `评审应当留下 1 条行内评论，实际 ${inlineComments.length}`);
+  assert(
+    inlineComments[0]?.path === 'src/feature.txt' && inlineComments[0]?.line === 1,
+    `行内评论应当锚定在 src/feature.txt:1，实际 ${inlineComments[0]?.path}:${inlineComments[0]?.line}`,
+  );
+  const reviewSummary = (provider.state.comments.get(pr.number) ?? []).find((comment) =>
+    comment.body.includes('AI 评审'),
+  );
+  assert(
+    reviewSummary?.body.includes('`src/feature.txt:1`') === true,
+    '汇总评论应当列出已发布的行内评论与锚点',
+  );
+  assert(
+    runner.lastFixPrompt?.includes('src/feature.txt:1') === true,
+    '修复任务的提示词应当带上行内评论及其锚点',
+  );
+  log.warn('行内评论场景通过：评审问题贴在 src/feature.txt:1，修复任务读取到该评论 ✅');
 
   const branch = pr.headRef;
   const files = git(['ls-tree', '--name-only', '-r', `refs/heads/${branch}`], bareRepo)

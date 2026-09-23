@@ -14,6 +14,7 @@ import {
   basicAuthHeader,
   type CreateLabelInput,
   type CreatePullRequestInput,
+  type CreateReviewCommentInput,
   type GitProvider,
   type LabelTargetInput,
   type ListIssueOptions,
@@ -88,6 +89,30 @@ interface GiteaComment {
   user?: GiteaUser | null;
   created_at: string;
   html_url?: string;
+}
+
+interface GiteaPullReview {
+  id: number;
+  body?: string | null;
+  state?: string;
+  /** Number of code comments in this review; 0 for a plain review body. */
+  comments_count?: number;
+  commit_id?: string | null;
+  submitted_at?: string | null;
+  html_url?: string;
+  user?: GiteaUser | null;
+}
+
+interface GiteaReviewComment {
+  id: number;
+  body: string;
+  user?: GiteaUser | null;
+  created_at: string;
+  html_url?: string;
+  path?: string | null;
+  /** Line number in the new file version (Gitea calls it a position). */
+  position?: number | null;
+  original_position?: number | null;
 }
 
 function normalizeBaseUrlFor(raw: string): string {
@@ -324,6 +349,73 @@ export class GiteaProvider implements GitProvider {
       body: comment.body ?? body,
       createdAt: comment.created_at,
       url: comment.html_url ?? null,
+    };
+  }
+
+  async listReviewComments(ref: RepoRef, number: number): Promise<Comment[]> {
+    // Gitea has no endpoint that lists every code comment of a pull request:
+    // reviews are listed first and each one then queried for its comments.
+    const reviews = await this.client.paginate<GiteaPullReview>(
+      `/repos/${ref.owner}/${ref.name}/pulls/${number}/reviews`,
+      { perPageParam: 'limit', limit: 50 },
+    );
+
+    const comments: Comment[] = [];
+    for (const review of reviews) {
+      if ((review.comments_count ?? 0) <= 0) continue;
+      const chunk = await this.client.paginate<GiteaReviewComment>(
+        `/repos/${ref.owner}/${ref.name}/pulls/${number}/reviews/${review.id}/comments`,
+        { perPageParam: 'limit', limit: 100 },
+      );
+      for (const comment of chunk) {
+        comments.push({
+          id: String(comment.id),
+          author: comment.user?.login ?? 'unknown',
+          body: comment.body ?? '',
+          createdAt: comment.created_at,
+          url: comment.html_url ?? null,
+          path: comment.path ?? null,
+          line: comment.position ?? comment.original_position ?? null,
+        });
+      }
+    }
+    return comments;
+  }
+
+  async createReviewComment(
+    ref: RepoRef,
+    number: number,
+    input: CreateReviewCommentInput,
+  ): Promise<Comment> {
+    // Gitea anchors a code comment by line number of the file version, even
+    // though the field is named `new_position` (`old_position` covers deleted
+    // lines). A review is the only write endpoint that accepts them.
+    const review = await this.client.post<GiteaPullReview>(
+      `/repos/${ref.owner}/${ref.name}/pulls/${number}/reviews`,
+      {
+        body: {
+          event: 'COMMENT',
+          body: '',
+          ...(input.commitId ? { commit_id: input.commitId } : {}),
+          comments: [
+            {
+              path: input.path,
+              body: input.body,
+              new_position: input.line,
+              old_position: 0,
+            },
+          ],
+        },
+      },
+    );
+    return {
+      id: String(review?.id ?? Date.now()),
+      author: review?.user?.login ?? 'autogit',
+      body: input.body,
+      createdAt: review?.submitted_at ?? new Date().toISOString(),
+      url: review?.html_url ?? null,
+      path: input.path,
+      line: input.line,
     };
   }
 

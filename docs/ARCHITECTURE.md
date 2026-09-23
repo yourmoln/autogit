@@ -84,12 +84,13 @@ PR 正文由 `buildPullRequestBody()` 生成，按仓库约定固定包含 `## �
 
 ## 4. Provider 抽象
 
-`GitProvider` 接口把三个平台的差异收敛成 16 个方法（用户、仓库、标签、Issue、评论、PR、Git 认证头）。共同点：
+`GitProvider` 接口把三个平台的差异收敛成 18 个方法（用户、仓库、标签、Issue、会话评论、行内评审评论、PR、Git 认证头）。共同点：
 
 - 使用 `fetch` + 统一重试（429/5xx，最多 3 次），超时 30s；
 - 未配置代理时走平台 `fetch`；配置了代理则改走 `util/proxy-http.ts` 的代理客户端（HTTP 绝对形式 / CONNECT 隧道 / SOCKS5），行为与重试策略一致；
 - 分页统一走 `ApiClient.paginate()`，兼容 `per_page` 与 `limit` 两种参数名；
 - 标签写入统一使用「替换语义」的接口（`PUT .../labels`），避免增量操作产生的竞态；
+- 行内评审评论统一走 `listReviewComments()` / `createReviewComment()`：调用方先按 diff 解析出可锚定的行（`util/diff-anchors.ts`），再交给平台写入；三个平台的行号口径不同，由各自 Provider 换算；
 - Git 认证头由 Provider 提供（GitHub 用 `x-access-token`、Gitea/Gitee 用 `用户名:Token` 的 Basic 认证）。
 
 平台差异（端点、颜色格式、Gitee 的 `access_token` 查询参数、PR 标签端点兜底）见 [PROVIDERS.md](PROVIDERS.md)。
@@ -104,6 +105,9 @@ PR 正文由 `buildPullRequestBody()` 生成，按仓库约定固定包含 `## �
 4. 从 `--output-last-message` 文件（或最后一条 agent 消息）提取结论；
 5. 评审任务附加 `--output-schema`，用 JSON Schema 强制 `{verdict, summary, issues[], tests}` 结构；
 6. 结论解析先做 JSON 提取、再做 `VERDICT:` 文本启发式（容忍 `approve` / `needs-fix` / 中文“通过”等写法）；仍然解析不出结论时，把模型上一次的输出回灌给它，要求只重新序列化结论（最多 2 次），全部失败才判定评审任务失败。
+7. 结论里带 `file` / `line` 的 issue 会在 `git diff --no-color base...HEAD` 的原始 patch 上解析成锚点（行号一律取**新文件**版本，重复出现在 hunk 头里的行号不算），能锚定的逐条发成行内评论（单次上限 20 条），其余留在汇总评论；写行内评论失败只记日志、不影响评审任务本身，所以三个平台都不会因为某条评论被拒而丢失结论。
+
+行内评论与会话评论在两个资源里：GitHub 的 `issues/{n}/comments` 根本不返回它们，Gitea 要按 review 逐个查询。因此把评审意见回灌给模型时（复审的「已有讨论」、修复任务的提示词）统一走 `listComments()` + `listReviewComments()` 合并后的讨论列表，否则修复代理看不到贴在代码行上的意见。
 
 `WorkspaceManager` 负责所有 git 操作：克隆（首次）、`fetch --prune`、`checkout -B`、`reset --hard`、`clean -fd`、`commit`、`push`。提交身份、`commit.gpgsign=false`、`core.longpaths=true` 都在工作区内单独配置，不污染用户全局 git 配置。
 

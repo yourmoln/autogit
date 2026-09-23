@@ -1540,25 +1540,29 @@ export class Orchestrator {
     // status label, so a human can see where the run stopped and hand it back.
     const finalLabels = alreadyStuck ? target.labels : [...new Set([...target.labels, 'ai/stuck'])];
 
-    if (!alreadyStuck) {
-      await provider.setLabels(ref, {
-        number: target.number,
-        labels: finalLabels,
-        isPullRequest: target.isPullRequest,
-      });
-      await provider.createComment(
-        ref,
-        target.number,
-        `${AI_MARKER}\n## ⛔ AI 流水线已阻塞\n\n${reason}`,
-      );
-    }
-
+    // The labels are mirrored into the local snapshot as well: the retry gate
+    // (`withRetryState`) and the boards read that snapshot, and the poller may
+    // be a full `pollSeconds` away — without the write-back the retry button
+    // stayed disabled until the next round even though the task was stuck.
     this.deps.store.setItemLabels({
       repositoryId,
       number: target.number,
       labels: finalLabels,
       isPullRequest: target.isPullRequest,
     });
+
+    if (alreadyStuck) return;
+
+    await provider.setLabels(ref, {
+      number: target.number,
+      labels: finalLabels,
+      isPullRequest: target.isPullRequest,
+    });
+    await provider.createComment(
+      ref,
+      target.number,
+      `${AI_MARKER}\n## ⛔ AI 流水线已阻塞\n\n${reason}`,
+    );
   }
 
   private async handleFailure(entry: QueueEntry, message: string): Promise<void> {

@@ -28,7 +28,7 @@ import websocket from '@fastify/websocket';
 import Fastify from 'fastify';
 
 import { ensureRuntimeDirectories, loadRuntimeConfig } from '../config.js';
-import type { AppContext } from '../context.js';
+import { createContext, type AppContext } from '../context.js';
 import { Db } from '../db/database.js';
 import { migrate } from '../db/migrations.js';
 import { Store } from '../db/store.js';
@@ -266,36 +266,9 @@ class SimulationRunner extends EngineRunner {
   reviewRounds = 0;
   /** How often a review had to be asked to re-output its verdict. */
   verdictRepairs = 0;
-  private nextRunGate: Promise<void> | null = null;
-  private pendingFailure: string | null = null;
-
-  /**
-   * Test helper: holds the next agent run until `gate` resolves, so a task can
-   * be observed while it is genuinely running.
-   */
-  holdNextRun(gate: Promise<void>): void {
-    this.nextRunGate = gate;
-  }
-
-  /** Test helper: makes the next agent run fail with `message`. */
-  failNextRun(message: string): void {
-    this.pendingFailure = message;
-  }
 
   override async run(input: EngineRunInput): Promise<EngineRunResult> {
     const started = Date.now();
-    const gate = this.nextRunGate;
-    if (gate) {
-      this.nextRunGate = null;
-      await gate;
-    }
-    if (input.signal?.aborted) return cancelled(started);
-    if (this.pendingFailure) {
-      const message = this.pendingFailure;
-      this.pendingFailure = null;
-      input.log('stderr', `模拟：${message}`);
-      return failed(message, started);
-    }
     mkdirSyncIfNeeded(input.cwd);
 
     // The first review answers in prose, so the parser cannot read a verdict and
@@ -365,6 +338,45 @@ flowchart LR
 \`\`\``,
       started,
     );
+  }
+}
+
+/**
+ * Fake agent with the two hooks the regression checks need: a run can be held
+ * open (so a task can be observed while it is `running`) or made to fail once.
+ */
+class GatedSimulationRunner extends SimulationRunner {
+  private nextRunGate: Promise<void> | null = null;
+  private pendingFailure: string | null = null;
+
+  /**
+   * Holds the next agent run until `gate` resolves, so a task can be observed
+   * while it is genuinely running.
+   */
+  holdNextRun(gate: Promise<void>): void {
+    this.nextRunGate = gate;
+  }
+
+  /** Makes the next agent run fail with `message`. */
+  failNextRun(message: string): void {
+    this.pendingFailure = message;
+  }
+
+  override async run(input: EngineRunInput): Promise<EngineRunResult> {
+    const started = Date.now();
+    const gate = this.nextRunGate;
+    if (gate) {
+      this.nextRunGate = null;
+      await gate;
+    }
+    if (input.signal?.aborted) return cancelled(started);
+    if (this.pendingFailure) {
+      const message = this.pendingFailure;
+      this.pendingFailure = null;
+      input.log('stderr', `模拟：${message}`);
+      return failed(message, started);
+    }
+    return super.run(input);
   }
 }
 
@@ -485,7 +497,7 @@ async function main(): Promise<void> {
   Object.assign(providers, { forAccount: () => provider });
 
   const codex = new CodexService(config, settings, events);
-  const runner = new SimulationRunner(config, settings, codex);
+  const runner = new GatedSimulationRunner(config, settings, codex);
   const workspace = new WorkspaceManager(config, settings);
   const labels = new LabelService({ store, providers, events });
   const orchestrator = new Orchestrator({
@@ -500,10 +512,12 @@ async function main(): Promise<void> {
     labels,
   });
 
-  // The regression checks below go through the real HTTP routes, so the
-  // simulation wires them up exactly like `index.ts` does (minus static files).
-  const ctx: AppContext = {
-    config,
+  // 回归检查走真实 HTTP 路由，上下文按 index.ts 的方式由 createContext 建好，
+  // 再把模拟自建的实例装进去：以后 AppContext 新增服务时这里不用跟着改，
+  // 这些路由也不会用到它们之外的接口。
+  const ctx: AppContext = createContext(config);
+  ctx.db.close(); // 模拟用自己的 db / store
+  Object.assign(ctx, {
     db,
     store,
     settings,
@@ -515,7 +529,7 @@ async function main(): Promise<void> {
     workspace,
     orchestrator,
     dispose: () => orchestrator.stop(),
-  };
+  });
   const app = Fastify({ logger: false });
   await app.register(websocket);
   registerSystemRoutes(app, ctx);
@@ -664,12 +678,14 @@ async function main(): Promise<void> {
   const succeeded = tasks.filter((task) => task.status === 'succeeded').length;
   assert(succeeded >= 4, `期望至少 4 个成功任务（实现/评审/修复/复审），实际 ${succeeded}`);
 
+  orchestrator.stop();
+
   // ---------------------------------------------------------- 回归：评审意见
 
   // ① 任务失败后，本地快照必须立刻带上 ai/stuck：重试按钮依赖它判断可用性，
   //    而下一轮轮询（默认 45s）之前没人会刷新它。
-  const retryIssue = provider.seedIssue({
-    number: 3,
+  const stuckIssue = provider.seedIssue({
+    number: 7,
     title: '验证失败后的重试门禁',
     body: '该 Issue 的实现任务会被模拟为失败，用于验证本地快照与 ai/stuck 同步。',
     labels: ['ai/todo'],
@@ -679,16 +695,23 @@ async function main(): Promise<void> {
   await waitForIdle(orchestrator, store, 60_000);
 
   const failedTask = store
-    .listTasks({ repositoryId: repository.id, limit: 5 })
-    .find((task) => task.status === 'failed');
+    .listTasks({ repositoryId: repository.id, limit: 50 })
+    .find(
+      (task) =>
+        task.kind === 'implement' &&
+        task.issueNumber === stuckIssue.number &&
+        task.status === 'failed',
+    );
   if (!failedTask) throw new Error('断言失败：期望一个失败任务，但最近的任务都不是 failed');
-  const retrySnapshot = store.listIssues(repository.id).find((row) => row.number === 3);
+  const retrySnapshot = store
+    .listIssues(repository.id)
+    .find((row) => row.number === stuckIssue.number);
   assert(retrySnapshot?.labels.includes('ai/stuck') === true, '失败后本地快照应立即包含 ai/stuck');
   assert(
     withRetryState(store, [failedTask])[0]?.retryable === true,
     '失败后重试门禁应立即放行，无需等待下一轮轮询',
   );
-  log.warn(`回归 ①：失败后 Issue #${retryIssue.number} 的本地快照立即同步 ai/stuck ✅`);
+  log.warn(`回归 ①：失败后 Issue #${stuckIssue.number} 的本地快照立即同步 ai/stuck ✅`);
 
   // ② “重新检测”不得内联等待模型探测（最长 3 分钟）：请求立即返回并报告
   //    探测进行中，结果由状态接口跟进，且并发请求复用同一次模型调用。
@@ -785,7 +808,7 @@ async function main(): Promise<void> {
   log.warn('回归 ③：重启保留内存队列，不再误报“服务重启中断” ✅');
 
   await app.close();
-  orchestrator.stop();
+  orchestrator.stop(); // 回归 ③ 用 restart() 拉起过调度器，这里停掉计时器
   db.close();
   rmSync(root, { recursive: true, force: true });
   log.warn('=== 模拟通过：Issue → PR → 评审 → 修复 → 复审 → 合并 ✅ ===');

@@ -113,7 +113,7 @@ PR 正文由 `buildPullRequestBody()` 生成，按仓库约定固定包含 `## �
 - 路由：`/`（总览）、`/accounts`、`/repositories`、`/repositories/:id`、`/tasks`、`/codex`、`/labels`、`/settings`。
 - 数据：TanStack Query 负责缓存与失效，WebSocket 事件到达时精确失效对应 query key。
 - 日志：`logStore` 用 `useSyncExternalStore` 维护按任务分桶的环形缓冲（4000 行），高频日志不会引起整页重渲染。
-- 设计系统：`styles.css` 中的 `panel` / `btn` / `chip` / `input` 等基础类 + Tailwind 工具类；动效集中在面板进场与状态切换。
+- 设计系统：`styles.css` 中的 `panel` / `btn` / `chip` / `input` 等基础类 + Tailwind 工具类；暗色主题，动效集中在面板进场与状态切换。
 - 主题：偏好（跟随系统 / 浅色 / 深色）由 `lib/theme.ts` + `hooks/useTheme.tsx` 维护并写入 `localStorage`，默认跟随系统；`index.html` 的前置脚本在首帧前写好 `<html data-theme>`，避免闪屏。样式以暗色为基线，`styles.css` 的 `[data-theme='light']` 重定向 `white` / `slate` / `*-200~400` 等基础色板，组件无需为两套主题各写一份类名。
 
 ## 7. 扩展点

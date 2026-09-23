@@ -83,7 +83,7 @@ SQLite 通过 Node 内置的 `node:sqlite`（`DatabaseSync`）访问，启用 WA
 
 失败落 `ai/stuck` 时，`markStuck()` 除了写远端标签，还会把标签回写进本地快照（`Store.setItemLabels()`）并重新推送任务状态：重试门禁（`GET /api/tasks` 的 `retryable`）与看板读的就是本地快照，回写后按钮立即可用，不必等下一轮轮询（默认 45s）。每次失败只发放一次重试：`POST /api/tasks/:id/retry` 会消费掉 `ai/stuck`。
 
-PR 正文由 `buildPullRequestBody()` 生成，按仓库约定固定包含 `## 实现假设清单` 与 `## 代码逻辑图` 两节：实现任务的提示词要求模型在总结里给出这两节，AutoGit 抽取后放进 PR 正文；模型没给时回落到「无额外假设」与 AutoGit 流水线示意图，保证两节始终非空。这两节不会进入提交信息。
+PR 正文由 `buildPullRequestBody()` 生成，按仓库约定固定包含 `## 实现假设清单` 与 `## 代码逻辑图` 两节：实现任务的提示词要求模型在总结里给出这两节，AutoGit 抽取后放进 PR 正文；模型没给时回落到「无额外假设」与 AutoGit 流水线示意图，保证两节始终非空。这两节不会进入提交信息。PR 标题由 `renderTitle()` 渲染设置里的模板后再归一化成 `<英文类型>: <描述>`（`conventionalTitle()`）：模板里写了英文类型就只归一化大小写、冒号与空格，没写就按标题开头的关键字推断类型（`新增…` → `feat:`、`修复…` → `fix:`、`优化…` → `perf:`…）、推断不出来用 `feat:`，所以默认模板 `{issueTitle} (#{issueNumber})` 也会产出合规标题。提交信息遵守同一条约定。
 
 ## 4. Provider 抽象
 

@@ -64,7 +64,9 @@
 
 ```bash
 # 1. 安装依赖（Node ≥ 22.5，pnpm ≥ 10）
-pnpm install
+#    把 store 放在仓库外：本机默认的 store 就在项目目录里（<仓库>/.pnpm-store/v10，装完约 265 MB）
+pnpm install --store-dir "$env:TEMP/pnpm-store"    # Windows PowerShell
+pnpm install --store-dir /tmp/pnpm-store           # Linux / macOS
 
 # 2. 开发模式：后端 4711，前端 5173（已配置代理 /api 与 WebSocket）
 #    只有这条路径会放行 Vite 开发来源，其它本地端口一律拒绝
@@ -74,6 +76,8 @@ pnpm dev
 pnpm build
 pnpm start          # http://127.0.0.1:4711（编译产物自动按 NODE_ENV=production 运行）
 ```
+
+`pnpm install` 默认会把包缓存（store）放在**项目目录**里：本机实测 `pnpm store path` 输出 `<仓库>/.pnpm-store/v10`，一次安装约 265 MB。它已被 `.gitignore` 挡住，但误提交过就要改写历史才能清掉，所以上面把 `--store-dir` 显式指到了仓库外；`pnpm repo:check` 在 store 落在仓库内时会打印一条 ⚠️ 警告（只警告、不影响退出码：落在哪里取决于机器上的 pnpm 配置，而不是仓库内容）。这里**没有**提交 `.npmrc` 固定 `store-dir`，原因是 AutoGit 跑任务的 Codex 沙箱只允许写任务工作区与临时目录（`apps/server/src/services/runner.ts` 用 `--sandbox workspace-write` 启动 Codex，设置页的「Codex 沙箱」是同一个开关），把 store 固定到用户主目录（`~/.pnpm-store`）会让沙箱里的 `pnpm install` 直接失败；机器级设置请写进 `~/.npmrc`，不要进仓库。
 
 `pnpm start` 运行的是打包后的 `dist/index.js`，进程没有 `NODE_ENV` 时默认按生产模式启动：实时通道与写请求只接受同源与 `AUTOGIT_ALLOWED_ORIGINS` 列出的来源，服务日志也是结构化 JSON。手动 `node dist/index.js` 同理；需要从编译产物连 Vite 开发服务器（或想保留彩色的单行日志）时显式设置 `NODE_ENV=development`。
 
@@ -259,6 +263,16 @@ pnpm --filter @autogit/server proxy:check -- --online  # 额外验证真实 HTTP
 
 `client:check` 用 `window` / `WebSocket` / `fetch` 三个桩件跑前端会话生命周期的 10 项断言：实时连接收到 `4401`（其他设备改凭据、退出登录、会话过期）时广播一次 `autogit:unauthorized` 并停止重连；收到 `4402`（本机改凭据，新 Cookie 就在同一个响应里）时不广播、只退避重连，登录态原地不动（否则改密码成功会先闪一下登录页）；其它关闭码先按 5 分钟节流核对一次会话（会话已失效同样广播）再退避重连，会话仍有效时不广播；受保护接口（含 `PUT /api/auth/credentials`）返回 `401` 时广播失效，而公开的登录 / 会话查询 / 退出登录接口返回 `401`（密码错误）与其它状态码（如 `403`）不广播。会话结束后的清理用真的 React Query 缓存验证（`window` 桩件带事件总线，广播会真的送到订阅方）：`4401` 与登出都走 `lib/session-state.ts` 的 `resetSessionState`，任务日志缓冲清空、受保护查询缓存移除、缓存里的登录态回到匿名；最后再核对 `AuthProvider` 编译后的源码确实把会话失效广播与 `logout` 都接到这个入口，防止它退回没人调用的死代码。
 
+### PR 标题与正文规范
+
+PR 标题由 `renderTitle()` 渲染「设置 → PR 标题模板」再归一化，结果必须满足仓库约定 `<英文类型>: <描述>`：类型取 `feat` / `fix` / `chore` / `refactor` / `docs` / `build` / `perf` / `test` / `ci` / `style` / `revert` 之一，冒号必须是半角且后面只有一个空格。
+
+- 模板里已经写了英文类型（`fix: {issueTitle}`）时只做归一化：大小写转小写、全角冒号 `：` 换成半角 `:`、多余空格压成一个；
+- 没写类型时按标题开头推断：`新增…` / `实现…` → `feat:`，`修复…` → `fix:`，`优化…` → `perf:`，`文档…` → `docs:`，`构建…` / `升级…` → `build:`，`回滚…` → `revert:`，其余落到 `feat:`；中文类型前缀（`修复：…`）同样被改写成英文；
+- 模板渲染成空串时回落到 `<Issue 标题> (#<编号>)` 再补类型。
+
+所以默认模板 `{issueTitle} (#{issueNumber})` 渲染出的「新增登录密码 (#4)」会被写成 `feat: 新增登录密码 (#4)`；提交信息遵守同一条约定（实现提交固定为 `feat: 实现 #<编号> <标题>`）。PR 正文由 `buildPullRequestBody()` 生成，固定包含且各出现一次 `## 实现假设清单` 与 `## 代码逻辑图` 两节、都非空；人工开 PR 时用仓库里的 `.github/pull_request_template.md` 起步。
+
 ### 合并 PR 前：确认分支历史干净
 
 AutoGit 只强推 `ai/*` 分支，但分支历史里可能夹带工作区产物——例如一次误提交的 `.pnpm-store/`（`ai/issue-4-新增登录密码` 这条分支带着 11,678 个对象、约 265 MB，最大单个对象约 72 MB；`git rev-list --objects HEAD -- .pnpm-store` 的原始输出是 11,682 行 = 11,282 个 blob + 398 个 tree + 2 个提交，脚本按路径过滤掉那 2 个提交和 2 条没有路径的 tree，所以两处数字差 4）。工作树里删掉它并不够：这些对象仍从 `HEAD` 可达，所以**含这类历史的分支只能用 `Squash and merge`，或先改写历史再合并**。`Create a merge commit` 会把整条对象链并进 `main`，`Rebase and merge` 会重放当初添加这些文件的提交，两者都让这份包缓存永久留在 `main` 的祖先链里，之后只能靠改写 `main` 的历史才能消除（克隆体积、`git rev-list --objects`、`git log --all` 都会一直背着它）。合并前跑一次：
@@ -270,12 +284,14 @@ pnpm repo:purge                    # 预演：列出会被改写的对象数量�
 pnpm repo:purge --base origin/main # 指定合并基准分支（默认按 origin/main、main、origin/master、master、origin/HEAD 探测）
 ```
 
+`pnpm repo:check` 还会报告 pnpm store 的落点：落在仓库内时打印一条 ⚠️ 警告（只警告、不改退出码），并给出把 store 指向仓库外的安装命令，理由见上面「快速开始」里的安装说明。
+
 命中 `.pnpm-store` 时会打印对象数量与体积、给出合并方式提醒，并以退出码 1 结束；先按下面二选一处理、再合并：
 
 1. **改写历史**（有远端写权限时首选）：先 `git fetch origin`，再 `pnpm repo:purge` 预演（只读，不动任何引用），确认对象数量后 `pnpm repo:purge --apply`。脚本用 git 自带的 `filter-branch` 只改写**这条分支自己带来的提交**（`<合并基准>..<分支>`），基准分支的历史一字不动，所以 `main` 上 GitHub 建的合并提交（带 `gpgsig`，被重建就会丢签名、SHA 随之改变）不会被卷进来：范围一旦放宽到整条历史，`main` 的提交会在分支里被重建，与 `main` 的合并基准会从分叉点往后退（本仓库实测 `403990a` → `9daccf9`），PR 从「无冲突、合并结果树就是 `HEAD` 树」变成 8 个冲突文件——而 tip 树一个字没变，只看树根本发现不了。改写前先在临时仓库里跑一遍自检（几秒，`--skip-self-test` 跳过），改写时先在临时分支上做，比对 tip 树一字未变**且与基准分支的合并基准没有移动**才移动真正的分支，旧历史留在 `refs/autogit-backup/<分支>/<时间戳>`（`git update-ref refs/heads/<分支> <备份引用>` 即可回退）。基准默认按 `origin/main`、`main`、`origin/master`、`master`、`origin/HEAD` 的顺序探测，也可以用 `--base <ref>` 指定；对象是基准分支自己带进来的（本分支没添加过）时脚本会拒绝改写并说明原因。改写完推送并复核：`git fetch origin && git push --force-with-lease origin <分支>`，再跑 `pnpm repo:check` 确认本地可达历史归零。注意 `git filter-repo --path .pnpm-store --invert-paths` 并不等价：它默认改写它看到的所有 ref（包括 `main`），范围比这里大得多。
 2. **Squash and merge**：GitHub 的合并按钮选 `Squash and merge`（只取 PR 的最终树），**不要**选 `Create a merge commit` 或 `Rebase and merge`；合并后删除该分支（`refs/pull/<n>` 仍会短暂保留这些对象，之后随 GC 回收）。
 
-**本次收口决策（PR #8，`ai/issue-4-新增登录密码`）**：合并侧走第 2 条 —— 用 `Squash and merge` 合并并删除分支；若希望保留这条分支的逐个提交，必须先在有写权限的环境执行第 1 条（`pnpm repo:purge --apply` 后 `git push --force-with-lease`），确认 `pnpm repo:check` 归零，再改用普通合并。修复代理只改工作树里的源码、不重写历史（沙箱里 `.git` 只读，也没有推送权限），所以这条决策只能落在合并侧：仓库自身无法把已经提交过的对象从 `HEAD` 可达集合里摘掉。在这条分支上 `pnpm repo:check` 仍会以退出码 1 结束，这是预期结果（它扫的就是 `HEAD` 可达对象），`pnpm repo:check --ref origin/main` 保持退出码 0；只有走完上面第 1 条（改写历史）本地才会归零。第 1 条已在临时克隆上实测：改写后 `HEAD^{tree}` 仍是 `f921a58`、与 `origin/main` 的合并基准仍是 `403990a`、`git merge-tree --write-tree HEAD origin/main` 仍是退出码 0 且结果树为 `f921a58`，也就是走完第 1 条后 PR 与 `main` 依然无冲突（改写前后 `main` 的 24 个提交逐字节相同）。
+**本次收口决策（PR #8，`ai/issue-4-新增登录密码`）**：合并侧走第 2 条 —— 用 `Squash and merge` 合并并删除分支；若希望保留这条分支的逐个提交，必须先在有写权限的环境执行第 1 条（`pnpm repo:purge --apply` 后 `git push --force-with-lease`），确认 `pnpm repo:check` 归零，再改用普通合并。修复代理只改工作树里的源码、不重写历史（沙箱里 `.git` 只读，也没有推送权限），所以这条决策只能落在合并侧：仓库自身无法把已经提交过的对象从 `HEAD` 可达集合里摘掉。在这条分支上 `pnpm repo:check` 仍会以退出码 1 结束，这是预期结果（它扫的就是 `HEAD` 可达对象），`pnpm repo:check --ref origin/main` 保持退出码 0；只有走完上面第 1 条（改写历史）本地才会归零。第 1 条已在临时克隆上实测（改完立即复核）：改写只动这条分支自己带来的提交，tip 树逐字节不变、与 `origin/main` 的合并基准仍是 `403990a`、`git merge-tree --write-tree HEAD origin/main` 仍是退出码 0 且结果树等于 tip 树、`pnpm repo:check` 归零（改写前后 `main` 的提交逐字节相同）。涉及具体哈希的数字会随分支增长变化，以脚本每次打印的结果为准。标题同样按仓库规范收口：这个 PR 的标题应当是 `feat: 新增登录密码`（AutoGit 用当时的默认模板 `{issueTitle} (#{issueNumber})` 建成了「新增登录密码 (#4)」）；仓库里的改动只影响之后新建的 PR，所以这条也要由合并侧在 GitHub 上改。
 
 「评审通过只打 `ai/approved`、合并动作留给人工」的约定不变，人工额外要确认的就是这里的合并方式。AutoGit 的修复代理跑在 `.git` 只读、也没有远端写权限的沙箱里，所以第 1 条只能由有推送权限的一侧执行；两条路都没走就合并，等于把这份包缓存写进 `main` 的祖先链。
 

@@ -1855,11 +1855,68 @@ function buildCommitMessage(issue: RemoteIssue, summary: string): string {
   return `feat: 实现 #${issue.number} ${title}\n\n${body}`;
 }
 
+/** Type used when neither the template nor the title says what kind of change it is. */
+const DEFAULT_TITLE_TYPE = 'feat';
+
+/**
+ * Leading keyword → Conventional Commits type.
+ *
+ * A template like `{issueTitle}` renders `新增登录密码 (#4)`, which the repository
+ * convention requires to become `feat: 新增登录密码 (#4)`. The same table rewrites the
+ * Chinese type prefixes the convention forbids (`修复：登录失败` → `fix: 登录失败`).
+ */
+const TITLE_TYPE_HINTS: Array<[RegExp, string]> = [
+  [/^(回滚|回退|撤销|revert)/i, 'revert'],
+  [/^(修复|修正|修復|解决|排查|fix)/i, 'fix'],
+  [/^(新增|添加|增加|实现|支持|引入|feat)/i, 'feat'],
+  [/^(优化|性能|提速|perf)/i, 'perf'],
+  [/^(重构|整理|refactor)/i, 'refactor'],
+  [/^(文档|说明|注释|docs)/i, 'docs'],
+  [/^(测试|用例|test)/i, 'test'],
+  [/^(构建|依赖|升级|迁移|build)/i, 'build'],
+  [/^(样式|格式|排版|style)/i, 'style'],
+  [/^(流水线|持续集成|ci)/i, 'ci'],
+  [/^(杂项|维护|清理|配置|chore)/i, 'chore'],
+];
+
+/** Type implied by the leading keyword of a title, `null` when nothing matches. */
+function impliedTitleType(text: string): string | null {
+  for (const [pattern, type] of TITLE_TYPE_HINTS) {
+    if (pattern.test(text)) return type;
+  }
+  return null;
+}
+
+/**
+ * Rewrites a title into the `<英文类型>: <描述>` form every commit subject and pull
+ * request title has to use.
+ *
+ * An explicit English prefix is kept and only normalized (lower case, half-width colon,
+ * exactly one space), so a template that already spells the type out wins; a title that
+ * only carries a Chinese type word, or no type at all, gets the implied (or default) type
+ * in front of it.
+ */
+export function conventionalTitle(title: string): string {
+  const text = title.replace(/\s+/g, ' ').trim();
+  if (text.length === 0) return '';
+
+  const typed = text.match(/^([A-Za-z]+) *[:：] *(\S.*)$/);
+  if (typed?.[1] && typed[2]) return `${typed[1].toLowerCase()}: ${typed[2]}`;
+
+  const worded = text.match(/^([^:：\s]{1,8}) *[:：] *(\S.*)$/);
+  const implied = worded?.[1] ? impliedTitleType(worded[1]) : null;
+  if (worded?.[2] && implied) return `${implied}: ${worded[2]}`;
+
+  return `${impliedTitleType(text) ?? DEFAULT_TITLE_TYPE}: ${text}`;
+}
+
 export function renderTitle(template: string, issue: RemoteIssue): string {
-  return template
+  const rendered = template
     .replaceAll('{issueTitle}', issue.title)
     .replaceAll('{issueNumber}', String(issue.number))
-    .slice(0, 250);
+    .trim();
+  const fallback = `${issue.title} (#${issue.number})`;
+  return conventionalTitle(rendered.length > 0 ? rendered : fallback).slice(0, 250);
 }
 
 export function buildPullRequestBody(

@@ -154,7 +154,10 @@ export function SettingsPage(): ReactNode {
               onChange={(event) => patch({ branchPrefix: event.target.value })}
             />
           </Field>
-          <Field label="PR 标题模板" hint="可用 {issueTitle} / {issueNumber}">
+          <Field
+            label="PR 标题模板"
+            hint="可用 {issueTitle} / {issueNumber}；未写类型时自动补「<英文类型>: 」前缀"
+          >
             <input
               className="input font-mono text-xs"
               value={form.prTitleTemplate}

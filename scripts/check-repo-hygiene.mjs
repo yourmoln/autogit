@@ -17,19 +17,34 @@
  * leaves the objects behind — that, or rewriting the branch first, is the only
  * safe way to land a branch like this one.
  *
+ * The same run also reports where `pnpm install` would put the store, because a
+ * repo-local cache is the root cause of the accident above: an install inside the
+ * repository leaves ~265 MB of cache in the working tree, and only `.gitignore`
+ * keeps it out of the index. That report is a warning instead of a failure — the
+ * location comes from the machine's pnpm configuration, not from the repository,
+ * and a gate that fails on it would also fail in environments that install into
+ * the workspace on purpose. A committed `.npmrc` is not the fix either: the Codex
+ * sandbox AutoGit runs its tasks in only allows writes inside the task workspace
+ * and the temp directory, so pinning `store-dir` to the user home makes
+ * `pnpm install` fail inside the pipeline. Configure it outside the repository
+ * instead (`pnpm install --store-dir <仓库外路径>`, or `~/.npmrc` for a machine
+ * wide setting).
+ *
  * Usage:
  *   pnpm repo:check                     # scan HEAD (the current branch)
  *   pnpm repo:check --ref origin/main   # scan another ref as well
  *   pnpm repo:check --skip-self-test    # skip the scanner self test
  *
  * Every run starts with a self test (`--skip-self-test` opts out): a throwaway
- * repository in the temp directory proves that a clean history passes and that
- * `.pnpm-store` objects a later commit deleted are still caught. If the
- * detection logic ever breaks, this gate fails instead of silently passing.
+ * repository in the temp directory proves that a clean history passes, that
+ * `.pnpm-store` objects a later commit deleted are still caught and that the store
+ * location check separates a store inside the repository from a sibling directory
+ * that merely shares the prefix. If the detection logic ever breaks, this gate
+ * fails instead of silently passing.
  */
-import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
 
 const FORBIDDEN = '.pnpm-store';
@@ -95,6 +110,99 @@ function totalBlobBytes(cwd, entries) {
   return bytes;
 }
 
+/** pnpm reads `store-dir` from this environment variable before any npmrc file. */
+const STORE_DIR_ENV = 'npm_config_store_dir';
+/** On Windows the pnpm CLI is a `.cmd` shim, which needs a shell to be spawned. */
+const PNPM = process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm';
+const PNPM_TIMEOUT_MS = 30_000;
+
+/** `~`, `${VAR}` and `$VAR` expansion, then resolution against the config file. */
+function expandStoreDir(value, baseDir) {
+  const expanded = value
+    .trim()
+    .replace(/^~(?=$|[\\/])/, homedir())
+    .replace(/\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/g, (_match, name) => process.env[name] ?? '');
+  return path.resolve(baseDir, expanded);
+}
+
+/** `store-dir` from one npmrc file, `null` when the file does not set it. */
+function npmrcStoreDir(file) {
+  let contents;
+  try {
+    contents = readFileSync(file, 'utf8');
+  } catch {
+    return null;
+  }
+
+  let value = null;
+  for (const line of contents.split('\n')) {
+    const match = line.match(/^\s*store-dir\s*=\s*(.+?)\s*$/);
+    if (match?.[1]) value = match[1]; // the last assignment wins, like ini parsing
+  }
+  if (value === null) return null;
+  // pnpm resolves a relative store-dir against the npmrc file, not the cwd.
+  return { dir: expandStoreDir(value, path.dirname(file)), source: file };
+}
+
+/** Configured store directory: environment first, then project and user npmrc. */
+function configuredStoreDir(cwd) {
+  const fromEnvironment = process.env[STORE_DIR_ENV]?.trim();
+  if (fromEnvironment) {
+    return { dir: expandStoreDir(fromEnvironment, cwd), source: STORE_DIR_ENV };
+  }
+  return npmrcStoreDir(path.join(cwd, '.npmrc')) ?? npmrcStoreDir(path.join(homedir(), '.npmrc'));
+}
+
+/** `pnpm store path` — the authoritative answer, `null` when pnpm cannot answer. */
+function pnpmStoreDir(cwd) {
+  // 常量命令 + shell：Windows 上 pnpm 是 .cmd 垫片，必须经过 shell；命令里没有外部输入。
+  const result = spawnSync(`${PNPM} store path`, {
+    cwd,
+    encoding: 'utf8',
+    shell: true,
+    timeout: PNPM_TIMEOUT_MS,
+  });
+  if (result.error || result.status !== 0) return null;
+
+  const stdout = typeof result.stdout === 'string' ? result.stdout : '';
+  const lines = stdout
+    .split('\n')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+  // A path line, not a stray notice: pnpm prints nothing else today, but this
+  // keeps a future warning line from being mistaken for the store location.
+  const line = lines.find((entry) => path.isAbsolute(entry)) ?? lines[0];
+  return line ? { dir: path.resolve(cwd, line), source: 'pnpm store path' } : null;
+}
+
+/** `true` when `child` is `parent` itself or lives below it. */
+function isInsideRepository(parent, child) {
+  const normalize = (value) => {
+    const resolved = path.resolve(value);
+    return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+  };
+  const relative = path.relative(normalize(parent), normalize(child));
+  if (relative === '') return true;
+  if (path.isAbsolute(relative)) return false;
+  return relative !== '..' && !relative.startsWith(`..${path.sep}`);
+}
+
+/**
+ * Warning for a store that `pnpm install` would write inside the repository, `null`
+ * when it is outside (or unknown). Never a failure: see the file header.
+ */
+function storeLocationWarning(cwd, store) {
+  if (!store || !isInsideRepository(cwd, store.dir)) return null;
+  return (
+    `pnpm 的 store 目录落在仓库内（${path.resolve(store.dir)}，来源：${store.source}）：` +
+    '一次 pnpm install 就会在这里写入 265 MB 量级的包缓存，一旦误提交只能改写历史才能清掉。\n' +
+    '   处理：安装依赖时把 store 指向仓库外 —— Windows：pnpm install --store-dir "$env:TEMP\\pnpm-store"；' +
+    'Linux/macOS：pnpm install --store-dir /tmp/pnpm-store；也可以写进机器级 ~/.npmrc。' +
+    '不要提交仓库内 .npmrc 固定 store-dir：AutoGit 流水线的 Codex 沙箱只允许写任务工作区与临时目录，' +
+    '固定到用户目录会让沙箱内的 pnpm install 直接失败。'
+  );
+}
+
 /**
  * Scans one repository: the index, the ignore rule and every object reachable
  * from `ref`. Returns the problems plus the numbers the caller reports.
@@ -132,7 +240,11 @@ function scan(cwd, ref) {
     );
   }
 
-  return { problems, entries: entries.length, bytes, tracked: tracked.length };
+  // `pnpm store path` knows about every config source; the npmrc/env scan is the
+  // fallback for machines without pnpm.
+  const store = pnpmStoreDir(cwd) ?? configuredStoreDir(cwd);
+
+  return { problems, entries: entries.length, bytes, tracked: tracked.length, store };
 }
 
 function commitAll(cwd, message) {
@@ -201,7 +313,36 @@ function selfTest() {
       throw new Error('缺少 .pnpm-store 忽略规则没有被拦下');
     }
 
-    return `干净仓库 0 命中、提交后删除仍检出 ${found.entries} 个对象、缺少 .gitignore 规则被拦下`;
+    // A store inside the repository has to be reported, while a sibling directory
+    // whose name merely shares the prefix has to stay silent.
+    const insideStore = storeLocationWarning(clean, {
+      dir: path.join(clean, FORBIDDEN, 'v10'),
+      source: '自检',
+    });
+    if (insideStore === null) throw new Error('仓库内的 pnpm store 没有被警告');
+    const siblingStore = storeLocationWarning(clean, {
+      dir: path.join(root, 'sibling-store', 'v10'),
+      source: '自检',
+    });
+    if (siblingStore !== null) throw new Error(`仓库外的 pnpm store 被误报：${siblingStore}`);
+
+    // `.npmrc` 的相对路径按 pnpm 的规则相对该文件解析，`~` 展开到用户目录。
+    const configured = path.join(root, 'configured');
+    mkdirSync(configured, { recursive: true });
+    writeFileSync(path.join(configured, '.npmrc'), 'store-dir=../.pnpm-store\n');
+    const relativeStore = npmrcStoreDir(path.join(configured, '.npmrc'));
+    if (relativeStore?.dir !== path.resolve(configured, '..', '.pnpm-store')) {
+      throw new Error(`.npmrc 的相对 store-dir 解析错误：${relativeStore?.dir}`);
+    }
+    const tildeStore = expandStoreDir('~/.pnpm-store', configured);
+    if (tildeStore !== path.join(homedir(), '.pnpm-store')) {
+      throw new Error(`store-dir 的 ~ 没有展开到用户目录：${tildeStore}`);
+    }
+
+    return (
+      `干净仓库 0 命中、提交后删除仍检出 ${found.entries} 个对象、缺少 .gitignore 规则被拦下、` +
+      '仓库内的 store 目录被警告而仓库外的不误报'
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -234,6 +375,7 @@ function parseArguments(argv) {
 function main() {
   const problems = [];
   const notes = [];
+  const warnings = [];
 
   let options;
   try {
@@ -259,12 +401,22 @@ function main() {
   }
 
   try {
-    problems.push(...scan(process.cwd(), options.ref).problems);
+    const result = scan(process.cwd(), options.ref);
+    problems.push(...result.problems);
+    const warning = storeLocationWarning(process.cwd(), result.store);
+    if (warning) {
+      warnings.push(warning);
+    } else if (result.store) {
+      notes.push(`✅ pnpm store 在仓库外：${result.store.dir}（来源：${result.store.source}）`);
+    } else {
+      notes.push('ℹ️ 无法确定 pnpm store 目录（没有 pnpm 也没有 store-dir 配置），跳过该检查');
+    }
   } catch (error) {
     problems.push(`无法扫描 ${options.ref}：${errorMessage(error)}`);
   }
 
   for (const note of notes) process.stdout.write(`${note}\n`);
+  for (const warning of warnings) process.stdout.write(`⚠️ ${warning}\n`);
   if (problems.length === 0) {
     process.stdout.write(`✅ ${options.ref} 的索引与可达历史都干净：没有 ${FORBIDDEN} 对象\n`);
     return;

@@ -251,6 +251,7 @@ pnpm build        # shared → server → web
 pnpm simulate     # 端到端模拟：真实 git + 假 Codex + 假 Git 平台
 pnpm --filter @autogit/server auth:check            # 登录门禁自检（临时数据目录，真实 HTTP 路由）
 pnpm --filter @autogit/web client:check            # 前端会话生命周期自检（4401 登出 / 4402 轮换重连 / 401 的登录态广播 / 会话结束后的清理）
+pnpm --filter @autogit/server title:check          # PR 标题归一化自检（类型白名单 / 中文前缀 / 模板回落）
 pnpm --filter @autogit/server proxy:check          # 代理链路自检（本地起 HTTP/SOCKS5 代理）
 pnpm --filter @autogit/server proxy:check -- --online  # 额外验证真实 HTTPS 隧道
 ```
@@ -263,11 +264,14 @@ pnpm --filter @autogit/server proxy:check -- --online  # 额外验证真实 HTTP
 
 `client:check` 用 `window` / `WebSocket` / `fetch` 三个桩件跑前端会话生命周期的 10 项断言：实时连接收到 `4401`（其他设备改凭据、退出登录、会话过期）时广播一次 `autogit:unauthorized` 并停止重连；收到 `4402`（本机改凭据，新 Cookie 就在同一个响应里）时不广播、只退避重连，登录态原地不动（否则改密码成功会先闪一下登录页）；其它关闭码先按 5 分钟节流核对一次会话（会话已失效同样广播）再退避重连，会话仍有效时不广播；受保护接口（含 `PUT /api/auth/credentials`）返回 `401` 时广播失效，而公开的登录 / 会话查询 / 退出登录接口返回 `401`（密码错误）与其它状态码（如 `403`）不广播。会话结束后的清理用真的 React Query 缓存验证（`window` 桩件带事件总线，广播会真的送到订阅方）：`4401` 与登出都走 `lib/session-state.ts` 的 `resetSessionState`，任务日志缓冲清空、受保护查询缓存移除、缓存里的登录态回到匿名；最后再核对 `AuthProvider` 编译后的源码确实把会话失效广播与 `logout` 都接到这个入口，防止它退回没人调用的死代码。
 
+`title:check` 用 40 条断言锁定 `renderTitle()` / `conventionalTitle()` 的归一化规则：白名单里的 11 个类型原样保留（大写、全角冒号与多余空格归一化成「小写 + 半角冒号 + 一个空格」）、中文类型前缀（`修复：…`）改写成英文、没写类型时按开头关键字推断（`新增…` → `feat:`、`优化…` → `perf:`）、推断不出来落 `feat:`、模板渲染成空串时回落到 `<Issue 标题> (#<编号>)`、超长标题截断到 250 字符后类型前缀仍在，以及 `README: 更新说明` / `Release: v1.2` / `docker: 调整镜像` / `AutoGit: 一些说明` 这类「英文单词 + 冒号」不被当成类型 —— 每条断言都会再核对输出前缀确实落在白名单内，所以再冒出 `readme:` / `release:` 这类类型就会直接失败。
+
 ### PR 标题与正文规范
 
 PR 标题由 `renderTitle()` 渲染「设置 → PR 标题模板」再归一化，结果必须满足仓库约定 `<英文类型>: <描述>`：类型取 `feat` / `fix` / `chore` / `refactor` / `docs` / `build` / `perf` / `test` / `ci` / `style` / `revert` 之一，冒号必须是半角且后面只有一个空格。
 
-- 模板里已经写了英文类型（`fix: {issueTitle}`）时只做归一化：大小写转小写、全角冒号 `：` 换成半角 `:`、多余空格压成一个；
+- 模板里已经写了英文类型（`fix: {issueTitle}`）时只做归一化：大小写转小写、全角冒号 `：` 换成半角 `:`、多余空格压成一个 —— 但只有上面列出的 11 个类型算类型前缀，别的英文单词不是；
+- 前缀不在那张列表里时整串当描述：`README: 更新说明`、`Release: v1.2`、`docker: 调整镜像` 这类「英文单词 + 冒号」的 Issue 标题会被写成 `feat: README: 更新说明`，而不是原样透传成 `readme:` / `release:` / `docker:` 这种约定外的类型（这条约束同时管着 PR 标题与 Squash 合并后写进 `main` 的提交主题）；
 - 没写类型时按标题开头推断：`新增…` / `实现…` → `feat:`，`修复…` → `fix:`，`优化…` → `perf:`，`文档…` → `docs:`，`构建…` / `升级…` → `build:`，`回滚…` → `revert:`，其余落到 `feat:`；中文类型前缀（`修复：…`）同样被改写成英文；
 - 模板渲染成空串时回落到 `<Issue 标题> (#<编号>)` 再补类型。
 

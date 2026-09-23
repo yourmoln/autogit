@@ -39,12 +39,7 @@ import { registerTaskRoutes, withRetryState } from '../routes/tasks.js';
 import { CodexService } from '../services/codex.js';
 import { EventBus } from '../services/events.js';
 import { LabelService } from '../services/labels.js';
-import {
-  buildPullRequestBody,
-  conventionalTitle,
-  Orchestrator,
-  renderTitle,
-} from '../services/orchestrator.js';
+import { buildPullRequestBody, Orchestrator } from '../services/orchestrator.js';
 import { ProviderFactory } from '../services/providers.js';
 import { ProxyService } from '../services/proxy.js';
 import type { EngineRunInput, EngineRunResult } from '../services/runner.js';
@@ -687,38 +682,6 @@ async function main(): Promise<void> {
     '实现代理没给出两节时，PR 正文也必须补全且非空',
   );
   log.warn('PR 正文：实现假设清单 / 代码逻辑图两节齐全（含回落路径）✅');
-
-  // PR 标题按仓库约定必须是 `<英文类型>: <描述>`（半角冒号 + 一个空格）：模板没写类型时
-  // AutoGit 自己补，模板已经写了英文类型时只做归一化（大小写、全角冒号、多余空格）。
-  assert(
-    pr.title === `feat: ${issue.title} (#${issue.number})`,
-    '默认模板创建的 PR 标题应当补上 feat 前缀',
-  );
-  assert(
-    renderTitle('fix: {issueTitle}', issue) === `fix: ${issue.title}`,
-    '模板里写明的英文类型应当保留',
-  );
-  assert(
-    renderTitle('fix： {issueTitle}', issue) === `fix: ${issue.title}`,
-    '全角冒号与多余空格应当归一化成「类型 + 半角冒号 + 一个空格」',
-  );
-  assert(
-    renderTitle('   ', issue) === `feat: ${issue.title} (#${issue.number})`,
-    '模板渲染为空时应当回落到「Issue 标题 + 编号」并补类型前缀',
-  );
-  const titleCases: Array<[string, string]> = [
-    ['新增登录密码 (#4)', 'feat: 新增登录密码 (#4)'],
-    ['修复登录失败', 'fix: 修复登录失败'],
-    ['修复：登录失败', 'fix: 登录失败'],
-    ['优化任务列表加载', 'perf: 优化任务列表加载'],
-    ['docs：补充 README', 'docs: 补充 README'],
-    ['chore: 更新构建配置', 'chore: 更新构建配置'],
-    ['调整轮询间隔', 'feat: 调整轮询间隔'],
-  ];
-  for (const [input, expected] of titleCases) {
-    assert(conventionalTitle(input) === expected, `标题规范化 ${input} 应当得到 ${expected}`);
-  }
-  log.warn('PR 标题：类型前缀补齐与归一化（含全角冒号、空模板回落）✅');
 
   const branch = pr.headRef;
   const files = git(['ls-tree', '--name-only', '-r', `refs/heads/${branch}`], bareRepo)

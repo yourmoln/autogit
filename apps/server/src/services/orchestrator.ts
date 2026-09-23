@@ -1859,6 +1859,27 @@ function buildCommitMessage(issue: RemoteIssue, summary: string): string {
 const DEFAULT_TITLE_TYPE = 'feat';
 
 /**
+ * Types the repository convention allows, i.e. the only prefixes that count as a type.
+ *
+ * Mirrored from `AGENTS.md` / README「PR 标题与正文规范」: an English word in front of a colon
+ * is a type only when it is one of these, otherwise it is part of the description (see
+ * `conventionalTitle()`).
+ */
+const ALLOWED_TITLE_TYPES: ReadonlySet<string> = new Set([
+  'feat',
+  'fix',
+  'chore',
+  'refactor',
+  'docs',
+  'build',
+  'perf',
+  'test',
+  'ci',
+  'style',
+  'revert',
+]);
+
+/**
  * Leading keyword → Conventional Commits type.
  *
  * A template like `{issueTitle}` renders `新增登录密码 (#4)`, which the repository
@@ -1892,16 +1913,20 @@ function impliedTitleType(text: string): string | null {
  * request title has to use.
  *
  * An explicit English prefix is kept and only normalized (lower case, half-width colon,
- * exactly one space), so a template that already spells the type out wins; a title that
- * only carries a Chinese type word, or no type at all, gets the implied (or default) type
- * in front of it.
+ * exactly one space) — but only when it is one of the allowed types: `README: 更新说明` is a
+ * description that happens to start with an English word, and turning it into `readme:` would
+ * produce a type the convention does not list. Such a title, a title that only carries a
+ * Chinese type word, and a title without any type all get the implied (or default) type in
+ * front of them.
  */
 export function conventionalTitle(title: string): string {
   const text = title.replace(/\s+/g, ' ').trim();
   if (text.length === 0) return '';
 
+  // Only a known type is a prefix; anything else keeps its colon inside the description.
   const typed = text.match(/^([A-Za-z]+) *[:：] *(\S.*)$/);
-  if (typed?.[1] && typed[2]) return `${typed[1].toLowerCase()}: ${typed[2]}`;
+  const type = typed?.[1]?.toLowerCase();
+  if (typed?.[2] && type && ALLOWED_TITLE_TYPES.has(type)) return `${type}: ${typed[2]}`;
 
   const worded = text.match(/^([^:：\s]{1,8}) *[:：] *(\S.*)$/);
   const implied = worded?.[1] ? impliedTitleType(worded[1]) : null;

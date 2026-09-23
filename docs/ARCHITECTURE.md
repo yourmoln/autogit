@@ -105,7 +105,7 @@ PR 正文由 `buildPullRequestBody()` 生成，按仓库约定固定包含 `## �
 4. 从 `--output-last-message` 文件（或最后一条 agent 消息）提取结论；
 5. 评审任务附加 `--output-schema`，用 JSON Schema 强制 `{verdict, summary, issues[], tests}` 结构；
 6. 结论解析先做 JSON 提取、再做 `VERDICT:` 文本启发式（容忍 `approve` / `needs-fix` / 中文“通过”等写法）；仍然解析不出结论时，把模型上一次的输出回灌给它，要求只重新序列化结论（最多 2 次），全部失败才判定评审任务失败。
-7. 结论里带 `file` / `line` 的 issue 会在 `git diff --no-color base...HEAD` 的原始 patch 上解析成锚点（行号一律取**新文件**版本，重复出现在 hunk 头里的行号不算），能锚定的逐条发成行内评论（单次上限 20 条），其余留在汇总评论；写行内评论失败只记日志、不影响评审任务本身，所以三个平台都不会因为某条评论被拒而丢失结论。
+7. 结论里带 `file` / `line` 的 issue 会在 `git diff --no-color base...HEAD` 的原始 patch 上解析成锚点（行号一律取**新文件**版本，重复出现在 hunk 头里的行号不算），能锚定的逐条发成行内评论（单次上限 20 条），其余留在汇总评论；写入成功后还会读回核对锚点的真实行号（Gitea 按 review id 读回 `reviews/{id}/comments`、Gitee 按评论 id 读回 `pulls/comments/{id}`），对不上就删掉刚写入的那条（Gitea 删除这个 review）并退回汇总评论；写行内评论失败只记日志、不影响评审任务本身，所以三个平台都不会因为某条评论被拒而丢失结论。diff 一律带 `-c core.quotePath=false` 读取，中文等非 ASCII 路径不会被 git 转义成八进制。
 
 行内评论与会话评论在两个资源里：GitHub 的 `issues/{n}/comments` 根本不返回它们，Gitea 要按 review 逐个查询。因此把评审意见回灌给模型时（复审的「已有讨论」、修复任务的提示词）统一走 `listComments()` + `listReviewComments()` 合并后的讨论列表，否则修复代理看不到贴在代码行上的意见。
 

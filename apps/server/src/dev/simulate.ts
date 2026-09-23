@@ -10,6 +10,7 @@
  */
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -28,11 +29,13 @@ import websocket from '@fastify/websocket';
 import Fastify from 'fastify';
 
 import { ensureRuntimeDirectories, loadRuntimeConfig } from '../config.js';
-import { createContext, type AppContext } from '../context.js';
+import { type AppContext, createContext } from '../context.js';
 import { Db } from '../db/database.js';
 import { migrate } from '../db/migrations.js';
 import { Store } from '../db/store.js';
-import type { GitProvider, RepoRef } from '../providers/index.js';
+import { GiteaProvider } from '../providers/gitea.js';
+import { GiteeProvider } from '../providers/gitee.js';
+import type { GitProvider, ProviderAccount, RepoRef } from '../providers/index.js';
 import { registerCodexRoutes } from '../routes/codex.js';
 import { registerSystemRoutes } from '../routes/system.js';
 import { registerTaskRoutes, withRetryState } from '../routes/tasks.js';
@@ -40,6 +43,7 @@ import { CodexService } from '../services/codex.js';
 import { EventBus } from '../services/events.js';
 import { LabelService } from '../services/labels.js';
 import { buildPullRequestBody, Orchestrator } from '../services/orchestrator.js';
+import { buildFixPrompt } from '../services/prompts.js';
 import { ProviderFactory } from '../services/providers.js';
 import { ProxyService } from '../services/proxy.js';
 import type { EngineRunInput, EngineRunResult } from '../services/runner.js';
@@ -50,6 +54,7 @@ import {
   type WorkspaceLog,
   WorkspaceManager,
 } from '../services/workspace.js';
+import { parseDiffAnchors } from '../util/diff-anchors.js';
 import { initLogger, logger } from '../util/logger.js';
 import { slugify } from '../util/time.js';
 
@@ -729,9 +734,15 @@ async function main(): Promise<void> {
     reviewSummary?.body.includes('`src/feature.txt:1`') === true,
     '汇总评论应当列出已发布的行内评论与锚点',
   );
+  // 汇总评论里本来就有 `src/feature.txt:1`，只断言这个锚点等于没断言行内接线：
+  // 必须检查只有「行内评论」小节才会出现的文本。
   assert(
-    runner.lastFixPrompt?.includes('src/feature.txt:1') === true,
-    '修复任务的提示词应当带上行内评论及其锚点',
+    runner.lastFixPrompt?.includes('### 行内评论 1 · `src/feature.txt:1`') === true,
+    '修复任务的提示词应当带上行内评论小节及其锚点',
+  );
+  assert(
+    runner.lastFixPrompt?.includes('feature.txt 需要包含一行标题，便于后续渲染。') === true,
+    '修复任务的提示词应当带上行内评论正文',
   );
   log.warn('行内评论场景通过：评审问题贴在 src/feature.txt:1，修复任务读取到该评论 ✅');
 
@@ -1089,6 +1100,271 @@ async function main(): Promise<void> {
 
   orchestrator.stop();
 
+  // ---- 场景 6：行内评论的锚点解析与平台回退语义 -------------------------
+  //
+  // ① 探针：git 默认 `core.quotePath=true` 会把非 ASCII 路径写成八进制转义
+  //    （`+++ "b/docs/\350\257\264\346\230\216.md"`），解析器必须还原出真实
+  //    路径，否则中文文件名永远锚不上；`workspace.diffPatch()` 另外用
+  //    `-c core.quotePath=false` 让 git 直接给出原始 UTF-8 路径。
+  const quotedUnicodePatch = [
+    'diff --git "a/docs/\\350\\257\\264\\346\\230\\216.md" "b/docs/\\350\\257\\264\\346\\230\\216.md"',
+    'new file mode 100644',
+    '--- /dev/null',
+    '+++ "b/docs/\\350\\257\\264\\346\\230\\216.md"',
+    '@@ -0,0 +1,2 @@',
+    '+第一行',
+    '+第二行',
+  ].join('\n');
+  const quotedAnchor = parseDiffAnchors(quotedUnicodePatch).find('docs/说明.md', 2);
+  assert(
+    quotedAnchor?.line === 2 && quotedAnchor.position === 2,
+    `quotePath 转义的中文路径应当解析出锚点，实际 ${JSON.stringify(quotedAnchor)}`,
+  );
+  const rawAnchor = parseDiffAnchors(
+    [
+      'diff --git a/docs/说明.md b/docs/说明.md',
+      'new file mode 100644',
+      '--- /dev/null',
+      '+++ b/docs/说明.md',
+      '@@ -0,0 +1,2 @@',
+      '+第一行',
+      '+第二行',
+    ].join('\n'),
+  ).find('docs/说明.md', 2);
+  assert(
+    rawAnchor?.line === 2 && rawAnchor.position === 2,
+    `原始 UTF-8 路径应当解析出锚点，实际 ${JSON.stringify(rawAnchor)}`,
+  );
+
+  // 顺带守住解析器已知的边界：删除文件、二进制文件、越界行号都不能锚定，
+  // 新增行内容以 `+++ ` 开头时不得被当成文件头，路径后缀匹配仍然可用。
+  const trickyPatch = [
+    'diff --git a/src/new.ts b/src/new.ts',
+    'new file mode 100644',
+    '--- /dev/null',
+    '+++ b/src/new.ts',
+    '@@ -0,0 +1,3 @@',
+    '+plain',
+    '+++ 这不是文件头',
+    '+tail',
+    'diff --git a/src/gone.ts b/src/gone.ts',
+    'deleted file mode 100644',
+    '--- a/src/gone.ts',
+    '+++ /dev/null',
+    '@@ -1 +0,0 @@',
+    '-removed',
+    'diff --git a/assets/logo.png b/assets/logo.png',
+    'new file mode 100644',
+    'Binary files /dev/null and b/assets/logo.png differ',
+    'diff --git a/src/deep/big.txt b/src/deep/big.txt',
+    'new file mode 100644',
+    '--- /dev/null',
+    '+++ b/src/deep/big.txt',
+    '@@ -0,0 +1 @@',
+    '+content',
+  ].join('\n');
+  const tricky = parseDiffAnchors(trickyPatch);
+  assert(
+    tricky.find('src/new.ts', 3)?.position === 3,
+    '以 `+++ ` 开头的新增行不应打乱后续行的 patch 位置',
+  );
+  assert(tricky.find('src/gone.ts', 1) === null, '删除的文件不应当解析出锚点');
+  assert(tricky.find('assets/logo.png', 1) === null, '二进制文件不应当解析出锚点');
+  assert(tricky.find('src/new.ts', 9) === null, 'diff 之外的行号不应当解析出锚点');
+  assert(tricky.find('big.txt', 1)?.path === 'src/deep/big.txt', '唯一后缀匹配应当解析出锚点');
+  log.warn('锚点解析场景通过：中文路径、二进制/删除文件与后缀匹配均符合预期 ✅');
+
+  // ② Gitee：`position` 的两种口径必须各试一次。第一次请求被实例拒绝（4xx）
+  //    时也要继续试第二种语义，只有两种都失败才退回汇总评论。
+  const giteeApi = await startFakeApi((call) => {
+    if (call.method === 'POST' && call.path === '/api/v5/repos/sim/demo/pulls/1/comments') {
+      const body = call.body as { path: string; position: number };
+      // 只认「新文件行号」的实例：patch 位置 5 被拒，行号 20 通过。
+      if (body.position !== 20) return { status: 400, json: { message: 'position 无效' } };
+      return {
+        status: 201,
+        json: { id: 77, path: body.path, position: body.position, new_line: 20, body: 'body' },
+      };
+    }
+    if (call.method === 'GET' && call.path === '/api/v5/repos/sim/demo/pulls/comments/77') {
+      return {
+        status: 200,
+        json: {
+          id: 77,
+          path: 'src/feature.txt',
+          position: 20,
+          new_line: 20,
+          body: 'body',
+          created_at: new Date().toISOString(),
+          user: { login: 'autogit-bot' },
+        },
+      };
+    }
+    return { status: 404, json: { message: 'not found' } };
+  });
+  const gitee = new GiteeProvider(fakeAccount('gitee', `${giteeApi.baseUrl}/api/v5`));
+  const giteeComment = await gitee.createReviewComment({ owner: 'sim', name: 'demo' }, 1, {
+    body: '行内评论正文',
+    path: 'src/feature.txt',
+    line: 20,
+    diffPosition: 5,
+    commitId: null,
+  });
+  const giteePosts = giteeApi.calls
+    .filter((call) => call.method === 'POST')
+    .map((call) => (call.body as { position: number }).position);
+  assert(
+    giteePosts.length === 2 && giteePosts[0] === 5 && giteePosts[1] === 20,
+    `Gitee 第一次 position 被拒后应当继续尝试第二种语义，实际 POST position=${giteePosts.join(',')}`,
+  );
+  assert(giteeComment.line === 20, `Gitee 行内评论应当锚定在第 20 行，实际 ${giteeComment.line}`);
+  await giteeApi.close();
+
+  // ③ Gitee 读回里只有被原样回写的 `position`（没有 `new_line`）时不算验证通过：
+  //    必须删除这条评论并抛错，让调用方把它退回汇总评论。
+  const echoStore = new Map<number, { path: string; position: number }>();
+  const echoApi = await startFakeApi((call) => {
+    const id = Number.parseInt(call.path.split('/').at(-1) ?? '', 10);
+    if (call.method === 'POST' && call.path.endsWith('/comments')) {
+      const body = call.body as { path: string; position: number };
+      const created = 90 + echoStore.size;
+      echoStore.set(created, { path: body.path, position: body.position });
+      // 只回写 position，不回传 new_line：锚点无法验证。
+      return { status: 201, json: { id: created, path: body.path, position: body.position } };
+    }
+    if (call.method === 'GET' && call.path.includes('/pulls/comments/')) {
+      const stored = echoStore.get(id);
+      return stored
+        ? { status: 200, json: { id, ...stored, body: 'body' } }
+        : { status: 404, json: { message: 'not found' } };
+    }
+    if (call.method === 'DELETE' && call.path.includes('/pulls/comments/')) {
+      echoStore.delete(id);
+      return { status: 204 };
+    }
+    return { status: 404, json: { message: 'not found' } };
+  });
+  const echoGitee = new GiteeProvider(fakeAccount('gitee', `${echoApi.baseUrl}/api/v5`));
+  const echoFailure = await expectRejects(
+    () =>
+      echoGitee.createReviewComment({ owner: 'sim', name: 'demo' }, 1, {
+        body: '行内评论正文',
+        path: 'src/feature.txt',
+        line: 20,
+        diffPosition: 5,
+        commitId: null,
+      }),
+    'Gitee 无法读回 new_line 时应当判定锚定失败',
+  );
+  assert(
+    echoFailure.includes('退回汇总评论'),
+    `Gitee 失败信息应当说明会退回汇总评论，实际：${echoFailure}`,
+  );
+  assert(
+    echoStore.size === 0 &&
+      echoApi.calls.filter((call) => call.method === 'DELETE').length === 2 &&
+      echoApi.calls.filter((call) => call.method === 'POST').length === 2,
+    'Gitee 未验证通过的评论应当被删除，且两种 position 语义都要试过',
+  );
+  await echoApi.close();
+
+  // ④ Gitea：写接口只回 review id，必须读回 `reviews/{id}/comments` 核对行号；
+  //    对不上就删除这条 review（Gitea 会连带删除它的代码评论）并退回汇总评论。
+  const giteaApi = await startFakeApi((call) => {
+    if (call.method === 'POST' && call.path === '/api/v1/repos/sim/demo/pulls/1/reviews') {
+      return { status: 200, json: { id: 33, comments_count: 1 } };
+    }
+    if (
+      call.method === 'GET' &&
+      call.path === '/api/v1/repos/sim/demo/pulls/1/reviews/33/comments'
+    ) {
+      // 实例把 new_position 当成了 patch 位置：真实行号与目标行号不一致。
+      return {
+        status: 200,
+        json: [{ id: 9, path: 'src/feature.txt', position: 5, original_position: 5, body: 'x' }],
+      };
+    }
+    if (call.method === 'DELETE' && call.path === '/api/v1/repos/sim/demo/pulls/1/reviews/33') {
+      return { status: 204 };
+    }
+    return { status: 404, json: { message: 'not found' } };
+  });
+  const gitea = new GiteaProvider(fakeAccount('gitea', `${giteaApi.baseUrl}/api/v1`));
+  const giteaFailure = await expectRejects(
+    () =>
+      gitea.createReviewComment({ owner: 'sim', name: 'demo' }, 1, {
+        body: '行内评论正文',
+        path: 'src/feature.txt',
+        line: 20,
+        diffPosition: 5,
+        commitId: null,
+      }),
+    'Gitea 读回的行号与目标不一致时应当判定锚定失败',
+  );
+  assert(
+    giteaFailure.includes('退回汇总评论'),
+    `Gitea 失败信息应当说明会退回汇总评论，实际：${giteaFailure}`,
+  );
+  assert(
+    ['POST', 'GET', 'DELETE'].every((method) =>
+      giteaApi.calls.some((call) => call.method === method),
+    ),
+    `Gitea 应当写入后读回核对并删除错位的 review，实际调用：${giteaApi.calls
+      .map((call) => `${call.method} ${call.path}`)
+      .join(' → ')}`,
+  );
+  await giteaApi.close();
+
+  const giteaOkApi = await startFakeApi((call) => {
+    if (call.method === 'POST' && call.path === '/api/v1/repos/sim/demo/pulls/1/reviews') {
+      return { status: 200, json: { id: 34, comments_count: 1 } };
+    }
+    if (
+      call.method === 'GET' &&
+      call.path === '/api/v1/repos/sim/demo/pulls/1/reviews/34/comments'
+    ) {
+      return {
+        status: 200,
+        json: [{ id: 10, path: 'src/feature.txt', position: 20, original_position: 20 }],
+      };
+    }
+    return { status: 404, json: { message: 'not found' } };
+  });
+  const giteaOk = new GiteaProvider(fakeAccount('gitea', `${giteaOkApi.baseUrl}/api/v1`));
+  const giteaComment = await giteaOk.createReviewComment({ owner: 'sim', name: 'demo' }, 1, {
+    body: '行内评论正文',
+    path: 'src/feature.txt',
+    line: 20,
+    diffPosition: 5,
+    commitId: null,
+  });
+  assert(giteaComment.line === 20, `Gitea 行内评论应当锚定在第 20 行，实际 ${giteaComment.line}`);
+  await giteaOkApi.close();
+
+  // ⑤ 旧的断言只匹配 `src/feature.txt:1`，而汇总评论文本里本来就有它：证明
+  //    必须用「行内评论」小节里的独有文本，否则删掉接线也照样通过。
+  const promptFor = (inlineComments: Array<{ path: string; line: number; body: string }>) =>
+    buildFixPrompt({
+      repository: { fullName: 'sim/demo', defaultBranch: 'main', owner: 'sim', name: 'demo' },
+      pullRequest: pr,
+      issue: null,
+      reviewComment: '实现方向正确，但 `src/feature.txt:1` 缺少标题行，需要补齐。',
+      inlineComments,
+      diffStat: 'src/feature.txt | 1 +',
+    });
+  const summaryOnly = promptFor([]);
+  assert(
+    summaryOnly.includes('src/feature.txt:1') && !summaryOnly.includes('### 行内评论 1'),
+    '汇总评论本身就含锚点文本，所以断言必须落到「行内评论 1」小节',
+  );
+  assert(
+    promptFor([{ path: 'src/feature.txt', line: 1, body: '细节：缺少标题行' }]).includes(
+      '### 行内评论 1 · `src/feature.txt:1`',
+    ),
+    '带上行内评论时提示词应当出现行内小节',
+  );
+  log.warn('行内评论回退场景通过：中文路径可锚定，Gitee/Gitea 均会读回核对并退回汇总评论 ✅');
+
   // ---------------------------------------------------------- 回归：评审意见
 
   // ① 任务失败后，本地快照必须立刻带上 ai/stuck：重试按钮依赖它判断可用性，
@@ -1225,6 +1501,75 @@ async function main(): Promise<void> {
 
 function assert(condition: unknown, message: string): void {
   if (!condition) throw new Error(`断言失败：${message}`);
+}
+
+/** Account stub for a provider that is pointed at a local fake API. */
+function fakeAccount(provider: ProviderAccount['provider'], baseUrl: string): ProviderAccount {
+  return { provider, baseUrl, username: null, token: 'sim-token', proxyUrl: null };
+}
+
+function expectRejects(action: () => Promise<unknown>, message: string): Promise<string> {
+  return action().then(
+    () => {
+      throw new Error(`断言失败：${message}（实际没有抛错）`);
+    },
+    (error: unknown) => {
+      const text = error instanceof Error ? error.message : String(error);
+      if (!text) throw new Error(`断言失败：${message}（未带上错误信息）`);
+      return text;
+    },
+  );
+}
+
+interface FakeApiCall {
+  method: string;
+  path: string;
+  body: unknown;
+}
+
+/**
+ * In-process stand-in for a platform REST API, so the provider fallbacks can be
+ * verified offline: it records every call and answers from `handler`.
+ */
+async function startFakeApi(handler: (call: FakeApiCall) => { status: number; json?: unknown }) {
+  const calls: FakeApiCall[] = [];
+  const server = createServer((request, response) => {
+    const chunks: Buffer[] = [];
+    request.on('data', (chunk) => chunks.push(chunk as Buffer));
+    request.on('end', () => {
+      const raw = Buffer.concat(chunks).toString('utf8');
+      let body: unknown = null;
+      try {
+        body = raw.length > 0 ? JSON.parse(raw) : null;
+      } catch {
+        body = raw;
+      }
+      const call: FakeApiCall = {
+        method: request.method ?? '',
+        path: new URL(request.url ?? '/', 'http://fake.local').pathname,
+        body,
+      };
+      calls.push(call);
+      const answer = handler(call);
+      response.writeHead(answer.status, { 'content-type': 'application/json' });
+      response.end(answer.json === undefined ? '' : JSON.stringify(answer.json));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  if (address === null || typeof address === 'string') {
+    throw new Error('模拟 API 未能绑定本地端口');
+  }
+  return {
+    baseUrl: `http://127.0.0.1:${address.port}`,
+    calls,
+    close: () =>
+      new Promise<void>((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()));
+        // 原生 fetch 会保持 keep-alive 连接，不主动断开的话 close() 永不回调。
+        server.closeAllConnections();
+      }),
+  };
 }
 
 /** How often `needle` appears in `text` (used to check PR section headings). */

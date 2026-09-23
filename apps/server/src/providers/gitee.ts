@@ -8,7 +8,7 @@ import type {
   RemoteUser,
 } from '@autogit/shared';
 
-import { ApiClient, tryRequests } from './http.js';
+import { ApiClient, ApiError, tryRequests } from './http.js';
 import {
   basicAuthHeader,
   type CreateLabelInput,
@@ -111,6 +111,12 @@ function toNumber(value: string | number | null | undefined): number | null {
   if (value === null || value === undefined) return null;
   const parsed = typeof value === 'number' ? value : Number.parseInt(value, 10);
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+/** Best effort text of a failed request, so the caller can log why it fell back. */
+function describeFailure(error: unknown): string {
+  if (error instanceof ApiError) return error.detail;
+  return error instanceof Error ? error.message : String(error);
 }
 
 function labelsOf(labels: Array<GiteeLabel | string> | undefined): string[] {
@@ -387,10 +393,11 @@ export class GiteeProvider implements GitProvider {
   /**
    * Gitee documents `position` as a line count inside the diff, but deployments
    * disagree and some treat it as the line number of the new file. Both
-   * readings are tried, and the created comment is read back: when the anchor
-   * did not land on the intended line the comment is deleted again, so the
-   * caller keeps that finding in the summary instead of leaving a misleading
-   * anchor on the pull request.
+   * readings are tried - a request the instance rejects moves on to the next
+   * reading instead of aborting the loop - and the created comment is read back:
+   * only a returned `new_line` equal to the intended line counts as success.
+   * Anything else deletes the comment again, so the caller keeps that finding in
+   * the summary comment instead of leaving a misleading anchor behind.
    */
   async createReviewComment(
     ref: RepoRef,
@@ -400,21 +407,38 @@ export class GiteeProvider implements GitProvider {
     const path = `/repos/${ref.owner}/${ref.name}/pulls/${number}/comments`;
     const positions =
       input.diffPosition === input.line ? [input.diffPosition] : [input.diffPosition, input.line];
+    const rejected: string[] = [];
 
     for (const position of positions) {
-      const created = await this.client.post<GiteePullComment>(path, {
-        body: {
-          body: input.body,
-          path: input.path,
-          position,
-          ...(input.commitId ? { commit_id: input.commitId } : {}),
-        },
-      });
+      let created: GiteePullComment | null = null;
+      try {
+        created = await this.client.post<GiteePullComment>(path, {
+          body: {
+            body: input.body,
+            path: input.path,
+            position,
+            ...(input.commitId ? { commit_id: input.commitId } : {}),
+          },
+        });
+      } catch (error) {
+        // An instance reading `position` as a new file line rejects the patch
+        // position (and vice versa); the other reading is still worth a try.
+        rejected.push(`position=${position} 被拒绝（${describeFailure(error)}）`);
+        continue;
+      }
 
       const id = toNumber(created?.id);
-      const verified = id === null ? null : await this.readPullComment(ref, id);
-      const line = verified ? (toNumber(verified.new_line) ?? toNumber(verified.position)) : null;
-      if (id !== null && line === input.line) {
+      if (id === null) {
+        rejected.push(`position=${position} 的响应里没有评论 id`);
+        continue;
+      }
+
+      const verified = await this.readPullComment(ref, id);
+      // Only the real new file line counts. Falling back to `position` would
+      // compare a patch offset against a line number, and an instance that
+      // echoes the value back would make a misplaced comment look verified.
+      const line = toNumber(verified?.new_line);
+      if (line === input.line) {
         return {
           id: String(id),
           author: verified?.user?.login ?? 'autogit',
@@ -425,10 +449,12 @@ export class GiteeProvider implements GitProvider {
           line,
         };
       }
-      if (id !== null) await this.deletePullComment(ref, id);
+
+      await this.deletePullComment(ref, id);
+      rejected.push(`position=${position} 落在${line === null ? '无法确认的行' : `第 ${line} 行`}`);
     }
 
-    throw new Error('Gitee 未接受这条行内评论：评论无法锚定到目标代码行');
+    throw new Error(`Gitee 未接受这条行内评论，该条已退回汇总评论：${rejected.join('；')}`);
   }
 
   private async readPullComment(ref: RepoRef, id: number): Promise<GiteePullComment | null> {

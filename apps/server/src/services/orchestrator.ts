@@ -1376,7 +1376,7 @@ export class Orchestrator {
         this.appendLog(
           input.taskId,
           'system',
-          `行内评论未能发布（${anchor.path}:${anchor.line}）：${describeProviderError(error)}`,
+          `行内评论未能发布（${anchor.path}:${anchor.line}），该条已退回汇总评论：${describeProviderError(error)}`,
         );
       }
     }

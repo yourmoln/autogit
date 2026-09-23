@@ -29,6 +29,14 @@ export interface CommitResult {
   sha: string | null;
 }
 
+/**
+ * Diffs are read with `core.quotePath=false`: with the default setting git
+ * escapes every non ASCII byte of a path (`"b/docs/\350\257\264\346\230\216.md"`),
+ * which hides the real file name from `util/diff-anchors.ts` and from the
+ * prompts, so findings on such files could never be anchored.
+ */
+const RAW_PATH_DIFF = ['-c', 'core.quotePath=false'];
+
 /** Lock files a killed git process can leave behind; git refuses to run while they exist. */
 const STALE_LOCK_FILES = [
   'index.lock',
@@ -614,14 +622,17 @@ export class WorkspaceManager {
     maxChars = 60_000,
   ): Promise<string> {
     const net = this.netFor(provider);
-    const stat = await git(['diff', '--stat', `${baseRef}...HEAD`], { cwd: dir, ...net });
-    const diff = await git(['diff', `${baseRef}...HEAD`], { cwd: dir, ...net });
+    const stat = await git([...RAW_PATH_DIFF, 'diff', '--stat', `${baseRef}...HEAD`], {
+      cwd: dir,
+      ...net,
+    });
+    const diff = await git([...RAW_PATH_DIFF, 'diff', `${baseRef}...HEAD`], { cwd: dir, ...net });
     const text = `${stat.stdout.trim()}\n\n${diff.stdout.trim()}`.trim();
     return text.length > maxChars ? `${text.slice(0, maxChars)}\n…（diff 已截断）` : text;
   }
 
   async diffStat(dir: string, baseRef: string, provider: GitProvider): Promise<string> {
-    const result = await git(['diff', '--stat', `${baseRef}...HEAD`], {
+    const result = await git([...RAW_PATH_DIFF, 'diff', '--stat', `${baseRef}...HEAD`], {
       cwd: dir,
       ...this.netFor(provider),
     });
@@ -640,7 +651,7 @@ export class WorkspaceManager {
     provider: GitProvider,
     maxChars = 2_000_000,
   ): Promise<string> {
-    const result = await git(['diff', '--no-color', `${baseRef}...HEAD`], {
+    const result = await git([...RAW_PATH_DIFF, 'diff', '--no-color', `${baseRef}...HEAD`], {
       cwd: dir,
       ...this.netFor(provider),
     });

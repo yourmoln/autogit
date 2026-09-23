@@ -389,7 +389,10 @@ export class GiteaProvider implements GitProvider {
   ): Promise<Comment> {
     // Gitea anchors a code comment by line number of the file version, even
     // though the field is named `new_position` (`old_position` covers deleted
-    // lines). A review is the only write endpoint that accepts them.
+    // lines). A review is the only write endpoint that accepts them, and the
+    // line it really stored is read back afterwards: instances disagree about
+    // that field, and a comment sitting on the wrong line would be worse than
+    // one that stays in the summary.
     const review = await this.client.post<GiteaPullReview>(
       `/repos/${ref.owner}/${ref.name}/pulls/${number}/reviews`,
       {
@@ -408,8 +411,23 @@ export class GiteaProvider implements GitProvider {
         },
       },
     );
+
+    const reviewId = toNumericId(review?.id ?? null);
+    const verified = reviewId === null ? null : await this.readReviewComment(ref, number, reviewId);
+    if (verified === null || verified.line !== input.line) {
+      // The review exists only for this one comment, so dropping it removes the
+      // misplaced anchor again. Best effort: instances without the endpoint
+      // answer 404/405 and the comment has to be ignored instead.
+      if (reviewId !== null) await this.deleteReview(ref, number, reviewId);
+      throw new Error(
+        `Gitea 未确认这条行内评论的锚点（目标第 ${input.line} 行，实际${
+          verified?.line ?? '无法读回'
+        }），该条已退回汇总评论`,
+      );
+    }
+
     return {
-      id: String(review?.id ?? Date.now()),
+      id: String(verified.id),
       author: review?.user?.login ?? 'autogit',
       body: input.body,
       createdAt: review?.submitted_at ?? new Date().toISOString(),
@@ -417,6 +435,45 @@ export class GiteaProvider implements GitProvider {
       path: input.path,
       line: input.line,
     };
+  }
+
+  /**
+   * The code comment the instance really stored for a review, read back over
+   * `GET .../reviews/{id}/comments`. `null` means "not verifiable" (endpoint
+   * missing, permission, network), which the caller treats as a failed anchor.
+   */
+  private async readReviewComment(
+    ref: RepoRef,
+    number: number,
+    reviewId: number,
+  ): Promise<{ id: number; line: number | null } | null> {
+    try {
+      const comments = await this.client.paginate<GiteaReviewComment>(
+        `/repos/${ref.owner}/${ref.name}/pulls/${number}/reviews/${reviewId}/comments`,
+        { perPageParam: 'limit', limit: 50 },
+      );
+      const comment = comments[0];
+      if (!comment) return null;
+      return { id: comment.id, line: comment.position ?? comment.original_position ?? null };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Best effort removal of a review that only existed for an inline comment.
+   * Gitea deletes the code comments of a review together with the review, so
+   * this takes a misplaced anchor off the pull request again; instances without
+   * the endpoint answer 404/405 and the caller keeps the summary fallback.
+   */
+  private async deleteReview(ref: RepoRef, number: number, reviewId: number): Promise<void> {
+    try {
+      await this.client.delete(
+        `/repos/${ref.owner}/${ref.name}/pulls/${number}/reviews/${reviewId}`,
+      );
+    } catch {
+      // Verifying is what matters here; deleting is a courtesy.
+    }
   }
 
   async setLabels(ref: RepoRef, target: LabelTargetInput): Promise<void> {

@@ -118,15 +118,62 @@ export function parseDiffAnchors(diff: string): DiffAnchors {
 
 /** `b/src/x.ts` / `"b/src/x y.ts"` / `/dev/null` as written in a patch header. */
 function parseDiffSpec(spec: string): string | null {
-  let value = spec.trim();
-  if (value.startsWith('"') && value.endsWith('"')) {
-    value = value
-      .slice(1, -1)
-      .replace(/\\t/g, '\t')
-      .replace(/\\(["\\])/g, '$1');
-  }
+  const raw = spec.trim();
+  const value =
+    raw.length >= 2 && raw.startsWith('"') && raw.endsWith('"')
+      ? decodeQuotedPath(raw.slice(1, -1))
+      : raw;
   if (!value || value === '/dev/null') return null;
   return value;
+}
+
+/** The C style escapes git may write inside a quoted path (see git's `quote.c`). */
+const QUOTED_PATH_ESCAPES: Record<string, string> = {
+  a: '\u0007',
+  b: '\b',
+  f: '\f',
+  n: '\n',
+  r: '\r',
+  t: '\t',
+  v: '\v',
+  '"': '"',
+  '\\': '\\',
+};
+
+/**
+ * Decodes a quoted path the way git wrote it: `"` and `\` are escaped, so are
+ * control characters, and - while `core.quotePath` keeps its default - every
+ * non ASCII byte as `\OOO`. Those octal escapes are UTF-8 bytes, so they have to
+ * be collected as bytes and decoded together with the literal characters;
+ * otherwise a repository with Chinese file names never resolves an anchor.
+ * AutoGit asks git for raw paths (`core.quotePath=false`), so this is the second
+ * line of defence for patches produced with the default setting.
+ */
+function decodeQuotedPath(quoted: string): string {
+  const bytes: number[] = [];
+  const push = (text: string): void => {
+    for (const byte of Buffer.from(text, 'utf8')) bytes.push(byte);
+  };
+
+  for (let index = 0; index < quoted.length; index += 1) {
+    const char = quoted.charAt(index);
+    if (char !== '\\') {
+      push(char);
+      continue;
+    }
+
+    const octal = /^[0-7]{3}/.exec(quoted.slice(index + 1))?.[0];
+    if (octal) {
+      bytes.push(Number.parseInt(octal, 8));
+      index += 3;
+      continue;
+    }
+
+    const next = quoted.charAt(index + 1);
+    push(QUOTED_PATH_ESCAPES[next] ?? next);
+    index += 1;
+  }
+  return Buffer.from(bytes).toString('utf8');
 }
 
 /** Drops the `a/` / `b/` prefix git puts in front of every diff path. */

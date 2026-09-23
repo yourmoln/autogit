@@ -28,7 +28,7 @@ import websocket from '@fastify/websocket';
 import Fastify from 'fastify';
 
 import { ensureRuntimeDirectories, loadRuntimeConfig } from '../config.js';
-import { createContext, type AppContext } from '../context.js';
+import { type AppContext, createContext } from '../context.js';
 import { Db } from '../db/database.js';
 import { migrate } from '../db/migrations.js';
 import { Store } from '../db/store.js';
@@ -40,6 +40,7 @@ import { CodexService } from '../services/codex.js';
 import { EventBus } from '../services/events.js';
 import { LabelService } from '../services/labels.js';
 import { buildPullRequestBody, Orchestrator } from '../services/orchestrator.js';
+import { bodyProblems } from '../services/pr-metadata.js';
 import { ProviderFactory } from '../services/providers.js';
 import { ProxyService } from '../services/proxy.js';
 import type { EngineRunInput, EngineRunResult } from '../services/runner.js';
@@ -73,6 +74,8 @@ class StubProvider implements GitProvider {
     nextCommentId: 1,
   };
   private nextPullRequest = 1;
+  /** Every title/body rewrite AutoGit asked for, in order. */
+  readonly metadataUpdates: Array<{ number: number; title?: string; body?: string }> = [];
 
   constructor(private readonly cloneUrl: string) {}
 
@@ -231,6 +234,33 @@ class StubProvider implements GitProvider {
     return pr;
   }
 
+  /**
+   * Rewrites the title/body like a platform would. The returned PR is the same
+   * object the orchestrator reads back, so the assertions can check the result
+   * without another `getPullRequest` call.
+   */
+  async updatePullRequest(
+    _ref: RepoRef,
+    number: number,
+    input: { title?: string; body?: string },
+  ): Promise<RemotePullRequest> {
+    const pr = this.state.pullRequests.get(number);
+    if (!pr) throw new Error(`stub PR #${number} not found`);
+    if (input.title !== undefined) pr.title = input.title;
+    if (input.body !== undefined) pr.body = input.body;
+    pr.updatedAt = new Date().toISOString();
+    this.metadataUpdates.push({ number, ...input });
+    return pr;
+  }
+
+  /** Test helper: makes a PR look like one AutoGit used to create. */
+  setPullRequestMetadata(number: number, input: { title?: string; body?: string }): void {
+    const pr = this.state.pullRequests.get(number);
+    if (!pr) throw new Error(`stub PR #${number} not found`);
+    if (input.title !== undefined) pr.title = input.title;
+    if (input.body !== undefined) pr.body = input.body;
+  }
+
   /** Test helper: merges a pull request so the reconcile path can be verified. */
   mergePullRequest(number: number): void {
     const pr = this.state.pullRequests.get(number);
@@ -275,6 +305,15 @@ class SimulationRunner extends EngineRunner {
   verdictRepairs = 0;
   /** How many following implement runs fail, to exercise the retry budget. */
   failImplementTimes = 0;
+  /** How many following reviews answer `needs_fix` regardless of the diff. */
+  forceNeedsFixRounds = 0;
+  /**
+   * How many following fix runs finish without touching a file, the way a real
+   * one does when every finding is a merge-side or metadata action.
+   */
+  noChangeFixRounds = 0;
+  /** Action block the next no-change fix run hands back to AutoGit. */
+  fixActionBlock: Record<string, unknown> | null = null;
   /** Wall-clock deadline every following run waits for before doing its work. */
   private holdUntil = 0;
 
@@ -341,6 +380,26 @@ class SimulationRunner extends EngineRunner {
         input.log('agent', prose);
         return success(prose, started);
       }
+      if (this.forceNeedsFixRounds > 0) {
+        this.forceNeedsFixRounds -= 1;
+        const verdict = {
+          verdict: 'needs_fix',
+          summary: '改动本身可以合并，但分支历史里仍有必须由合并侧处理的内容。',
+          issues: [
+            {
+              severity: 'blocker',
+              title: '分支历史需要合并侧改写',
+              detail: '历史里的缓存对象只能由有推送权限的一侧清理。',
+              file: null,
+              line: null,
+              suggestion: '合并前先改写分支历史。',
+            },
+          ],
+          tests: null,
+        };
+        input.log('agent', `模拟评审结论：${verdict.verdict}`);
+        return success(JSON.stringify(verdict, null, 2), started);
+      }
       const verdict = {
         verdict: 'approve',
         summary: '改动符合预期，测试通过，可以合并。',
@@ -352,6 +411,30 @@ class SimulationRunner extends EngineRunner {
     }
 
     if (input.prompt.includes('修复代理')) {
+      if (this.noChangeFixRounds > 0) {
+        this.noChangeFixRounds -= 1;
+        input.log('agent', '模拟：评审意见都不需要改动仓库文件，本轮不修改任何文件');
+        const lines = [
+          this.fixActionBlock
+            ? '本轮意见都不需要改动仓库文件，已按下面的动作块交给 AutoGit 执行。'
+            : '本轮意见都只能由人工/合并侧执行，仓库文件无需改动。',
+          '',
+          '## 实现假设清单',
+          '',
+          '- 假设分支历史只能由有推送权限的一侧改写。',
+          '',
+          '## 代码逻辑图',
+          '',
+          '```mermaid',
+          'flowchart LR',
+          '  A["评审意见"] --> B["人工/合并侧执行"]',
+          '```',
+        ];
+        if (this.fixActionBlock) {
+          lines.push('', '```autogit', JSON.stringify(this.fixActionBlock, null, 2), '```');
+        }
+        return success(lines.join('\n'), started);
+      }
       input.log('command', '$ write src/feature.txt');
       writeFileSync(
         path.join(input.cwd, 'src', 'feature.txt'),
@@ -1034,6 +1117,273 @@ async function main(): Promise<void> {
     workspace.releaseTaskWorkspace(repository.id, taskId);
   }
   log.warn('基座抓取场景通过：同仓库并发任务串行抓取基座克隆，不再互抢 ref 锁 ✅');
+
+  // ---- 场景 6：无文件改动的修复不再判失败，标题/正文由 AutoGit 维护 --------
+  //
+  // 旧行为：修复任务只要没有产生文件改动就抛错判失败，于是「评审要求改 PR
+  // 标题 / 要求合并侧改写历史」这类只能由 AutoGit 或人工执行的意见会把流水线
+  // 卡死（线上 PR #8 连续 20 轮 review ↔ fix 空转后失败）。现在元数据由 AutoGit
+  // 自己通过平台 API 修正，无改动的修复按「无需改动」记为成功并说明理由。
+  settings.update({ maxConcurrentPerRepo: 1 });
+  const metadataIssue = provider.seedIssue({
+    number: 7,
+    title: '标题与正文维护',
+    body: '用于验证 AutoGit 自己维护 PR 标题与正文，以及无改动的修复不再判失败。',
+    labels: ['ai/todo'],
+  });
+  await runUntilQuiet(orchestrator, store, repository.id, 8);
+
+  const metadataTasks = store
+    .listTasks({ repositoryId: repository.id, limit: 300 })
+    .filter((task) => task.kind === 'implement' && task.issueNumber === metadataIssue.number);
+  assert(
+    metadataTasks.some((task) => task.status === 'succeeded'),
+    'Issue #7 应当实现成功',
+  );
+  const metadataBranch = metadataTasks.find((task) => task.branch !== null)?.branch ?? '';
+  const metadataPr = await provider.findPullRequestByHead(
+    { owner: 'sim', name: 'demo' },
+    metadataBranch,
+  );
+  assert(metadataPr !== null, `Issue #7 应当创建 PR（分支 ${metadataBranch}）`);
+  if (!metadataPr) throw new Error('Issue #7 应当创建 PR');
+
+  // 默认模板渲染的是「标题与正文维护 (#7)」，AutoGit 建 PR 时就补齐类型前缀；
+  // 正文由 buildPullRequestBody 生成，两节必须齐全。
+  assert(
+    metadataPr.title === `feat: ${metadataIssue.title} (#${metadataIssue.number})`,
+    `新建 PR 的标题应当带类型前缀，实际「${metadataPr.title}」`,
+  );
+  assert(
+    bodyProblems(metadataPr.body).length === 0,
+    `新建 PR 的正文应当包含两节，问题：${bodyProblems(metadataPr.body).join('；')}`,
+  );
+  log.warn('元数据场景：新建 PR 的标题与正文已符合仓库约定 ✅');
+
+  // 模拟历史遗留的 PR：标题没有类型前缀，正文也缺两节。
+  const legacyPr = metadataPr;
+  provider.setPullRequestMetadata(legacyPr.number, {
+    title: '标题与正文维护 (#7)',
+    body: '## 改动说明\n\n（人为去掉两节，模拟早期 AutoGit 建的 PR）',
+  });
+  const updatesBefore = provider.metadataUpdates.length;
+  runner.forceNeedsFixRounds = 1;
+  runner.noChangeFixRounds = 1;
+  await provider.setLabels(
+    { owner: 'sim', name: 'demo' },
+    { number: legacyPr.number, labels: ['ai/needs-fix'], isPullRequest: true },
+  );
+  await orchestrator.tick('metadata-sync');
+  await waitForIdle(orchestrator, store, 60_000);
+
+  const syncedPr = await provider.getPullRequest({ owner: 'sim', name: 'demo' }, legacyPr.number);
+  assert(
+    syncedPr.title === `feat: ${metadataIssue.title} (#${metadataIssue.number})`,
+    `AutoGit 应当把标题补成 \`feat: …\`，实际「${syncedPr.title}」`,
+  );
+  assert(
+    bodyProblems(syncedPr.body).length === 0,
+    `AutoGit 应当补齐正文两节，问题：${bodyProblems(syncedPr.body).join('；')}`,
+  );
+  assert(
+    provider.metadataUpdates.length > updatesBefore &&
+      provider.metadataUpdates.at(-1)?.number === legacyPr.number,
+    'AutoGit 应当通过平台 API 修改过该 PR 的标题与正文',
+  );
+  const syncTask = store
+    .listTasks({ repositoryId: repository.id, limit: 300 })
+    .find((task) => task.kind === 'fix' && task.prNumber === legacyPr.number);
+  assert(
+    syncTask?.status === 'succeeded',
+    `没有文件改动的修复任务应当记为成功，实际 ${syncTask?.status}（${syncTask?.error ?? '无错误信息'}）`,
+  );
+  assert(syncTask?.error === null, '没有文件改动的修复任务不应带错误原因');
+  assert(
+    syncedPr.labels.includes('ai/needs-review'),
+    'AutoGit 修正元数据后 PR 应当回到 ai/needs-review（有进展就继续流水线）',
+  );
+  log.warn('元数据场景通过：AutoGit 自己修正 PR 标题与正文，无改动的修复不判失败 ✅');
+
+  // 元数据已经合规、文件也不用改：按「无需改动」记录理由并交回人工，
+  // 既不再判失败，也不会让流水线继续空转。
+  const updatesBeforePark = provider.metadataUpdates.length;
+  runner.forceNeedsFixRounds = 1;
+  runner.noChangeFixRounds = 1;
+  await provider.setLabels(
+    { owner: 'sim', name: 'demo' },
+    { number: legacyPr.number, labels: ['ai/needs-fix'], isPullRequest: true },
+  );
+  await orchestrator.tick('no-change-fix');
+  await waitForIdle(orchestrator, store, 60_000);
+
+  const parkedPr = await provider.getPullRequest({ owner: 'sim', name: 'demo' }, legacyPr.number);
+  const noChangeTasks = store
+    .listTasks({ repositoryId: repository.id, limit: 300 })
+    .filter((task) => task.kind === 'fix' && task.prNumber === legacyPr.number);
+  // `listTasks` returns newest first, so the parked run is the first entry.
+  const noChangeTask = noChangeTasks[0];
+  assert(
+    noChangeTask?.status === 'succeeded',
+    `没有任何改动的修复应当记为成功并说明理由，实际 ${noChangeTask?.status}`,
+  );
+  assert(noChangeTask?.error === null, '没有任何改动的修复不应带错误原因');
+  assert(
+    (noChangeTask?.summary ?? '').includes('没有产生文件改动'),
+    '任务总结里应当说明「本轮没有产生文件改动」的理由',
+  );
+  assert(parkedPr.labels.includes('ai/stuck'), '没有任何改动时应当交回人工确认');
+  assert(
+    provider.metadataUpdates.length === updatesBeforePark,
+    '元数据已经合规时不应再调用平台 API 改写标题/正文',
+  );
+
+  const tasksBeforeExtraTick = store.listTasks({ repositoryId: repository.id, limit: 300 }).length;
+  await orchestrator.tick('no-change-fix-again');
+  await waitForIdle(orchestrator, store, 60_000);
+  assert(
+    store.listTasks({ repositoryId: repository.id, limit: 300 }).length === tasksBeforeExtraTick,
+    'ai/stuck 之后不应当再自动重排修复任务（否则又会回到 review ↔ fix 空转）',
+  );
+  log.warn('无改动场景通过：记录理由并转人工确认，不再判失败也不再空转 ✅');
+
+  // 模型自己决定、AutoGit 代跑：修复代理在动作块里要求改标题与正文。
+  const requestedBody = [
+    '## 改动说明',
+    '',
+    '标题与正文由修复代理给出，AutoGit 负责执行。',
+    '',
+    '## 实现假设清单',
+    '',
+    '- 假设平台 API 由 AutoGit 调用，修复代理只负责判断。',
+    '',
+    '## 代码逻辑图',
+    '',
+    '```mermaid',
+    'flowchart LR',
+    '  A["修复代理提出动作"] --> B["AutoGit 执行"]',
+    '```',
+  ].join('\n');
+  provider.setPullRequestMetadata(legacyPr.number, {
+    title: '待代理修标题',
+    body: '## 改动说明\n\n（缺两节，等代理请求）',
+  });
+  runner.forceNeedsFixRounds = 1;
+  runner.noChangeFixRounds = 1;
+  runner.fixActionBlock = {
+    prTitle: 'fix: 待代理修标题',
+    prBody: requestedBody,
+    reason: '标题与正文属于平台元数据，沙箱里改不到',
+  };
+  await provider.setLabels(
+    { owner: 'sim', name: 'demo' },
+    { number: legacyPr.number, labels: ['ai/needs-fix'], isPullRequest: true },
+  );
+  await orchestrator.tick('agent-requested-metadata');
+  await waitForIdle(orchestrator, store, 60_000);
+  runner.fixActionBlock = null;
+
+  const requestedPr = await provider.getPullRequest(
+    { owner: 'sim', name: 'demo' },
+    legacyPr.number,
+  );
+  assert(
+    requestedPr.title === 'fix: 待代理修标题',
+    `AutoGit 应当按请求改标题，实际「${requestedPr.title}」`,
+  );
+  assert(requestedPr.body === requestedBody, 'AutoGit 应当按请求替换 PR 正文');
+  assert(
+    requestedPr.labels.includes('ai/needs-review'),
+    '执行完代理请求的动作后 PR 应当回到 ai/needs-review',
+  );
+  log.warn('动作场景通过：修复代理提出、AutoGit 代执行 PR 标题与正文修改 ✅');
+
+  // ---- 场景 7：修复代理请求清理分支历史 --------------------------------
+  //
+  // 「分支历史里误提交了包缓存」只能靠改写历史解决，而改写需要写 `.git` 与推送
+  // 权限——都在沙箱之外。模型把需求写进动作块，AutoGit 用有界改写（只动本分支
+  // 自己的提交）+ 强推执行，tip 树与合并基准都不许变。
+  const purgeIssue = provider.seedIssue({
+    number: 8,
+    title: '历史里的误提交缓存',
+    body: '用于验证修复代理请求清理分支历史时，AutoGit 会代它改写并强推。',
+    labels: ['ai/todo'],
+  });
+  await runUntilQuiet(orchestrator, store, repository.id, 8);
+
+  const purgeTasks = store
+    .listTasks({ repositoryId: repository.id, limit: 300 })
+    .filter((task) => task.kind === 'implement' && task.issueNumber === purgeIssue.number);
+  const purgeBranch = purgeTasks.find((task) => task.branch !== null)?.branch ?? '';
+  const purgePr = await provider.findPullRequestByHead({ owner: 'sim', name: 'demo' }, purgeBranch);
+  assert(purgePr !== null, `Issue #8 应当创建 PR（分支 ${purgeBranch}）`);
+  if (!purgePr) throw new Error('Issue #8 应当创建 PR');
+
+  // 制造线上 PR #8 那种形态：先误提交缓存，再在后续提交里删掉工作树里的它。
+  // 于是 tip 树干净，但对象仍然从分支可达——正是「删文件救不了」的情形。
+  git(['fetch', 'origin', purgeBranch], seedDir);
+  git(['checkout', '-B', purgeBranch, 'FETCH_HEAD'], seedDir);
+  mkdirSync(path.join(seedDir, '.pnpm-store'), { recursive: true });
+  writeFileSync(path.join(seedDir, '.pnpm-store', 'junk.bin'), 'cached tarball\n', 'utf8');
+  git(['add', '-f', '--', '.pnpm-store'], seedDir);
+  git(['commit', '-m', 'chore: 误提交包缓存'], seedDir);
+  rmSync(path.join(seedDir, '.pnpm-store'), { recursive: true, force: true });
+  git(['add', '-A'], seedDir);
+  git(['commit', '-m', 'chore: 删除缓存目录（历史仍可达）'], seedDir);
+  git(['push', '--force', 'origin', purgeBranch], seedDir);
+  git(['checkout', 'main'], seedDir);
+
+  const reachableJunk = (): string =>
+    git(
+      ['rev-list', '--objects', `refs/heads/${purgeBranch}`, '--', '.pnpm-store'],
+      bareRepo,
+    ).trim();
+  assert(reachableJunk().length > 0, '回归场景要求分支历史里确实有缓存对象');
+  const tipTreeBefore = git(['rev-parse', `refs/heads/${purgeBranch}^{tree}`], bareRepo).trim();
+  const tipBefore = git(['rev-parse', `refs/heads/${purgeBranch}`], bareRepo).trim();
+
+  runner.forceNeedsFixRounds = 1;
+  runner.noChangeFixRounds = 1;
+  runner.fixActionBlock = {
+    purgePaths: ['.pnpm-store'],
+    reason: '缓存目录只能从分支历史里删掉，沙箱没有写 .git 与推送的权限',
+  };
+  await provider.setLabels(
+    { owner: 'sim', name: 'demo' },
+    { number: purgePr.number, labels: ['ai/needs-fix'], isPullRequest: true },
+  );
+  await orchestrator.tick('purge-history');
+  await waitForIdle(orchestrator, store, 60_000);
+  runner.fixActionBlock = null;
+
+  assert(
+    reachableJunk() === '',
+    `改写后分支历史里不应再有缓存对象，实际：${reachableJunk().slice(0, 200)}`,
+  );
+  assert(
+    git(['rev-parse', `refs/heads/${purgeBranch}^{tree}`], bareRepo).trim() === tipTreeBefore,
+    '改写分支历史后 tip 树必须逐字节不变',
+  );
+  assert(
+    git(['rev-parse', `refs/heads/${purgeBranch}`], bareRepo).trim() !== tipBefore,
+    '改写应当真的移动了分支 tip',
+  );
+  const purgeFixTask = store
+    .listTasks({ repositoryId: repository.id, limit: 300 })
+    .find((task) => task.kind === 'fix' && task.prNumber === purgePr.number);
+  assert(
+    purgeFixTask?.status === 'succeeded',
+    `清理历史的修复任务应当成功，实际 ${purgeFixTask?.status}（${purgeFixTask?.error ?? '无错误信息'}）`,
+  );
+  assert(
+    (purgeFixTask?.summary ?? '').includes('分支历史已改写'),
+    '任务总结里应当说明 AutoGit 代执行的改写动作',
+  );
+  const purgedPr = await provider.getPullRequest({ owner: 'sim', name: 'demo' }, purgePr.number);
+  assert(
+    purgedPr.labels.includes('ai/needs-review'),
+    '分支历史清理完成后 PR 应当回到 ai/needs-review',
+  );
+  log.warn('历史清理场景通过：模型提出、AutoGit 有界改写并强推，tip 树保持不变 ✅');
 
   orchestrator.stop();
 

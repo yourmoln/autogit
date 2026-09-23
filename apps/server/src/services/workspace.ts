@@ -29,6 +29,15 @@ export interface CommitResult {
   sha: string | null;
 }
 
+export interface PurgeResult {
+  /** Whether the branch tip actually moved. */
+  rewritten: boolean;
+  /** Branch tip before the rewrite. */
+  from: string;
+  /** Branch tip after the rewrite (`from` when nothing was rewritten). */
+  to: string;
+}
+
 /** Lock files a killed git process can leave behind; git refuses to run while they exist. */
 const STALE_LOCK_FILES = [
   'index.lock',
@@ -618,6 +627,91 @@ export class WorkspaceManager {
     const diff = await git(['diff', `${baseRef}...HEAD`], { cwd: dir, ...net });
     const text = `${stat.stdout.trim()}\n\n${diff.stdout.trim()}`.trim();
     return text.length > maxChars ? `${text.slice(0, maxChars)}\n…（diff 已截断）` : text;
+  }
+
+  /**
+   * Deletes `paths` from the commits this branch added, leaving the rest alone.
+   *
+   * A path committed by mistake (`.pnpm-store/`, build output) cannot be fixed
+   * by deleting it in a later commit: every object stays reachable from `HEAD`,
+   * so `Create a merge commit` still drags the whole cache into the base
+   * branch's ancestry for good. The only repair is rewriting the commits that
+   * added it.
+   *
+   * The rewrite is bounded to `<merge base>..HEAD` — the commits this branch
+   * contributes — because `git filter-branch` rebuilds every commit it walks
+   * and a rebuilt commit loses its `gpgsig`; walking the base branch's own
+   * commits would move the merge base backwards and turn a mergeable PR into a
+   * conflicted one while the tip tree stayed identical.
+   *
+   * The branch is only moved when both invariants hold afterwards: the tip
+   * *tree* is byte-identical (a rewrite may change what the branch carries in
+   * its history, never what it contains) and the merge base with `baseRef` is
+   * unchanged (which is what keeps the PR mergeable without conflicts).
+   */
+  async purgePathsFromHistory(
+    dir: string,
+    baseRef: string,
+    paths: string[],
+    provider: GitProvider,
+    log: WorkspaceLog,
+  ): Promise<PurgeResult> {
+    const net = this.netFor(provider);
+    const run = (args: string[], env?: NodeJS.ProcessEnv) =>
+      git(args, { cwd: dir, ...net, env, onLine: (line) => log('git', line.message) });
+    const head = async (): Promise<string> => (await run(['rev-parse', 'HEAD'])).stdout.trim();
+
+    const from = await head();
+    const treeBefore = (await run(['rev-parse', 'HEAD^{tree}'])).stdout.trim();
+    const mergeBase = (await run(['merge-base', baseRef, 'HEAD'])).stdout.trim();
+    if (!from || !treeBefore || !mergeBase) {
+      throw new Error(`无法读取分支状态（HEAD=${from}，合并基准=${mergeBase || '未知'}）`);
+    }
+
+    const filter = paths
+      .map((item) => `git rm -r --cached --ignore-unmatch -- "${item}"`)
+      .join(' && ');
+    const rewrite = await git(
+      [
+        'filter-branch',
+        '-f',
+        '--index-filter',
+        filter,
+        '--prune-empty',
+        '--',
+        `${mergeBase}..HEAD`,
+      ],
+      {
+        cwd: dir,
+        ...net,
+        // The helpers git uses to run `--index-filter` print a deprecation
+        // notice on every run; the rewrite itself is deliberate here.
+        env: { FILTER_BRANCH_SQUELCH_WARNING: '1' },
+        timeoutMs: 30 * 60_000,
+        onLine: (line) => log('git', line.message),
+      },
+    );
+    if (rewrite.code !== 0) {
+      await run(['reset', '--hard', from]);
+      throw new Error(
+        `改写分支历史失败：${firstLine(rewrite.stderr) || firstLine(rewrite.stdout)}`,
+      );
+    }
+
+    const to = await head();
+    if (to === from) return { rewritten: false, from, to };
+
+    const treeAfter = (await run(['rev-parse', 'HEAD^{tree}'])).stdout.trim();
+    const mergeBaseAfter = (await run(['merge-base', baseRef, 'HEAD'])).stdout.trim();
+    if (treeAfter !== treeBefore || mergeBaseAfter !== mergeBase) {
+      // Undo our own rewrite: the branch must not move when either invariant
+      // broke, and the old tip is still reachable through the backup ref git
+      // leaves in `refs/original/`.
+      await run(['reset', '--hard', from]);
+      throw new Error('改写后的分支与预期不一致（tip 树或合并基准发生变化），已放弃改写');
+    }
+
+    return { rewritten: true, from, to };
   }
 
   async diffStat(dir: string, baseRef: string, provider: GitProvider): Promise<string> {

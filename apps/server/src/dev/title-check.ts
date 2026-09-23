@@ -13,12 +13,17 @@
  * prefix is not a known type now stays the description and gets the inferred (or default)
  * type in front of it.
  *
+ * The rules themselves live in `services/pr-metadata.ts` — the same module AutoGit uses to
+ * repair PR metadata over the platform API — so this check exercises the shipped
+ * implementation instead of a private copy that can drift away from it.
+ *
  * Usage: pnpm --filter @autogit/server title:check
  */
 
 import type { RemoteIssue } from '@autogit/shared';
 
-import { conventionalTitle, renderTitle } from '../services/orchestrator.js';
+import { renderTitle } from '../services/orchestrator.js';
+import { conventionalTitle, titleProblem } from '../services/pr-metadata.js';
 
 /**
  * Types the repository convention allows (README「PR 标题与正文规范」/ AGENTS.md).
@@ -96,6 +101,8 @@ function titleCase(input: string, expected: string): () => string {
       `conventionalTitle(${JSON.stringify(input)}) 得到 ${JSON.stringify(actual)}，期望 ${JSON.stringify(expected)}`,
     );
     assert(leadingType(actual) !== null, `结果不是白名单类型：${actual}`);
+    const problem = titleProblem(actual);
+    assert(problem === null, `生产线校验器不接受该标题：${problem}`);
     return actual;
   };
 }
@@ -109,6 +116,8 @@ function templateCase(template: string, expected: string): () => string {
       `renderTitle(${JSON.stringify(template)}) 得到 ${JSON.stringify(actual)}，期望 ${JSON.stringify(expected)}`,
     );
     assert(leadingType(actual) !== null, `结果不是白名单类型：${actual}`);
+    const problem = titleProblem(actual);
+    assert(problem === null, `生产线校验器不接受该标题：${problem}`);
     return actual;
   };
 }
@@ -153,7 +162,14 @@ function main(): void {
   );
   expect('模板写死 fix', templateCase('fix: {issueTitle}', 'fix: 新增登录密码'));
   expect('模板 FIX： 归一化', templateCase('FIX：  {issueTitle}', 'fix: 新增登录密码'));
-  expect('空模板回落', templateCase('   ', 'feat: 新增登录密码 (#4)'));
+  // 空模板在设置层就收敛成默认模板（`services/settings.ts`：
+  // `prTitleTemplate.trim() || '{issueTitle} (#{issueNumber})'`），renderTitle 见不到空串。
+  // 万一见到也不凭空的编一个 Issue 标题出来——回落只发生在设置层这一处。
+  expect('空模板不编造标题（由设置层兜底）', () => {
+    const actual = renderTitle('   ', ISSUE);
+    assert(actual.trim() === '', `空模板不应当被编造成标题，实际 ${JSON.stringify(actual)}`);
+    return '仅设置层回落';
+  });
   expect('模板写了非类型前缀', templateCase('README: {issueTitle}', 'feat: README: 新增登录密码'));
 
   // ⑥ 超长标题截断到 250 字符，类型前缀必须还在。

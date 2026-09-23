@@ -32,6 +32,8 @@
 | Issue 自动实现 | `ai/todo` → 领取 → `ai/doing` → Codex 实现 → 分支推送 → 创建 PR → `ai/needs-review` |
 | PR 自动评审 | 结构化评审结论（JSON Schema），通过 → `ai/approved`，有问题 → `ai/needs-fix` |
 | 自动修复回路 | 按评审意见修复并回推分支，修复完成自动回到 `ai/needs-review` |
+| 修复代理代执行动作 | 沙箱里做不到的事（改 PR 标题/正文、从分支历史里删掉误提交的路径）由修复代理在 `autogit` 动作块里提出，AutoGit 用凭据执行 |
+| 无改动修复不算失败 | 修复代理确认「评审意见不需要改动仓库文件」时，任务按成功记录并附上理由，PR 转人工确认，不再红着退场空转 |
 | 合并后处理 | 检测到 PR 合并 → Issue 转 `ai/verify`，等待人工验证关闭 |
 | 阻塞与暂停 | 失败自动打 `ai/stuck` 并留言原因；`ai/paused` 人工暂停，轮询器跳过 |
 | 优先级调度 | `ai/priority-high` 全局插队，`ai/priority-low` 后置，默认普通 |
@@ -166,6 +168,7 @@ stateDiagram-v2
     needs_review --> approved: 评审通过
     needs_review --> needs_fix: 评审有问题
     needs_fix --> needs_review: 修复并回推分支
+    needs_fix --> stuck: 没有可执行的改动（人工确认）
     approved --> [*]: 人工合并
     verify --> [*]: 人工验证并关闭 Issue
 ```
@@ -176,6 +179,35 @@ stateDiagram-v2
 - `ai/stuck` 与 `ai/paused` 是附加开关，不会覆盖已有状态，便于人工判断停在哪里。
 - 只跟踪 **open** 的 Issue/PR：远端关闭 Issue（或 PR 被合并、关闭）后，条目会在下一次轮询时离开看板、计数与调度队列；本地快照保留，用于任务历史与标签回溯。
 - 修复与评审共用 PR 分支；分支名固定为 `<branchPrefix><issueNumber>-<slug>`（默认 `ai/issue-`），AutoGit 只会强推自己的分支。
+- 「修复并回推分支」也包括代理要求的动作：改 PR 标题/正文、清理分支历史（见上一节）。只有既没有文件改动、也没有动作请求时才转 `ai/stuck`，且这一轮任务仍记为成功。
+
+## 修复代理的动作与边界
+
+修复代理跑在 Codex 沙箱里：它只能改仓库文件，不能 `git commit/push/checkout`，也没有平台凭据。但评审意见不全是「改文件」能解决的——PR 标题不合规、分支历史里误提交了包缓存——只改文件永远修不掉，评审→修复就会一直空转（线上 PR #8 连续 20 轮）。
+
+所以沙箱里做不到的事由**修复代理决定、AutoGit 执行**：代理在总结末尾附一个 `autogit` 动作块，AutoGit 用自己的凭据照做，并在 PR 上留言列出实际执行了什么。
+
+```autogit
+{
+  "prTitle": "feat: 期望的最终标题",
+  "prBody": "完整正文，必须包含 ## 实现假设清单 与 ## 代码逻辑图 各一次",
+  "purgePaths": [".pnpm-store"],
+  "reason": "为什么需要这些动作"
+}
+```
+
+| 字段 | 语义 |
+| --- | --- |
+| `prTitle` | 直接改 PR 标题；不合规时会先按 `<英文类型>: <描述>` 归一化，仍不合规则忽略并记日志 |
+| `prBody` | 替换 PR 正文；缺 `## 实现假设清单` / `## 代码逻辑图`（或重复、为空）时忽略并记日志 |
+| `purgePaths` | 把这些仓库内相对路径从**本分支自己新增的提交**（合并基准之后）里删除后强推；只允许安全的相对路径，拒绝 `.git`、绝对路径与 `..` |
+| `reason` | 必填项之外的自由说明，会写进任务日志，方便人工复核 |
+
+改写历史有两条硬约束，任何一条不成立就放弃、不动分支：改写前后 **tip 的树必须逐字节相同**（改写只能改变分支携带的历史，不能改变它包含的内容），且**与基准分支的合并基准不变**（这决定 PR 还能不能无冲突合并）。
+
+如果代理既没改文件、也没提出任何动作，说明它认为评审意见已经处理或需要人工决定：任务按**成功**记录并附上代理给出的理由，PR 打上 `ai/stuck` 交回人工——不判失败，也不会继续空转。同类情形连续出现时，人工移除 `ai/stuck` 即获得完整重试额度。
+
+PR 标题与正文本身由 AutoGit 维护：创建 PR 时模板渲染出的标题会自动补成 `<英文类型>: <描述>`，正文固定包含两节；每一轮修复结束时再校验一次，不合规就修正（代理通过动作块给出的内容优先）。
 
 ## Codex CLI 集成
 
@@ -251,7 +283,7 @@ pnpm build        # shared → server → web
 pnpm simulate     # 端到端模拟：真实 git + 假 Codex + 假 Git 平台
 pnpm --filter @autogit/server auth:check            # 登录门禁自检（临时数据目录，真实 HTTP 路由）
 pnpm --filter @autogit/web client:check            # 前端会话生命周期自检（4401 登出 / 4402 轮换重连 / 401 的登录态广播 / 会话结束后的清理）
-pnpm --filter @autogit/server title:check          # PR 标题归一化自检（类型白名单 / 中文前缀 / 模板回落）
+pnpm --filter @autogit/server title:check          # PR 标题归一化自检（类型白名单 / 中文前缀 / 模板与 Issue 标题）
 pnpm --filter @autogit/server proxy:check          # 代理链路自检（本地起 HTTP/SOCKS5 代理）
 pnpm --filter @autogit/server proxy:check -- --online  # 额外验证真实 HTTPS 隧道
 ```
@@ -264,22 +296,22 @@ pnpm --filter @autogit/server proxy:check -- --online  # 额外验证真实 HTTP
 
 `client:check` 用 `window` / `WebSocket` / `fetch` 三个桩件跑前端会话生命周期的 10 项断言：实时连接收到 `4401`（其他设备改凭据、退出登录、会话过期）时广播一次 `autogit:unauthorized` 并停止重连；收到 `4402`（本机改凭据，新 Cookie 就在同一个响应里）时不广播、只退避重连，登录态原地不动（否则改密码成功会先闪一下登录页）；其它关闭码先按 5 分钟节流核对一次会话（会话已失效同样广播）再退避重连，会话仍有效时不广播；受保护接口（含 `PUT /api/auth/credentials`）返回 `401` 时广播失效，而公开的登录 / 会话查询 / 退出登录接口返回 `401`（密码错误）与其它状态码（如 `403`）不广播。会话结束后的清理用真的 React Query 缓存验证（`window` 桩件带事件总线，广播会真的送到订阅方）：`4401` 与登出都走 `lib/session-state.ts` 的 `resetSessionState`，任务日志缓冲清空、受保护查询缓存移除、缓存里的登录态回到匿名；最后再核对 `AuthProvider` 编译后的源码确实把会话失效广播与 `logout` 都接到这个入口，防止它退回没人调用的死代码。
 
-`title:check` 用 40 条断言锁定 `renderTitle()` / `conventionalTitle()` 的归一化规则：白名单里的 11 个类型原样保留（大写、全角冒号与多余空格归一化成「小写 + 半角冒号 + 一个空格」）、中文类型前缀（`修复：…`）改写成英文、没写类型时按开头关键字推断（`新增…` → `feat:`、`优化…` → `perf:`）、推断不出来落 `feat:`、模板渲染成空串时回落到 `<Issue 标题> (#<编号>)`、超长标题截断到 250 字符后类型前缀仍在，以及 `README: 更新说明` / `Release: v1.2` / `docker: 调整镜像` / `AutoGit: 一些说明` 这类「英文单词 + 冒号」不被当成类型 —— 每条断言都会再核对输出前缀确实落在白名单内，所以再冒出 `readme:` / `release:` 这类类型就会直接失败。
+`title:check` 用 40 条断言锁定 `renderTitle()` 与 `services/pr-metadata.ts` 的归一化规则：白名单里的 11 个类型原样保留（大写、全角冒号与多余空格归一化成「小写 + 半角冒号 + 一个空格」）、中文类型前缀（`修复：…`）改写成英文、没写类型时按开头关键字推断（`新增…` → `feat:`、`优化…` → `perf:`）、推断不出来落 `feat:`、超长标题截断到 250 字符后类型前缀仍在、模板渲染成空串时不凭空的编标题（空模板由 `services/settings.ts` 收敛成默认模板），以及 `README: 更新说明` / `Release: v1.2` / `docker: 调整镜像` / `AutoGit: 一些说明` 这类「英文单词 + 冒号」不被当成类型 —— 每条断言都会再用生产线校验器 `titleProblem()` 复核一次、并核对输出前缀确实落在白名单内，所以再冒出 `readme:` / `release:` 这类类型就会直接失败。这条自检直接跑 `services/pr-metadata.ts` 的实现（不再是 `orchestrator.ts` 里的一份私有副本），规则只维护一处。
 
 ### PR 标题与正文规范
 
-PR 标题由 `renderTitle()` 渲染「设置 → PR 标题模板」再归一化，结果必须满足仓库约定 `<英文类型>: <描述>`：类型取 `feat` / `fix` / `chore` / `refactor` / `docs` / `build` / `perf` / `test` / `ci` / `style` / `revert` 之一，冒号必须是半角且后面只有一个空格。
+PR 标题由 `renderTitle()` 渲染「设置 → PR 标题模板」再归一化，结果必须满足仓库约定 `<英文类型>: <描述>`：类型取 `feat` / `fix` / `chore` / `refactor` / `docs` / `build` / `perf` / `test` / `ci` / `style` / `revert` 之一，冒号必须是半角且后面只有一个空格。规则只有一份实现：`services/pr-metadata.ts`（纯函数：类型前缀归一化、必需小节的校验 / 抽取 / 剔除），创建 PR、每轮修复后的再校验与 `title:check` 自检共用它。
 
 - 模板里已经写了英文类型（`fix: {issueTitle}`）时只做归一化：大小写转小写、全角冒号 `：` 换成半角 `:`、多余空格压成一个 —— 但只有上面列出的 11 个类型算类型前缀，别的英文单词不是；
 - 前缀不在那张列表里时整串当描述：`README: 更新说明`、`Release: v1.2`、`docker: 调整镜像` 这类「英文单词 + 冒号」的 Issue 标题会被写成 `feat: README: 更新说明`，而不是原样透传成 `readme:` / `release:` / `docker:` 这种约定外的类型（这条约束同时管着 PR 标题与 Squash 合并后写进 `main` 的提交主题）；
 - 没写类型时按标题开头推断：`新增…` / `实现…` → `feat:`，`修复…` → `fix:`，`优化…` → `perf:`，`文档…` → `docs:`，`构建…` / `升级…` → `build:`，`回滚…` → `revert:`，其余落到 `feat:`；中文类型前缀（`修复：…`）同样被改写成英文；
-- 模板渲染成空串时回落到 `<Issue 标题> (#<编号>)` 再补类型。
+- 模板为空（或只有空白）时不需要在渲染阶段兜底：`services/settings.ts` 保存设置时就把 `prTitleTemplate.trim() || '{issueTitle} (#{issueNumber})'` 写回默认模板，`renderTitle()` 因此见不到空模板，也不会凭空的编一个 Issue 标题出来（`title:check` 有对应断言）。
 
 所以默认模板 `{issueTitle} (#{issueNumber})` 渲染出的「新增登录密码 (#4)」会被写成 `feat: 新增登录密码 (#4)`；提交信息遵守同一条约定（实现提交固定为 `feat: 实现 #<编号> <标题>`）。PR 正文由 `buildPullRequestBody()` 生成，固定包含且各出现一次 `## 实现假设清单` 与 `## 代码逻辑图` 两节、都非空；人工开 PR 时用仓库里的 `.github/pull_request_template.md` 起步。
 
 ### 合并 PR 前：确认分支历史干净
 
-AutoGit 只强推 `ai/*` 分支，但分支历史里可能夹带工作区产物——例如一次误提交的 `.pnpm-store/`（`ai/issue-4-新增登录密码` 这条分支带着 11,678 个对象、约 265 MB，最大单个对象约 72 MB；`git rev-list --objects HEAD -- .pnpm-store` 的原始输出是 11,682 行 = 11,282 个 blob + 398 个 tree + 2 个提交，脚本按路径过滤掉那 2 个提交和 2 条没有路径的 tree，所以两处数字差 4）。工作树里删掉它并不够：这些对象仍从 `HEAD` 可达，所以**含这类历史的分支只能用 `Squash and merge`，或先改写历史再合并**。`Create a merge commit` 会把整条对象链并进 `main`，`Rebase and merge` 会重放当初添加这些文件的提交，两者都让这份包缓存永久留在 `main` 的祖先链里，之后只能靠改写 `main` 的历史才能消除（克隆体积、`git rev-list --objects`、`git log --all` 都会一直背着它）。合并前跑一次：
+AutoGit 只强推 `ai/*` 分支，但分支历史里可能夹带工作区产物——例如一次误提交的 `.pnpm-store/`（`ai/issue-4-新增登录密码` 这条分支最初就误提交过它：11,678 个对象、约 265 MB，最大单个对象约 72 MB；`git rev-list --objects HEAD -- .pnpm-store` 的原始输出是 11,682 行 = 11,282 个 blob + 398 个 tree + 2 个提交，脚本按路径过滤掉那 2 个提交和 2 条没有路径的 tree，所以两处数字差 4。这些对象已按下面的第 1 条从这条分支的历史里改写掉，现在本分支与 `origin/main` 上跑 `pnpm repo:check` 都是退出码 0）。工作树里删掉它并不够：这些对象仍从 `HEAD` 可达，所以**含这类历史的分支只能用 `Squash and merge`，或先改写历史再合并**。`Create a merge commit` 会把整条对象链并进 `main`，`Rebase and merge` 会重放当初添加这些文件的提交，两者都让这份包缓存永久留在 `main` 的祖先链里，之后只能靠改写 `main` 的历史才能消除（克隆体积、`git rev-list --objects`、`git log --all` 都会一直背着它）。合并前跑一次：
 
 ```bash
 pnpm repo:check                    # 先自检扫描逻辑（干净仓库退出码 0、含缓存分支退出码 1），再扫 HEAD 可达的全部对象
@@ -295,7 +327,7 @@ pnpm repo:purge --base origin/main # 指定合并基准分支（默认按 origin
 1. **改写历史**（有远端写权限时首选）：先 `git fetch origin`，再 `pnpm repo:purge` 预演（只读，不动任何引用），确认对象数量后 `pnpm repo:purge --apply`。脚本用 git 自带的 `filter-branch` 只改写**这条分支自己带来的提交**（`<合并基准>..<分支>`），基准分支的历史一字不动，所以 `main` 上 GitHub 建的合并提交（带 `gpgsig`，被重建就会丢签名、SHA 随之改变）不会被卷进来：范围一旦放宽到整条历史，`main` 的提交会在分支里被重建，与 `main` 的合并基准会从分叉点往后退（本仓库实测 `403990a` → `9daccf9`），PR 从「无冲突、合并结果树就是 `HEAD` 树」变成 8 个冲突文件——而 tip 树一个字没变，只看树根本发现不了。改写前先在临时仓库里跑一遍自检（几秒，`--skip-self-test` 跳过），改写时先在临时分支上做，比对 tip 树一字未变**且与基准分支的合并基准没有移动**才移动真正的分支，旧历史留在 `refs/autogit-backup/<分支>/<时间戳>`（`git update-ref refs/heads/<分支> <备份引用>` 即可回退）。基准默认按 `origin/main`、`main`、`origin/master`、`master`、`origin/HEAD` 的顺序探测，也可以用 `--base <ref>` 指定；对象是基准分支自己带进来的（本分支没添加过）时脚本会拒绝改写并说明原因。改写完推送并复核：`git fetch origin && git push --force-with-lease origin <分支>`，再跑 `pnpm repo:check` 确认本地可达历史归零。注意 `git filter-repo --path .pnpm-store --invert-paths` 并不等价：它默认改写它看到的所有 ref（包括 `main`），范围比这里大得多。
 2. **Squash and merge**：GitHub 的合并按钮选 `Squash and merge`（只取 PR 的最终树），**不要**选 `Create a merge commit` 或 `Rebase and merge`；合并后删除该分支（`refs/pull/<n>` 仍会短暂保留这些对象，之后随 GC 回收）。
 
-**本次收口决策（PR #8，`ai/issue-4-新增登录密码`）**：合并侧走第 2 条 —— 用 `Squash and merge` 合并并删除分支；若希望保留这条分支的逐个提交，必须先在有写权限的环境执行第 1 条（`pnpm repo:purge --apply` 后 `git push --force-with-lease`），确认 `pnpm repo:check` 归零，再改用普通合并。修复代理只改工作树里的源码、不重写历史（沙箱里 `.git` 只读，也没有推送权限），所以这条决策只能落在合并侧：仓库自身无法把已经提交过的对象从 `HEAD` 可达集合里摘掉。在这条分支上 `pnpm repo:check` 仍会以退出码 1 结束，这是预期结果（它扫的就是 `HEAD` 可达对象），`pnpm repo:check --ref origin/main` 保持退出码 0；只有走完上面第 1 条（改写历史）本地才会归零。第 1 条已在临时克隆上实测（改完立即复核）：改写只动这条分支自己带来的提交，tip 树逐字节不变、与 `origin/main` 的合并基准仍是 `403990a`、`git merge-tree --write-tree HEAD origin/main` 仍是退出码 0 且结果树等于 tip 树、`pnpm repo:check` 归零（改写前后 `main` 的提交逐字节相同）。涉及具体哈希的数字会随分支增长变化，以脚本每次打印的结果为准。标题同样按仓库规范收口：这个 PR 的标题应当是 `feat: 新增登录密码 (#4)` —— 也就是 `renderTitle()` 用默认模板 `{issueTitle} (#{issueNumber})` 渲染出的结果（AutoGit 建 PR 时用的还是改前的旧模板，于是建成了不合规的「新增登录密码 (#4)」）；仓库里的改动只影响之后新建的 PR，已有标题不会被回改，所以这条也要由合并侧在 GitHub 上改。
+**本次收口决策（PR #8，`ai/issue-4-新增登录密码`）**：分支历史已按第 1 条改写完成并强推：`pnpm repo:check` 在本分支与 `--ref origin/main` 上都以退出码 0 结束，改写只动这条分支自己带来的提交（tip 树逐字节不变、与 `origin/main` 的合并基准仍是 `403990a`），所以合并方式不再受限——`Squash and merge` 与普通合并都安全。改写由有写权限的合并侧执行（`pnpm repo:purge --apply` 后 `git push --force-with-lease`，改完立即复核）；修复代理本身只改工作树里的源码，沙箱里 `.git` 只读、也没有推送权限，所以它只能跑只读的 `pnpm repo:purge` 预演。本轮还解掉了与 `origin/main` 的合并冲突（逐文件三方合并都以退出码 0 结束、结果与工作树逐字节相同），GitHub 上的合并按钮因此可用。涉及具体哈希与对象数量的数字会随分支增长变化，以脚本每次打印的结果为准。标题同样按仓库规范收口：这个 PR 的标题已由 AutoGit 改成 `feat: 新增登录密码 (#4)` —— `renderTitle()` 用默认模板 `{issueTitle} (#{issueNumber})` 渲染出「新增登录密码 (#4)」，再由 `services/pr-metadata.ts` 补上类型前缀；建 PR 时用的还是改前的旧模板，所以最初建成的是不合规的标题。这类元数据不再依赖人工：AutoGit 建 PR 时补前缀，每轮修复结束时再校验一次，修复代理也可以通过 `autogit` 动作块直接给出标题与正文。
 
 **合并侧操作清单（PR #8）**：① 把这个 PR 的标题改成 `feat: 新增登录密码 (#4)`；② 在 GitHub 上点 `Squash and merge`，合并后删除 `ai/issue-4-新增登录密码` 分支；③ 复核 `git fetch origin && pnpm repo:check --ref origin/main` 退出码 0，并且 `git log --oneline -1 origin/main` 的主题就是①里写进去的那个 `feat: ...`；④ 想保留这条分支的逐个提交，就先做①、再按第 1 条改写历史（`pnpm repo:purge --apply` + `git push --force-with-lease origin ai/issue-4-新增登录密码`，这条命令由 `pnpm repo:check` 直接打印）确认归零，之后才可以用普通合并。
 

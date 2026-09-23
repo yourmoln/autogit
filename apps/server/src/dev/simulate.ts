@@ -39,6 +39,7 @@ import { EngineRunner } from '../services/runner.js';
 import { SettingsService } from '../services/settings.js';
 import { WorkspaceManager } from '../services/workspace.js';
 import { initLogger, logger } from '../util/logger.js';
+import { slugify } from '../util/time.js';
 
 interface StubState {
   labels: Set<string>;
@@ -735,6 +736,63 @@ async function main(): Promise<void> {
     '人工重试后应当真正执行任务，而不是立刻重新阻塞',
   );
   log.warn('重试额度场景通过：连续失败 3 次阻塞后，人工重试仍能重新执行 ✅');
+
+  // ---- 场景 4：基础克隆残留的本地分支不得污染推送租约 -------------------
+  //
+  // 任务工作区是 `git clone --local <基础克隆>` 出来的，基础克隆里的本地分支会
+  // 被复制成任务工作区的 `origin/*` 远端跟踪引用。该引用的名字一旦等于本次要推
+  // 送的分支，`push --force-with-lease` 就会把它当作「远端当前值」：远端根本没有
+  // 这个分支时，推送直接被拒（`! [rejected] (stale info)`，线上 Issue #4 的故障）。
+  const phantomIssue = provider.seedIssue({
+    number: 6,
+    title: '残留本地分支不得阻塞推送',
+    body: '用于验证基础克隆里的残留本地分支不会污染推送租约。',
+    labels: ['ai/todo'],
+  });
+  const phantomBranch = `${settings.get().branchPrefix}${phantomIssue.number}-${slugify(
+    phantomIssue.title,
+  )}`.slice(0, 120);
+  const baseClone = workspace.pathFor(repository.id);
+  git(['branch', phantomBranch, 'main'], baseClone);
+
+  const remoteBranchNames = (): string[] =>
+    git(['branch', '--list', '--format=%(refname:short)'], bareRepo)
+      .split(/\r?\n/)
+      .map((name) => name.trim())
+      .filter(Boolean);
+  assert(
+    !remoteBranchNames().includes(phantomBranch),
+    `回归场景要求远端一开始没有 ${phantomBranch}`,
+  );
+
+  await runUntilQuiet(orchestrator, store, repository.id, 8);
+
+  const phantomTasks = store
+    .listTasks({ repositoryId: repository.id, limit: 300 })
+    .filter((task) => task.kind === 'implement' && task.issueNumber === phantomIssue.number);
+  assert(
+    phantomTasks.some((task) => task.status === 'succeeded'),
+    '基础克隆存在同名残留分支时，实现任务仍应推送成功',
+  );
+  assert(remoteBranchNames().includes(phantomBranch), `远端应当出现分支 ${phantomBranch}`);
+  log.warn('残留分支场景通过：基础克隆的同名本地分支不再让推送以 stale info 失败 ✅');
+
+  // 同一分支已存在于远端、而基础克隆里的残留分支指向另一个提交时，租约也必须以
+  // 远端当前值为准（人工重试 / 重跑 Issue 的常见形态）。
+  await provider.setLabels(
+    { owner: 'sim', name: 'demo' },
+    { number: phantomIssue.number, labels: ['ai/todo'], isPullRequest: false },
+  );
+  await orchestrator.tick('phantom-branch-rerun');
+  await waitForIdle(orchestrator, store, 60_000);
+  const rerunTasks = store
+    .listTasks({ repositoryId: repository.id, limit: 300 })
+    .filter((task) => task.kind === 'implement' && task.issueNumber === phantomIssue.number);
+  assert(
+    rerunTasks.filter((task) => task.status === 'succeeded').length >= 2,
+    '远端已有同名分支且基础克隆残留分支指向别处时，重跑实现任务仍应推送成功',
+  );
+  log.warn('残留分支场景通过：重跑 Issue 时租约同样以远端当前值为准 ✅');
 
   orchestrator.stop();
   db.close();

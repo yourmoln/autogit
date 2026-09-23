@@ -186,6 +186,14 @@ export class WorkspaceManager {
    * The local clone inherits the base clone as `origin`; pointing the remote
    * back at the provider afterwards keeps every later `fetch` / `push` on the
    * real repository instead of the local cache.
+   *
+   * That repointing is not enough on its own: `git clone --local` copies the
+   * base clone's *local* branches into the task clone's `origin/*` refs, so
+   * those refs describe the cache instead of the provider. A leftover branch
+   * whose name matches the one a task pushes is read by `push --force-with-lease`
+   * as the expected remote value, and the push is rejected with `stale info`
+   * even though nothing is wrong at the provider. Every task therefore starts
+   * with a pruned refresh so `origin/*` mirrors the real repository.
    */
   private async ensureTaskClone(
     base: string,
@@ -224,8 +232,53 @@ export class WorkspaceManager {
       }
     }
 
+    await this.refreshRemoteRefs(dir, repository, net, env, log);
     await this.configureIdentity(dir, net);
     return dir;
+  }
+
+  /**
+   * Makes `origin/*` of a task clone describe the provider, not the base clone.
+   *
+   * `--prune` drops the inherited branches that never existed at the provider
+   * (the ones that break `--force-with-lease`), the fetch updates the ones that
+   * do, and `origin/HEAD` is repointed at the default branch so no dangling
+   * symref is left behind.
+   */
+  private async refreshRemoteRefs(
+    dir: string,
+    repository: RepositoryRecord,
+    net: GitNet,
+    env: NodeJS.ProcessEnv,
+    log: WorkspaceLog,
+  ): Promise<void> {
+    const fetch = await this.runNetworkGit(
+      ['fetch', '--prune', '--no-tags', 'origin'],
+      { cwd: dir, net, env },
+      log,
+    );
+    if (fetch.code !== 0) {
+      throw new Error(
+        `刷新任务工作区远端引用失败：${fetch.stderr.trim() || fetch.stdout.trim() || '未知错误'}`,
+      );
+    }
+
+    const head = await git(
+      [
+        'symbolic-ref',
+        'refs/remotes/origin/HEAD',
+        `refs/remotes/origin/${repository.defaultBranch}`,
+      ],
+      { cwd: dir, ...net },
+    );
+    if (head.code !== 0) {
+      log(
+        'system',
+        `未能把 origin/HEAD 指向 ${repository.defaultBranch}：${
+          head.stderr.trim() || head.stdout.trim() || '未知错误'
+        }`,
+      );
+    }
   }
 
   /**

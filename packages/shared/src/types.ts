@@ -150,6 +150,12 @@ export interface Comment {
   body: string;
   createdAt: string;
   url: string | null;
+  /**
+   * Diff anchor of an inline (line level) review comment. Both stay null for
+   * conversation comments, which are not attached to a line of the change.
+   */
+  path?: string | null;
+  line?: number | null;
 }
 
 export interface RemoteIssue {

@@ -71,6 +71,27 @@ function commentsSection(comments: CommentDigest[]): string {
     .join('\n\n');
 }
 
+/**
+ * Inline review comments live outside the summary comment, so the fix prompt
+ * has to restate them; the anchor doubles as the pointer to the line the
+ * finding is about.
+ */
+function inlineCommentsSection(
+  comments: Array<{ path: string | null; line: number | null; body: string }>,
+): string {
+  if (comments.length === 0) return '';
+  const list = comments
+    .slice(-20)
+    .map((comment, index) => {
+      const anchor = comment.path
+        ? `\`${comment.path}${comment.line ? `:${comment.line}` : ''}\``
+        : '（未锚定到具体行）';
+      return `### 行内评论 ${index + 1} · ${anchor}\n${truncate(comment.body.trim(), 2000)}`;
+    })
+    .join('\n\n');
+  return `\n## 行内评论（贴在对应代码行上，同样必须逐条处理）\n\n${list}\n`;
+}
+
 export function buildImplementPrompt(input: {
   repository: PromptRepository;
   issue: RemoteIssue;
@@ -158,8 +179,16 @@ export const REVIEW_SCHEMA = {
           severity: { type: 'string', enum: ['blocker', 'major', 'minor'] },
           title: { type: 'string' },
           detail: { type: 'string' },
-          file: { type: ['string', 'null'], description: '相关文件路径；不适用时填 null。' },
-          line: { type: ['integer', 'null'], description: '相关行号；不适用时填 null。' },
+          file: {
+            type: ['string', 'null'],
+            description:
+              '相关文件路径（相对仓库根目录）；配合 line 会在该行留下行内评论，不适用时填 null。',
+          },
+          line: {
+            type: ['integer', 'null'],
+            description:
+              '相关行号，必须是变更后新文件中的行号且落在本次 diff 内；不适用时填 null。',
+          },
           suggestion: { type: ['string', 'null'], description: '修复建议；不适用时填 null。' },
         },
       },
@@ -200,6 +229,9 @@ ${input.diff}
 \`\`\`
 
 ## 评审要求
+
+每条 issue 尽量填上 file 与 line：能定位到本次 diff 中具体行的问题会自动作为行内评论贴到该行，定位不到时才会写进汇总评论。line 一律取「新文件」的行号。
+
 1. 以“能否安全合并”为目标，重点检查正确性、边界条件、异常处理、安全性与向后兼容。
 2. 你可以读取工作区中的完整代码验证 diff，也可以运行构建、测试、lint 来确认结论。
 3. 只有存在真实缺陷时才给 needs_fix；风格偏好或可选优化记为 minor，不作为阻塞项。
@@ -263,9 +295,12 @@ export function buildFixPrompt(input: {
   pullRequest: RemotePullRequest;
   issue: RemoteIssue | null;
   reviewComment: string;
+  /** Review findings that were posted as comments on specific diff lines. */
+  inlineComments?: Array<{ path: string | null; line: number | null; body: string }>;
   diffStat: string;
 }): string {
   const { repository, pullRequest } = input;
+  const inline = inlineCommentsSection(input.inlineComments ?? []);
   return `你是 AutoGit 的修复代理，需要按评审意见修订仓库 ${repository.fullName} 的 PR #${pullRequest.number}。
 
 ## PR 信息
@@ -281,7 +316,7 @@ ${input.diffStat}
 
 ## 评审意见（必须逐条处理）
 ${truncate(input.reviewComment, 8000)}
-
+${inline}
 ## 你的任务
 1. 逐条修复评审意见指出的问题；若某条意见经核实不成立，在总结中说明理由。
 2. 补齐或更新对应测试，避免同类问题回归。

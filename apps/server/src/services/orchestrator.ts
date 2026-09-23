@@ -2,6 +2,7 @@ import path from 'node:path';
 
 import {
   applyStatusTransition,
+  type Comment,
   type EngineId,
   type IssueStatus,
   isAiLabel,
@@ -50,10 +51,12 @@ import {
   type CommentDigest,
   REVIEW_SCHEMA,
 } from './prompts.js';
-import type { ProviderFactory } from './providers.js';
+import { describeProviderError, type ProviderFactory } from './providers.js';
+import { mergeReviewDiscussion, resolveReviewAnchors } from './review-findings.js';
 import {
   EngineRunner,
   type EngineRunResult,
+  type ReviewIssue,
   type ReviewVerdict,
   type TaskLogger,
 } from './runner.js';
@@ -68,6 +71,8 @@ const MAX_CLOSE_CHECKS_PER_TICK = 10;
 const REVIEW_VERDICT_REPAIR_ATTEMPTS = 2;
 /** A re-ask only re-serialises an existing conclusion, so it needs a short budget. */
 const REVIEW_VERDICT_REPAIR_TIMEOUT_MS = 5 * 60_000;
+/** Upper bound on inline comments per review, so a noisy review cannot spam the PR. */
+const MAX_INLINE_REVIEW_COMMENTS = 20;
 
 export interface OrchestratorDeps {
   config: RuntimeConfig;
@@ -109,6 +114,12 @@ export interface TickReport {
   queued: number;
   running: number;
   errors: string[];
+}
+
+/** Line an inline review comment ended up on, keyed by issue index. */
+export interface InlineReviewAnchor {
+  path: string;
+  line: number;
 }
 
 export class Orchestrator {
@@ -1232,7 +1243,10 @@ export class Orchestrator {
     await workspace.checkoutRemoteBranch(cwd, pullRequest.headRef, provider, log);
     this.deps.store.updateTask(entry.taskId, { workspace: cwd });
     const diff = await workspace.diffAgainstBase(cwd, `origin/${pullRequest.baseRef}`, provider);
-    const comments = await provider.listComments(ref, prNumber);
+    // Anchors are resolved against the untruncated patch; `diff` above is the
+    // prompt sized version and may already be cut off at 60k characters.
+    const patch = await workspace.diffPatch(cwd, `origin/${pullRequest.baseRef}`, provider);
+    const discussion = await this.reviewDiscussion(provider, ref, prNumber, entry.taskId);
 
     const prompt = buildReviewPrompt({
       repository: {
@@ -1244,7 +1258,7 @@ export class Orchestrator {
       pullRequest,
       issue,
       diff,
-      comments: comments.map((comment) => ({
+      comments: discussion.map((comment) => ({
         author: comment.author,
         body: comment.body,
         createdAt: comment.createdAt,
@@ -1286,7 +1300,16 @@ export class Orchestrator {
       );
     }
 
-    const body = renderReviewComment(verdict, durationMs);
+    const anchored = await this.postInlineReviewComments({
+      provider,
+      ref,
+      prNumber,
+      commitId: pullRequest.headSha,
+      patch,
+      issues: verdict.issues,
+      taskId: entry.taskId,
+    });
+    const body = renderReviewCommentWithAnchors(verdict, durationMs, anchored);
     await provider.createComment(ref, prNumber, body);
 
     if (verdict.verdict === 'approve') {
@@ -1321,6 +1344,88 @@ export class Orchestrator {
       repositoryId: repository.id,
       message: `PR #${prNumber} 评审发现问题（${verdict.issues.length} 条），已转 ai/needs-fix`,
     });
+  }
+
+  /**
+   * Posts one inline (line anchored) comment per finding that can be resolved
+   * against the diff.
+   *
+   * Findings without a usable anchor stay in the summary comment: every
+   * platform refuses - or silently misplaces - a comment on a line that is not
+   * part of the change, and a summary entry is a better outcome than a wrong
+   * anchor. Failures are logged and never fail the review task itself.
+   */
+  private async postInlineReviewComments(input: {
+    provider: GitProvider;
+    ref: RepoRef;
+    prNumber: number;
+    commitId: string | null;
+    patch: string;
+    issues: ReviewIssue[];
+    taskId: string;
+  }): Promise<Map<number, InlineReviewAnchor>> {
+    const posted = new Map<number, InlineReviewAnchor>();
+
+    for (const finding of resolveReviewAnchors(input.patch, input.issues)) {
+      if (posted.size >= MAX_INLINE_REVIEW_COMMENTS) break;
+      const issue = input.issues[finding.index];
+      if (!issue) continue;
+
+      try {
+        await input.provider.createReviewComment(input.ref, input.prNumber, {
+          body: renderInlineReviewComment(issue),
+          path: finding.path,
+          line: finding.line,
+          diffPositions: finding.diffPositions,
+          commitId: input.commitId,
+        });
+        posted.set(finding.index, { path: finding.path, line: finding.line });
+      } catch (error) {
+        this.appendLog(
+          input.taskId,
+          'system',
+          `行内评论未能发布（${finding.path}:${finding.line}），该条已退回汇总评论：${describeProviderError(error)}`,
+        );
+      }
+    }
+    if (posted.size > 0) {
+      this.appendLog(input.taskId, 'system', `已发布 ${posted.size} 条行内评论`);
+    }
+    return posted;
+  }
+
+  /**
+   * The discussion a review sees: conversation comments plus the inline
+   * comments, merged by `mergeReviewDiscussion()`.
+   */
+  private async reviewDiscussion(
+    provider: GitProvider,
+    ref: RepoRef,
+    prNumber: number,
+    taskId: string,
+  ): Promise<Comment[]> {
+    const comments = await provider.listComments(ref, prNumber);
+    const inline = await this.listInlineReviewComments(provider, ref, prNumber, taskId);
+    return mergeReviewDiscussion(comments, inline);
+  }
+
+  /**
+   * Inline comments are optional: a platform (or a version of it) that cannot
+   * serve them must not fail the surrounding task, so a read error degrades to
+   * "no inline comments" with a log line.
+   */
+  private async listInlineReviewComments(
+    provider: GitProvider,
+    ref: RepoRef,
+    prNumber: number,
+    taskId: string,
+  ): Promise<Comment[]> {
+    try {
+      return await provider.listReviewComments(ref, prNumber);
+    } catch (error) {
+      this.appendLog(taskId, 'system', `读取行内评论失败：${describeProviderError(error)}`);
+      return [];
+    }
   }
 
   /**
@@ -1436,6 +1541,14 @@ export class Orchestrator {
     const issue = await this.fetchLinkedIssue(repository, provider, ref, pullRequest);
     const comments = await provider.listComments(ref, prNumber);
     const reviewComment = findLatestReviewComment(comments);
+    // The findings of a review are split across two resources: the summary
+    // comment and the inline comments left on the changed lines.
+    const inlineComments = await this.listInlineReviewComments(
+      provider,
+      ref,
+      prNumber,
+      entry.taskId,
+    );
 
     const cwd = await workspace.ensureClone(repository, provider, log, { taskId: entry.taskId });
     await workspace.checkoutRemoteBranch(cwd, pullRequest.headRef, provider, log);
@@ -1452,6 +1565,11 @@ export class Orchestrator {
       pullRequest,
       issue,
       reviewComment: reviewComment?.body ?? '（未找到评审意见，请根据 PR 描述自查并修复明显问题）',
+      inlineComments: inlineComments.map((comment) => ({
+        path: comment.path ?? null,
+        line: comment.line ?? null,
+        body: comment.body,
+      })),
       diffStat,
     });
 
@@ -2191,6 +2309,62 @@ export function renderReviewComment(verdict: ReviewVerdict, durationMs: number):
   return `${AI_MARKER}\n${header}\n\n${verdict.summary}${issueList}${tests}${cost}`;
 }
 
+/**
+ * Summary comment of a review, with the anchors of the inline comments folded
+ * in.
+ *
+ * Findings that were posted as inline comments are only listed with their
+ * anchor: their full text lives on the code line they belong to. Everything
+ * else keeps the detailed rendering, so a finding is never lost because the
+ * platform refused an anchor.
+ */
+export function renderReviewCommentWithAnchors(
+  verdict: ReviewVerdict,
+  durationMs: number,
+  anchored: Map<number, InlineReviewAnchor> = new Map(),
+): string {
+  return renderReviewComment(withInlineFindings(verdict, anchored), durationMs);
+}
+
+/**
+ * Restates the anchored findings inside the summary text and drops them from
+ * the issue list, so `renderReviewComment()` lists every finding exactly once:
+ * the anchored ones with their `path:line`, the rest in full.
+ */
+function withInlineFindings(
+  verdict: ReviewVerdict,
+  anchored: Map<number, InlineReviewAnchor>,
+): ReviewVerdict {
+  if (anchored.size === 0) return verdict;
+
+  const inlineList = `\n### 行内评论\n\n以下问题已直接评论在对应代码行上：\n\n${[...anchored.entries()]
+    .map(([index, anchor], order) => {
+      const issue = verdict.issues[index];
+      if (!issue) return '';
+      return `${order + 1}. **[${severityLabel(issue.severity)}]** ${issue.title} · \`${anchor.path}:${anchor.line}\``;
+    })
+    .filter((line) => line.length > 0)
+    .join('\n')}`;
+
+  return {
+    ...verdict,
+    summary: `${verdict.summary}${inlineList}`,
+    issues: verdict.issues.filter((_issue, index) => !anchored.has(index)),
+  };
+}
+
+/** Body of a single inline review comment. */
+export function renderInlineReviewComment(issue: ReviewIssue): string {
+  const lines = [
+    AI_MARKER,
+    `**[${severityLabel(issue.severity)}] ${issue.title}**`,
+    '',
+    issue.detail,
+  ];
+  if (issue.suggestion) lines.push('', `建议：${issue.suggestion}`);
+  return lines.join('\n');
+}
+
 function severityLabel(severity: ReviewVerdict['issues'][number]['severity']): string {
   switch (severity) {
     case 'blocker':
@@ -2202,7 +2376,11 @@ function severityLabel(severity: ReviewVerdict['issues'][number]['severity']): s
   }
 }
 
-function findLatestReviewComment(
+/**
+ * The summary comment of the latest review, or the newest comment as a last
+ * resort. Exported so the prompt preview resolves it exactly like `runFix()`.
+ */
+export function findLatestReviewComment(
   comments: Array<{ author: string; body: string; createdAt: string }>,
 ): { author: string; body: string; createdAt: string } | null {
   const reviews = comments.filter((comment) => comment.body.includes('AI 评审'));

@@ -13,6 +13,7 @@ import {
   basicAuthHeader,
   type CreateLabelInput,
   type CreatePullRequestInput,
+  type CreateReviewCommentInput,
   type GitProvider,
   type LabelTargetInput,
   type ListIssueOptions,
@@ -91,6 +92,13 @@ interface GitHubComment {
   user: { login: string } | null;
   created_at: string;
   html_url: string;
+}
+
+interface GitHubReviewComment extends GitHubComment {
+  path: string | null;
+  /** Null once the comment is outdated; `original_line` keeps the old anchor. */
+  line: number | null;
+  original_line: number | null;
 }
 
 /** Hosts that serve the GitHub web UI; the REST API lives on a different host. */
@@ -310,6 +318,56 @@ export class GitHubProvider implements GitProvider {
       body: comment.body ?? body,
       createdAt: comment.created_at,
       url: comment.html_url,
+    };
+  }
+
+  async listReviewComments(ref: RepoRef, number: number): Promise<Comment[]> {
+    // Pull request review comments live on their own endpoint; the issue
+    // comments endpoint above never returns them.
+    const comments = await this.client.paginate<GitHubReviewComment>(
+      `/repos/${ref.owner}/${ref.name}/pulls/${number}/comments`,
+      { limit: 100, accept: ACCEPT },
+    );
+    return comments.map((comment) => ({
+      id: String(comment.id),
+      author: comment.user?.login ?? 'unknown',
+      body: comment.body ?? '',
+      createdAt: comment.created_at,
+      url: comment.html_url ?? null,
+      path: comment.path ?? null,
+      line: comment.line ?? comment.original_line ?? null,
+    }));
+  }
+
+  async createReviewComment(
+    ref: RepoRef,
+    number: number,
+    input: CreateReviewCommentInput,
+  ): Promise<Comment> {
+    const comment = await this.client.post<GitHubReviewComment>(
+      `/repos/${ref.owner}/${ref.name}/pulls/${number}/comments`,
+      {
+        body: {
+          body: input.body,
+          path: input.path,
+          line: input.line,
+          side: 'RIGHT',
+          // GitHub only accepts a line that is part of the diff, otherwise the
+          // request fails with 422 and the caller keeps the finding in the
+          // summary comment.
+          ...(input.commitId ? { commit_id: input.commitId } : {}),
+        },
+        accept: ACCEPT,
+      },
+    );
+    return {
+      id: String(comment.id),
+      author: comment.user?.login ?? 'autogit',
+      body: comment.body ?? input.body,
+      createdAt: comment.created_at,
+      url: comment.html_url ?? null,
+      path: comment.path ?? input.path,
+      line: comment.line ?? input.line,
     };
   }
 

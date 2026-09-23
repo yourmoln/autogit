@@ -14,6 +14,7 @@ import {
   basicAuthHeader,
   type CreateLabelInput,
   type CreatePullRequestInput,
+  type CreateReviewCommentInput,
   type GitProvider,
   type LabelTargetInput,
   type ListIssueOptions,
@@ -89,6 +90,30 @@ interface GiteaComment {
   user?: GiteaUser | null;
   created_at: string;
   html_url?: string;
+}
+
+interface GiteaPullReview {
+  id: number;
+  body?: string | null;
+  state?: string;
+  /** Number of code comments in this review; 0 for a plain review body. */
+  comments_count?: number;
+  commit_id?: string | null;
+  submitted_at?: string | null;
+  html_url?: string;
+  user?: GiteaUser | null;
+}
+
+interface GiteaReviewComment {
+  id: number;
+  body: string;
+  user?: GiteaUser | null;
+  created_at: string;
+  html_url?: string;
+  path?: string | null;
+  /** Line number in the new file version (Gitea calls it a position). */
+  position?: number | null;
+  original_position?: number | null;
 }
 
 function normalizeBaseUrlFor(raw: string): string {
@@ -326,6 +351,130 @@ export class GiteaProvider implements GitProvider {
       createdAt: comment.created_at,
       url: comment.html_url ?? null,
     };
+  }
+
+  async listReviewComments(ref: RepoRef, number: number): Promise<Comment[]> {
+    // Gitea has no endpoint that lists every code comment of a pull request:
+    // reviews are listed first and each one then queried for its comments.
+    const reviews = await this.client.paginate<GiteaPullReview>(
+      `/repos/${ref.owner}/${ref.name}/pulls/${number}/reviews`,
+      { perPageParam: 'limit', limit: 50 },
+    );
+
+    const comments: Comment[] = [];
+    for (const review of reviews) {
+      if ((review.comments_count ?? 0) <= 0) continue;
+      const chunk = await this.client.paginate<GiteaReviewComment>(
+        `/repos/${ref.owner}/${ref.name}/pulls/${number}/reviews/${review.id}/comments`,
+        { perPageParam: 'limit', limit: 100 },
+      );
+      for (const comment of chunk) {
+        comments.push({
+          id: String(comment.id),
+          author: comment.user?.login ?? 'unknown',
+          body: comment.body ?? '',
+          createdAt: comment.created_at,
+          url: comment.html_url ?? null,
+          path: comment.path ?? null,
+          line: comment.position ?? comment.original_position ?? null,
+        });
+      }
+    }
+    return comments;
+  }
+
+  async createReviewComment(
+    ref: RepoRef,
+    number: number,
+    input: CreateReviewCommentInput,
+  ): Promise<Comment> {
+    // Gitea anchors a code comment by line number of the file version, even
+    // though the field is named `new_position` (`old_position` covers deleted
+    // lines). A review is the only write endpoint that accepts them, and the
+    // line it really stored is read back afterwards: instances disagree about
+    // that field, and a comment sitting on the wrong line would be worse than
+    // one that stays in the summary.
+    const review = await this.client.post<GiteaPullReview>(
+      `/repos/${ref.owner}/${ref.name}/pulls/${number}/reviews`,
+      {
+        body: {
+          event: 'COMMENT',
+          body: '',
+          ...(input.commitId ? { commit_id: input.commitId } : {}),
+          comments: [
+            {
+              path: input.path,
+              body: input.body,
+              new_position: input.line,
+              old_position: 0,
+            },
+          ],
+        },
+      },
+    );
+
+    const reviewId = toNumericId(review?.id ?? null);
+    const verified = reviewId === null ? null : await this.readReviewComment(ref, number, reviewId);
+    if (verified === null || verified.line !== input.line) {
+      // The review exists only for this one comment, so dropping it removes the
+      // misplaced anchor again. Best effort: instances without the endpoint
+      // answer 404/405 and the comment has to be ignored instead.
+      if (reviewId !== null) await this.deleteReview(ref, number, reviewId);
+      throw new Error(
+        `Gitea 未确认这条行内评论的锚点（目标第 ${input.line} 行，实际${
+          verified?.line ?? '无法读回'
+        }），该条已退回汇总评论`,
+      );
+    }
+
+    return {
+      id: String(verified.id),
+      author: review?.user?.login ?? 'autogit',
+      body: input.body,
+      createdAt: review?.submitted_at ?? new Date().toISOString(),
+      url: review?.html_url ?? null,
+      path: input.path,
+      line: input.line,
+    };
+  }
+
+  /**
+   * The code comment the instance really stored for a review, read back over
+   * `GET .../reviews/{id}/comments`. `null` means "not verifiable" (endpoint
+   * missing, permission, network), which the caller treats as a failed anchor.
+   */
+  private async readReviewComment(
+    ref: RepoRef,
+    number: number,
+    reviewId: number,
+  ): Promise<{ id: number; line: number | null } | null> {
+    try {
+      const comments = await this.client.paginate<GiteaReviewComment>(
+        `/repos/${ref.owner}/${ref.name}/pulls/${number}/reviews/${reviewId}/comments`,
+        { perPageParam: 'limit', limit: 50 },
+      );
+      const comment = comments[0];
+      if (!comment) return null;
+      return { id: comment.id, line: comment.position ?? comment.original_position ?? null };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Best effort removal of a review that only existed for an inline comment.
+   * Gitea deletes the code comments of a review together with the review, so
+   * this takes a misplaced anchor off the pull request again; instances without
+   * the endpoint answer 404/405 and the caller keeps the summary fallback.
+   */
+  private async deleteReview(ref: RepoRef, number: number, reviewId: number): Promise<void> {
+    try {
+      await this.client.delete(
+        `/repos/${ref.owner}/${ref.name}/pulls/${number}/reviews/${reviewId}`,
+      );
+    } catch {
+      // Verifying is what matters here; deleting is a courtesy.
+    }
   }
 
   async setLabels(ref: RepoRef, target: LabelTargetInput): Promise<void> {

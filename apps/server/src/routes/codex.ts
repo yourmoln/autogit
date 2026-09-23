@@ -3,7 +3,9 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 
 import type { AppContext } from '../context.js';
+import { findLatestReviewComment } from '../services/orchestrator.js';
 import { buildFixPrompt, buildImplementPrompt, buildReviewPrompt } from '../services/prompts.js';
+import { mergeReviewDiscussion } from '../services/review-findings.js';
 import { HttpError, parseOrThrow } from '../util/http.js';
 import { logger } from '../util/logger.js';
 
@@ -122,11 +124,14 @@ export function registerCodexRoutes(app: FastifyInstance, ctx: AppContext): void
       if (!prNumber) throw new HttpError(400, '缺少 prNumber');
       const pullRequest = await provider.getPullRequest(ref, prNumber);
       const comments = await provider.listComments(ref, prNumber);
-      const digests = comments.map((comment) => ({
-        author: comment.author,
-        body: comment.body,
-        createdAt: comment.createdAt,
-      }));
+      // Inline comments are a separate resource, and the prompt preview must
+      // show the same discussion the real run gets.
+      const inline = await provider.listReviewComments(ref, prNumber).catch(() => []);
+      // `runReview()` merges the two lists (no duplicates, anchored bodies),
+      // `runFix()` keeps them apart: the summary comment is the review it has
+      // to work through, the inline findings are the lines it has to look at.
+      const discussion = mergeReviewDiscussion(comments, inline);
+      const reviewComment = findLatestReviewComment(comments);
 
       const prompt =
         kind === 'review'
@@ -135,13 +140,23 @@ export function registerCodexRoutes(app: FastifyInstance, ctx: AppContext): void
               pullRequest,
               issue: null,
               diff: '（预览模式下不包含真实 diff，运行时会注入完整变更）',
-              comments: digests,
+              comments: discussion.map((comment) => ({
+                author: comment.author,
+                body: comment.body,
+                createdAt: comment.createdAt,
+              })),
             })
           : buildFixPrompt({
               repository: promptRepository,
               pullRequest,
               issue: null,
-              reviewComment: digests.at(-1)?.body ?? '（没有找到评审评论）',
+              reviewComment:
+                reviewComment?.body ?? '（未找到评审意见，请根据 PR 描述自查并修复明显问题）',
+              inlineComments: inline.map((comment) => ({
+                path: comment.path ?? null,
+                line: comment.line ?? null,
+                body: comment.body,
+              })),
               diffStat: '（预览模式下不包含真实 diffstat）',
             });
 

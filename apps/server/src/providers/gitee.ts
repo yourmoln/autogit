@@ -8,11 +8,12 @@ import type {
   RemoteUser,
 } from '@autogit/shared';
 
-import { ApiClient, tryRequests } from './http.js';
+import { ApiClient, ApiError, tryRequests } from './http.js';
 import {
   basicAuthHeader,
   type CreateLabelInput,
   type CreatePullRequestInput,
+  type CreateReviewCommentInput,
   type GitProvider,
   type LabelTargetInput,
   type ListIssueOptions,
@@ -88,11 +89,35 @@ interface GiteeComment {
   created_at: string;
 }
 
+interface GiteePullComment extends GiteeComment {
+  path?: string | null;
+  /** Diff position of the comment; Gitee sends it as a string. */
+  position?: string | number | null;
+  original_position?: string | number | null;
+  /** Line number in the new file version, when the comment is anchored. */
+  new_line?: string | number | null;
+  commit_id?: string | null;
+  html_url?: string | null;
+}
+
 function normalizeBaseUrlFor(raw: string): string {
   const base = normalizeBaseUrl(raw);
   if (!base) return 'https://gitee.com/api/v5';
   if (/\/api\/v\d+$/.test(base)) return base;
   return `${base}/api/v5`;
+}
+
+/** Gitee reports ids and line numbers as numbers or as strings. */
+function toNumber(value: string | number | null | undefined): number | null {
+  if (value === null || value === undefined) return null;
+  const parsed = typeof value === 'number' ? value : Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+/** Best effort text of a failed request, so the caller can log why it fell back. */
+function describeFailure(error: unknown): string {
+  if (error instanceof ApiError) return error.detail;
+  return error instanceof Error ? error.message : String(error);
 }
 
 function labelsOf(labels: Array<GiteeLabel | string> | undefined): string[] {
@@ -335,6 +360,131 @@ export class GiteeProvider implements GitProvider {
       createdAt: comment?.created_at ?? new Date().toISOString(),
       url: null,
     };
+  }
+
+  async listReviewComments(ref: RepoRef, number: number): Promise<Comment[]> {
+    const path = `/repos/${ref.owner}/${ref.name}/pulls/${number}/comments`;
+    // The endpoint returns conversation comments and code line comments
+    // together. `comment_type` narrows it down, but older deployments reject
+    // the parameter, hence the unfiltered fallback plus a path filter below.
+    const comments = await tryRequests(
+      [
+        () =>
+          this.client.paginate<GiteePullComment>(path, {
+            query: { comment_type: 'diff_comment' },
+            limit: 100,
+          }),
+        () => this.client.paginate<GiteePullComment>(path, { limit: 100 }),
+      ],
+      [400, 404, 422],
+    );
+    return comments
+      .filter((comment) => (comment.path ?? '').length > 0)
+      .map((comment) => ({
+        id: String(comment.id),
+        author: comment.user?.login ?? 'unknown',
+        body: comment.body ?? '',
+        createdAt: comment.created_at,
+        url: comment.html_url ?? null,
+        path: comment.path ?? null,
+        line: toNumber(comment.new_line) ?? toNumber(comment.position),
+      }));
+  }
+
+  /**
+   * Gitee documents `position` as a line count inside the diff ("PR代码评论diff
+   * 中的行数"), but deployments disagree on the exact numbering and some treat
+   * it as the line number of the new file. Every candidate is tried - a request
+   * the instance rejects moves on to the next one instead of aborting the loop -
+   * and the created comment is read back: only a returned `new_line` equal to
+   * the intended line counts as success. Anything else deletes the comment
+   * again, so the caller keeps that finding in the summary comment instead of
+   * leaving a misleading anchor behind.
+   */
+  async createReviewComment(
+    ref: RepoRef,
+    number: number,
+    input: CreateReviewCommentInput,
+  ): Promise<Comment> {
+    const path = `/repos/${ref.owner}/${ref.name}/pulls/${number}/comments`;
+    // The patch positions of the anchor come first (most likely reading first),
+    // the new file line is the last resort for instances that read `position`
+    // that way. Duplicates would only cost an extra request.
+    const positions = [...new Set([...input.diffPositions, input.line])].filter(
+      (position) => Number.isInteger(position) && position > 0,
+    );
+    const rejected: string[] = [];
+
+    for (const position of positions) {
+      let created: GiteePullComment | null = null;
+      try {
+        created = await this.client.post<GiteePullComment>(path, {
+          body: {
+            body: input.body,
+            path: input.path,
+            position,
+            ...(input.commitId ? { commit_id: input.commitId } : {}),
+          },
+        });
+      } catch (error) {
+        // An instance reading `position` as a new file line rejects the patch
+        // position (and vice versa); the other reading is still worth a try.
+        rejected.push(`position=${position} 被拒绝（${describeFailure(error)}）`);
+        continue;
+      }
+
+      const id = toNumber(created?.id);
+      if (id === null) {
+        rejected.push(`position=${position} 的响应里没有评论 id`);
+        continue;
+      }
+
+      const verified = await this.readPullComment(ref, id);
+      // Only the real new file line counts. Falling back to `position` would
+      // compare a patch offset against a line number, and an instance that
+      // echoes the value back would make a misplaced comment look verified.
+      const line = toNumber(verified?.new_line);
+      if (line === input.line) {
+        return {
+          id: String(id),
+          author: verified?.user?.login ?? 'autogit',
+          body: verified?.body ?? input.body,
+          createdAt: verified?.created_at ?? new Date().toISOString(),
+          url: verified?.html_url ?? null,
+          path: input.path,
+          line,
+        };
+      }
+
+      await this.deletePullComment(ref, id);
+      rejected.push(`position=${position} 落在${line === null ? '无法确认的行' : `第 ${line} 行`}`);
+    }
+
+    throw new Error(
+      `Gitee 未接受这条行内评论，该条已退回汇总评论：${
+        rejected.length > 0 ? rejected.join('；') : '没有可用的位置候选'
+      }`,
+    );
+  }
+
+  private async readPullComment(ref: RepoRef, id: number): Promise<GiteePullComment | null> {
+    try {
+      return await this.client.get<GiteePullComment>(
+        `/repos/${ref.owner}/${ref.name}/pulls/comments/${id}`,
+      );
+    } catch {
+      // Reading back is only a verification step; without it the anchor counts
+      // as unverified and the caller falls back to the summary comment.
+      return null;
+    }
+  }
+
+  private async deletePullComment(ref: RepoRef, id: number): Promise<void> {
+    try {
+      await this.client.delete(`/repos/${ref.owner}/${ref.name}/pulls/comments/${id}`);
+    } catch {
+      // Best effort: an undeletable comment only leaves a stray anchor behind.
+    }
   }
 
   async setLabels(ref: RepoRef, target: LabelTargetInput): Promise<void> {

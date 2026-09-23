@@ -57,6 +57,14 @@ const INTERRUPTED_OPERATIONS = [
 ];
 
 /**
+ * Diffs are read with `core.quotePath=false`: with the default setting git
+ * escapes every non ASCII byte of a path (`"b/docs/\350\257\264\346\230\216.md"`),
+ * which hides the real file name from `util/diff-anchors.ts` and from the
+ * prompts, so findings on such files could never be anchored.
+ */
+const RAW_PATH_DIFF = ['-c', 'core.quotePath=false'];
+
+/**
  * Clone / fetch are the only git calls that fail on a flaky link or on a ref
  * another writer moved first, so they are the ones that get retries.
  */
@@ -623,8 +631,11 @@ export class WorkspaceManager {
     maxChars = 60_000,
   ): Promise<string> {
     const net = this.netFor(provider);
-    const stat = await git(['diff', '--stat', `${baseRef}...HEAD`], { cwd: dir, ...net });
-    const diff = await git(['diff', `${baseRef}...HEAD`], { cwd: dir, ...net });
+    const stat = await git([...RAW_PATH_DIFF, 'diff', '--stat', `${baseRef}...HEAD`], {
+      cwd: dir,
+      ...net,
+    });
+    const diff = await git([...RAW_PATH_DIFF, 'diff', `${baseRef}...HEAD`], { cwd: dir, ...net });
     const text = `${stat.stdout.trim()}\n\n${diff.stdout.trim()}`.trim();
     return text.length > maxChars ? `${text.slice(0, maxChars)}\n…（diff 已截断）` : text;
   }
@@ -715,11 +726,31 @@ export class WorkspaceManager {
   }
 
   async diffStat(dir: string, baseRef: string, provider: GitProvider): Promise<string> {
-    const result = await git(['diff', '--stat', `${baseRef}...HEAD`], {
+    const result = await git([...RAW_PATH_DIFF, 'diff', '--stat', `${baseRef}...HEAD`], {
       cwd: dir,
       ...this.netFor(provider),
     });
     return result.stdout.trim();
+  }
+
+  /**
+   * Raw patch of the branch against its base, used to resolve the lines an
+   * inline review comment may be anchored to. `diffAgainstBase()` prepends a
+   * stat block and truncates, which would silently shift or drop hunks, so the
+   * anchors are computed from this untouched patch instead.
+   */
+  async diffPatch(
+    dir: string,
+    baseRef: string,
+    provider: GitProvider,
+    maxChars = 2_000_000,
+  ): Promise<string> {
+    const result = await git([...RAW_PATH_DIFF, 'diff', '--no-color', `${baseRef}...HEAD`], {
+      cwd: dir,
+      ...this.netFor(provider),
+    });
+    if (result.code !== 0) return '';
+    return result.stdout.length > maxChars ? result.stdout.slice(0, maxChars) : result.stdout;
   }
 
   async currentBranch(dir: string, provider: GitProvider): Promise<string> {

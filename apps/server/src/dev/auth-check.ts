@@ -890,6 +890,103 @@ async function main(): Promise<void> {
       return 'HTTP 401';
     });
 
+    await expect('没有实际改动的 PUT 不轮换会话、不登出其他设备', async () => {
+      // 设置页每次保存都会把当前用户名原样提交，所以「用户名相同 + 密码留空」
+      // 正是空保存的样子。旧实现无条件轮换，于是这样一次请求就把其他设备全部
+      // 登出；现在它必须原样返回调用方自己的会话，别动任何一行会话数据。
+      const other = await app.inject({
+        method: 'POST',
+        url: '/api/auth/login',
+        payload: { username: 'moln', password: 's3cret-pw-2' },
+      });
+      const otherToken = cookieToken(other.headers['set-cookie']);
+      const sessionsBefore = ctx.store.countAuthSessions(nowIso());
+      const accountBefore = ctx.store.getAuthAccount();
+
+      const response = await app.inject({
+        method: 'PUT',
+        url: '/api/auth/credentials',
+        headers: { cookie: cookieHeader(sessionToken) },
+        payload: { currentPassword: 's3cret-pw-2', username: 'moln', password: null },
+      });
+      assert(response.statusCode === 200, `状态码 ${response.statusCode}`);
+      const payload = response.json<AuthSessionPayload & { rotated?: boolean }>();
+      assert(payload.rotated === false, '空保存没有回答「未改动」（rotated 缺失或为 true）');
+      assert(payload.session?.username === 'moln', '空保存改掉了会话里的用户名');
+      assert(response.headers['set-cookie'] === undefined, '空保存仍然下发了新的会话 Cookie');
+      assert(
+        ctx.store.countAuthSessions(nowIso()) === sessionsBefore,
+        `空保存改动了会话数量（${sessionsBefore} → ${ctx.store.countAuthSessions(nowIso())}）`,
+      );
+      assert(
+        ctx.store.getAuthAccount()?.updatedAt === accountBefore?.updatedAt,
+        '空保存仍然写入了 auth_account',
+      );
+
+      const otherStill = await app.inject({
+        method: 'GET',
+        url: '/api/system/overview',
+        headers: { cookie: cookieHeader(otherToken) },
+      });
+      assert(otherStill.statusCode === 200, `其他设备被空保存登出（${otherStill.statusCode}）`);
+
+      const mine = await app.inject({
+        method: 'GET',
+        url: '/api/system/overview',
+        headers: { cookie: cookieHeader(sessionToken) },
+      });
+      assert(mine.statusCode === 200, `调用方自己的会话被空保存登出（${mine.statusCode}）`);
+      return 'HTTP 200（rotated=false，无新 Cookie，其他设备仍在）';
+    });
+
+    await expect('把当前密码原样提交、用户名只改大小写都不算改动', async () => {
+      // 「未改动」按库里的凭据判定，而不是「请求带了哪些字段」：与登录、会话校验
+      // 同一套比较（用户名大小写不敏感），密码也要真的与库里不同才算改密码。
+      const sessionsBefore = ctx.store.countAuthSessions(nowIso());
+
+      const samePassword = await app.inject({
+        method: 'PUT',
+        url: '/api/auth/credentials',
+        headers: { cookie: cookieHeader(sessionToken) },
+        payload: { currentPassword: 's3cret-pw-2', password: 's3cret-pw-2' },
+      });
+      assert(samePassword.statusCode === 200, `状态码 ${samePassword.statusCode}`);
+      assert(
+        samePassword.json<AuthSessionPayload & { rotated?: boolean }>().rotated === false,
+        '把当前密码原样填回来被当成了改密码',
+      );
+
+      const casing = await app.inject({
+        method: 'PUT',
+        url: '/api/auth/credentials',
+        headers: { cookie: cookieHeader(sessionToken) },
+        payload: { currentPassword: 's3cret-pw-2', username: 'MOLN' },
+      });
+      assert(casing.statusCode === 200, `状态码 ${casing.statusCode}`);
+      assert(
+        casing.json<AuthSessionPayload & { rotated?: boolean }>().rotated === false,
+        '用户名只换大小写被当成了改名',
+      );
+      assert(
+        ctx.store.getAuthAccount()?.username === 'moln',
+        '大小写不同的用户名被写进了 auth_account',
+      );
+
+      const sessionsAfter = ctx.store.countAuthSessions(nowIso());
+      assert(
+        sessionsAfter === sessionsBefore,
+        `会话数量发生了变化（${sessionsBefore} → ${sessionsAfter}）`,
+      );
+      const login = await app.inject({
+        method: 'POST',
+        url: '/api/auth/login',
+        payload: { username: 'MOLN', password: 's3cret-pw-2' },
+      });
+      assert(login.statusCode === 200, `大小写不同的用户名无法登录（${login.statusCode}）`);
+      ctx.auth.logout(cookieToken(login.headers['set-cookie']));
+      return '两次 200（rotated=false），会话数量不变';
+    });
+
     process.stdout.write('\n退出登录：\n');
 
     await expect('退出登录清除 cookie 并吊销会话', async () => {

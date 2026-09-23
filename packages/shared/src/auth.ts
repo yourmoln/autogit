@@ -41,3 +41,14 @@ export interface AuthSessionPayload {
   /** 仅在已登录时返回，未登录时为 `null`。 */
   credentials: AuthCredentialsSummary | null;
 }
+
+/**
+ * `PUT /api/auth/credentials` 的响应。
+ *
+ * `rotated: false` 表示这次请求没有实际改动凭据（用户名与库里的相同、密码
+ * 留空或与当前密码一致）：`session` 就是调用方本来那个会话，其他设备也没有被
+ * 登出，界面据此如实提示「未检测到改动」而不是「账号已更新」。
+ */
+export interface AuthCredentialsPayload extends AuthSessionPayload {
+  rotated: boolean;
+}

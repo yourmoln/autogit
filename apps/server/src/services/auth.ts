@@ -170,6 +170,17 @@ export interface AuthLoginResult {
   session: AuthSession;
 }
 
+/**
+ * Answer of `PUT /api/auth/credentials`.
+ *
+ * `rotated: false` means the request asked for nothing that was not already
+ * stored: `token` is the session the caller arrived with, no other device was
+ * signed out and nothing was written to `auth_account`.
+ */
+export interface AuthCredentialsResult extends AuthLoginResult {
+  rotated: boolean;
+}
+
 export interface ResolvedAuthSession {
   session: AuthSession;
   /** SHA-256 of the presented token; identifies the session to live streams. */
@@ -268,28 +279,7 @@ export class AuthService {
     this.clearLoginFailures();
 
     this.pruneExpiredSessions();
-
-    const token = randomBytes(32).toString('base64url');
-    const createdAt = nowIso();
-    const expiresAt = new Date(Date.now() + sessionTtlMs(input.remember)).toISOString();
-    this.store.createAuthSession({
-      tokenHash: hashSessionToken(token),
-      username: account.username,
-      persistent: input.remember,
-      createdAt,
-      expiresAt,
-    });
-
-    return {
-      token,
-      session: {
-        username: account.username,
-        persistent: input.remember,
-        createdAt,
-        lastSeenAt: createdAt,
-        expiresAt,
-      },
-    };
+    return this.issueSession(account.username, input.remember);
   }
 
   /**
@@ -384,11 +374,18 @@ export class AuthService {
   /**
    * Changes the username and/or the password.
    *
-   * The current password is mandatory, and every session is rotated: other
-   * browsers are logged out immediately, while the caller receives a fresh
-   * session so it stays signed in on the device where the change happened. The
-   * caller passes the hash of the session it is rotating away from, so its own
-   * sockets can be told to reconnect instead of being signed out.
+   * The current password is mandatory, and a change that really happened rotates
+   * every session: other browsers are logged out immediately, while the caller
+   * receives a fresh session so it stays signed in on the device where the change
+   * happened. The caller passes the hash of the session it is rotating away from,
+   * so its own sockets can be told to reconnect instead of being signed out.
+   *
+   * A request that changes neither the username nor the password is not a
+   * credential change: it is answered with the session the caller already holds
+   * and leaves every other device signed in. The settings page submits the
+   * username it was given on every save, so an empty save used to arrive here as
+   * "same username, no password" — and rotating on that signed the whole account
+   * out of every other browser for nothing.
    */
   updateCredentials(input: {
     currentPassword: string;
@@ -398,7 +395,9 @@ export class AuthService {
     persistent?: boolean;
     /** Token hash the caller is replacing, i.e. the session behind its own sockets. */
     rotatedFrom?: string | null;
-  }): AuthLoginResult {
+    /** Raw token of the calling browser, so a no-op request can answer with it. */
+    currentToken?: string | null;
+  }): AuthCredentialsResult {
     const account = this.store.getAuthAccount();
     if (!account) throw new HttpError(500, '登录账号尚未初始化');
     if (!verifyPasswordHash(input.currentPassword, account.passwordHash)) {
@@ -409,29 +408,55 @@ export class AuthService {
       typeof input.username === 'string' && input.username.trim().length > 0
         ? normalizeUsername(input.username)
         : account.username;
-    const password =
+    const submittedPassword =
       typeof input.password === 'string' && input.password.length > 0
         ? normalizePassword(input.password)
         : null;
 
-    if (username !== account.username || password) {
-      this.store.upsertAuthAccount({
+    // "Did anything change?" is decided on the stored credentials, never on which
+    // fields the body happened to carry. The username is compared the way
+    // `login()` and `resolveSession()` compare it (`sameUsername`, so a different
+    // casing is the same account), and a submitted password only counts when it
+    // differs from the stored one — otherwise sending back the password that is
+    // already in place would log every other device out for nothing.
+    const renamed = !sameUsername(username, account.username);
+    const nextPassword =
+      submittedPassword !== null && !verifyPasswordHash(submittedPassword, account.passwordHash)
+        ? submittedPassword
+        : null;
+
+    if (!renamed && nextPassword === null) {
+      return this.answerUnchangedCredentials(input.currentToken ?? null, {
         username,
-        passwordHash: password ? hashPassword(password) : account.passwordHash,
-        // The hint follows the stored password, not "the endpoint was called":
-        // setting the password back to the factory value has to bring the
-        // warning back, so only a password that differs from `admin` stamps the
-        // marker. A rename passes `undefined` and keeps the stored marker.
-        passwordChanged: password === null ? undefined : !isFactoryPassword(password),
+        persistent: input.persistent ?? false,
       });
     }
+
+    this.store.upsertAuthAccount({
+      username,
+      passwordHash: nextPassword === null ? account.passwordHash : hashPassword(nextPassword),
+      // The hint follows the stored password, not "the endpoint was called":
+      // setting the password back to the factory value has to bring the
+      // warning back, so only a password that differs from `admin` stamps the
+      // marker. A rename passes `undefined` and keeps the stored marker.
+      passwordChanged: nextPassword === null ? undefined : !isFactoryPassword(nextPassword),
+    });
 
     // Rotate every session: other browsers lose access immediately, and the
     // caller gets a fresh token below.
     this.store.deleteAuthSessions();
     this.announceRevocation({ revoked: null, rotatedFrom: input.rotatedFrom ?? null });
 
-    const persistent = input.persistent ?? false;
+    return { ...this.issueSession(username, input.persistent ?? false), rotated: true };
+  }
+
+  /**
+   * Issues a session row for `username` and returns it with its raw token.
+   *
+   * `login()` and the credential rotation share this, so both hand out exactly
+   * the same shape (and the same TTL rules).
+   */
+  private issueSession(username: string, persistent: boolean): AuthLoginResult {
     const token = randomBytes(32).toString('base64url');
     const createdAt = nowIso();
     const expiresAt = new Date(Date.now() + sessionTtlMs(persistent)).toISOString();
@@ -453,6 +478,40 @@ export class AuthService {
         expiresAt,
       },
     };
+  }
+
+  /**
+   * Answer for a credential request that changed nothing.
+   *
+   * Handing back the caller's own session keeps the cookie, its `auth_sessions`
+   * row and every other device exactly as they are: no rotation, no revocation
+   * broadcast, nothing written. The fallback covers the race where that session
+   * disappeared between the auth guard and this call (or the caller presented no
+   * cookie at all): it issues a session for this browser alone instead of
+   * touching the sessions of everybody else.
+   */
+  private answerUnchangedCredentials(
+    token: string | null,
+    session: { username: string; persistent: boolean },
+  ): AuthCredentialsResult {
+    const raw = token?.trim();
+    if (raw) {
+      const record = this.store.getAuthSession(hashSessionToken(raw));
+      if (record && Date.parse(record.expiresAt) > Date.now()) {
+        return {
+          token: raw,
+          rotated: false,
+          session: {
+            username: record.username,
+            persistent: record.persistent,
+            createdAt: record.createdAt,
+            lastSeenAt: record.lastSeenAt,
+            expiresAt: record.expiresAt,
+          },
+        };
+      }
+    }
+    return { ...this.issueSession(session.username, session.persistent), rotated: false };
   }
 
   private pruneExpiredSessions(): void {

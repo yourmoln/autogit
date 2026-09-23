@@ -2,6 +2,7 @@ import type {
   Account,
   ActivityEntry,
   AppSettings,
+  AuthCredentialsPayload,
   AuthSessionPayload,
   CodexConfigPayload,
   CodexInstallState,
@@ -139,7 +140,7 @@ export const api = {
       /** 留空表示不修改密码。 */
       password?: string | null;
     }) =>
-      request<AuthSessionPayload>('/api/auth/credentials', {
+      request<AuthCredentialsPayload>('/api/auth/credentials', {
         method: 'PUT',
         body: JSON.stringify(body),
       }),

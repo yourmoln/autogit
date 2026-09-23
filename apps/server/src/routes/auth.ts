@@ -114,6 +114,7 @@ export function registerAuthRoutes(app: FastifyInstance, ctx: AppContext): void 
 
   app.put('/api/auth/credentials', async (request, reply) => {
     const body = parseOrThrow(credentialsSchema, request.body, '账号信息');
+    const currentToken = readCookie(request.headers.cookie, AUTH_SESSION_COOKIE);
     const result = ctx.auth.updateCredentials({
       currentPassword: body.currentPassword,
       username: body.username ?? null,
@@ -123,18 +124,24 @@ export function registerAuthRoutes(app: FastifyInstance, ctx: AppContext): void 
       // signed out: they share the cookie this request replaces, and the answer
       // below carries its replacement.
       rotatedFrom: request.authSessionHash,
+      // A request that changes nothing is answered with the session the browser
+      // already has, so the cookie below is only written when it really changed.
+      currentToken,
     });
-    sendSessionCookie(reply, result, isSecureRequest(request));
+    if (result.token !== currentToken) sendSessionCookie(reply, result, isSecureRequest(request));
     ctx.store.addActivity({
       level: 'success',
       scope: 'auth',
       repositoryId: null,
-      message: `登录账号已更新：${result.session.username}，其他设备的登录状态已失效`,
+      message: result.rotated
+        ? `登录账号已更新：${result.session.username}，其他设备的登录状态已失效`
+        : `登录账号未变更：${result.session.username}（未失效任何会话）`,
     });
 
     return {
       session: result.session,
       credentials: ctx.auth.credentialsSummary(),
+      rotated: result.rotated,
     };
   });
 }

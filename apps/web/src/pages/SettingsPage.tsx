@@ -343,7 +343,8 @@ export function SettingsPage(): ReactNode {
  * 登录账号管理。
  *
  * AutoGit 是单用户工具，账号只有一份：这里改掉的用户名/密码就是下次登录要
- * 用的凭据。修改需要验证当前密码，保存后其他设备上的登录状态会立即失效。
+ * 用的凭据。修改需要验证当前密码，确实改动后其他设备上的登录状态会立即失效；
+ * 保存时用户名与密码都没变（空保存、把当前密码原样填回来）不会碰任何会话。
  */
 function AccountSecurityCard(): ReactNode {
   const { credentials, session, updateCredentials, logout } = useAuth();
@@ -383,8 +384,12 @@ function AccountSecurityCard(): ReactNode {
         username: trimmedUsername,
         password: nextPassword.length > 0 ? nextPassword : null,
       }),
-    onSuccess: (updated) => {
-      toast.success(`登录账号已更新：${updated.username}`);
+    onSuccess: ({ session: updated, rotated }) => {
+      // A save that changed neither username nor password is not a failure: the
+      // server answers with the session the browser already has and signs nobody
+      // out, so the message must not claim the account was updated.
+      if (rotated) toast.success(`登录账号已更新：${updated.username}`);
+      else toast.info(`未检测到改动，登录状态与其它设备均未受影响：${updated.username}`);
       setUsername(updated.username);
       setUsernameEdited(false);
       setCurrentPassword('');
@@ -518,7 +523,8 @@ function AccountSecurityCard(): ReactNode {
         </div>
         <p className="mt-2 text-[11px] text-slate-500">
           密码以 scrypt 哈希保存，会话 token 只保存 SHA-256
-          摘要；修改凭据后其他设备需要重新登录，已经建立的实时连接会立即断开。
+          摘要；确实改动了用户名或密码后其他设备需要重新登录，已经建立的实时连接会立即断开，
+          没有实际改动时不会换 Cookie、也不会让任何设备下线。
         </p>
       </div>
     </SectionCard>

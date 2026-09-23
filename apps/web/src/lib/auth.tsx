@@ -27,6 +27,15 @@ export interface CredentialsUpdateInput {
   password?: string | null;
 }
 
+export interface CredentialsUpdateResult {
+  session: AuthSession;
+  /**
+   * `false` 表示这次请求没有实际改动凭据（用户名与当前一致、密码留空或与当前
+   * 密码相同）：服务端没有轮换会话，其他设备保持登录，界面不应提示「已更新」。
+   */
+  rotated: boolean;
+}
+
 export interface AuthContextValue {
   session: AuthSession | null;
   credentials: AuthCredentialsSummary | null;
@@ -34,7 +43,7 @@ export interface AuthContextValue {
   loading: boolean;
   login: (input: LoginInput) => Promise<AuthSession>;
   logout: () => Promise<void>;
-  updateCredentials: (input: CredentialsUpdateInput) => Promise<AuthSession>;
+  updateCredentials: (input: CredentialsUpdateInput) => Promise<CredentialsUpdateResult>;
 }
 
 const AuthContext = createContext<AuthContextValue | null>(null);
@@ -107,7 +116,9 @@ export function AuthProvider({ children }: { children: ReactNode }): ReactNode {
         const payload = await api.auth.updateCredentials(input);
         applyPayload(payload);
         if (!payload.session) throw new Error('保存响应缺少会话信息');
-        return payload.session;
+        // `rotated: false` 是「没有任何改动」的回答：Cookie 没有换、其他设备也
+        // 没有被登出，调用方据此给出如实的提示，而不是一句「已更新」。
+        return { session: payload.session, rotated: payload.rotated === true };
       } catch (error) {
         // The rotation revokes the old sessions before it answers, so a request
         // that fails or never arrives can leave this tab holding a cookie that no

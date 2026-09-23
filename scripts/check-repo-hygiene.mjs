@@ -125,8 +125,9 @@ function scan(cwd, ref) {
       `${ref} 可达的历史里有 ${entries.length} 个 ${FORBIDDEN} 对象（blob 合计 ${formatMb(bytes)}）。` +
         '删除文件只让工作树与索引变干净：这些对象仍从当初添加它们的提交起可达，' +
         'Create a merge commit 会把整条链并进目标分支，Rebase and merge 会重放那次添加。\n' +
-        '   处理（二选一）：① 在有远端写权限的环境改写该分支（' +
-        `git filter-repo --path ${FORBIDDEN} --invert-paths 后 git push --force-with-lease），再跑 pnpm repo:check 确认归零；` +
+        '   处理（二选一）：① 在有远端写权限的环境改写该分支：先 git fetch origin，再 pnpm repo:purge 预演、' +
+        'pnpm repo:purge --apply，最后 git push --force-with-lease，再跑 pnpm repo:check 确认归零；' +
+        '该脚本只改写分支自己的提交（基准分支的历史与合并基准都不动，不会把 PR 变成有冲突的）；' +
         '② 直接用 Squash and merge 合并（只取最终树）并在合并后删除该分支。',
     );
   }

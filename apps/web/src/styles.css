@@ -12,10 +12,118 @@
   --font-mono: "JetBrains Mono", "Cascadia Code", "SF Mono", ui-monospace, monospace;
 }
 
+/* -------------------------------------------------------------------- theme */
+
+/*
+ * The console is authored dark-first: surfaces are `white/N` alpha overlays,
+ * text follows the `slate` ladder and accents use the `*-200/300/400` tints.
+ * `[data-theme='light']` re-points exactly those primitives, so every component
+ * stays readable without repeating a second palette in each class name.
+ * The mode lives in `src/lib/theme.ts` (header button, default 跟随系统) and is
+ * applied to `<html>` by the pre-paint snippet in `index.html`.
+ */
 :root {
   color-scheme: dark;
   --glow-a: rgba(99, 102, 241, 0.22);
   --glow-b: rgba(34, 211, 238, 0.14);
+  --fg-default: rgb(226 232 240);
+  --selection: rgba(99, 102, 241, 0.35);
+  --panel-border: rgba(255, 255, 255, 0.07);
+  --panel-top: rgba(255, 255, 255, 0.045);
+  --panel-bottom: rgba(255, 255, 255, 0.012);
+  --panel-edge: rgba(255, 255, 255, 0.04);
+  --panel-shadow: 0 18px 40px -28px rgba(0, 0, 0, 0.9);
+  --panel-hover-border: rgba(129, 140, 248, 0.4);
+  --panel-hover-shadow: 0 26px 50px -30px rgba(79, 70, 229, 0.65);
+  --hairline: rgba(255, 255, 255, 0.12);
+  --control-border: rgba(255, 255, 255, 0.1);
+  --control-border-strong: rgba(255, 255, 255, 0.18);
+  --control-bg: rgba(255, 255, 255, 0.04);
+  --control-bg-hover: rgba(255, 255, 255, 0.08);
+  --field-bg: rgba(6, 8, 12, 0.65);
+  --muted-fg: rgb(148 163 184);
+  --placeholder-fg: rgb(100 116 139);
+  --danger-fg: #fca5a5;
+  --scrim: rgba(3, 6, 12, 0.68);
+  --grid-line: rgba(255, 255, 255, 0.035);
+  --scrollbar-thumb: rgba(148, 163, 184, 0.28);
+  --skeleton-a: rgba(255, 255, 255, 0.04);
+  --skeleton-b: rgba(255, 255, 255, 0.1);
+  --label-tint-keep: 100%;
+}
+
+:root[data-theme='light'] {
+  color-scheme: light;
+
+  /* `white/N` overlays draw ink on a light canvas, `black/N` insets draw paper. */
+  --color-white: #0f172a;
+  --color-black: #f1f5f9;
+
+  /* Text ladder mirrored around slate-500. */
+  --color-slate-50: #0b1220;
+  --color-slate-100: #0f172a;
+  --color-slate-200: #1e293b;
+  --color-slate-300: #334155;
+  --color-slate-400: #475569;
+  --color-slate-500: #64748b;
+  --color-slate-600: #94a3b8;
+
+  /* Accent tints go one or two stops deeper to keep contrast on light surfaces. */
+  --color-indigo-200: #3730a3;
+  --color-indigo-300: #4338ca;
+  --color-indigo-400: #4f46e5;
+  --color-violet-200: #5b21b6;
+  --color-violet-400: #7c3aed;
+  --color-cyan-200: #155e75;
+  --color-cyan-300: #0e7490;
+  --color-cyan-400: #0891b2;
+  --color-emerald-200: #065f46;
+  --color-emerald-300: #047857;
+  --color-emerald-400: #059669;
+  --color-amber-200: #92400e;
+  --color-amber-300: #b45309;
+  --color-amber-400: #d97706;
+  --color-orange-200: #9a3412;
+  --color-orange-300: #c2410c;
+  --color-orange-400: #ea580c;
+  --color-rose-100: #9f1239;
+  --color-rose-200: #be123c;
+  --color-rose-300: #e11d48;
+  --color-rose-400: #e11d48;
+
+  --color-canvas: #f4f6fb;
+  --color-surface: #ffffff;
+  --color-surface-raised: #ffffff;
+  --color-border-subtle: rgba(15, 23, 42, 0.1);
+  --color-brand-soft: #6366f1;
+  --color-accent: #0891b2;
+
+  --glow-a: rgba(99, 102, 241, 0.14);
+  --glow-b: rgba(8, 145, 178, 0.1);
+  --fg-default: rgb(30 41 59);
+  --selection: rgba(99, 102, 241, 0.22);
+  --panel-border: rgba(15, 23, 42, 0.09);
+  --panel-top: rgba(255, 255, 255, 0.96);
+  --panel-bottom: rgba(248, 250, 252, 0.9);
+  --panel-edge: rgba(255, 255, 255, 0.9);
+  --panel-shadow: 0 18px 38px -30px rgba(15, 23, 42, 0.45);
+  --panel-hover-border: rgba(79, 70, 229, 0.35);
+  --panel-hover-shadow: 0 26px 50px -32px rgba(79, 70, 229, 0.45);
+  --hairline: rgba(15, 23, 42, 0.1);
+  --control-border: rgba(15, 23, 42, 0.12);
+  --control-border-strong: rgba(15, 23, 42, 0.22);
+  --control-bg: rgba(255, 255, 255, 0.75);
+  --control-bg-hover: #ffffff;
+  --field-bg: rgba(255, 255, 255, 0.95);
+  --muted-fg: rgb(71 85 105);
+  --placeholder-fg: rgb(148 163 184);
+  --danger-fg: #b91c1c;
+  --scrim: rgba(15, 23, 42, 0.32);
+  --grid-line: rgba(15, 23, 42, 0.045);
+  --scrollbar-thumb: rgba(100, 116, 139, 0.35);
+  --skeleton-a: rgba(15, 23, 42, 0.05);
+  --skeleton-b: rgba(15, 23, 42, 0.1);
+  --label-tint-keep: 66%;
 }
 
 * {
@@ -34,14 +142,14 @@ body {
     radial-gradient(1100px 620px at 12% -8%, var(--glow-a), transparent 60%),
     radial-gradient(900px 520px at 92% 4%, var(--glow-b), transparent 58%),
     var(--color-canvas);
-  color: rgb(226 232 240);
+  color: var(--fg-default);
   font-family: var(--font-sans);
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
 }
 
 ::selection {
-  background: rgba(99, 102, 241, 0.35);
+  background: var(--selection);
 }
 
 /* ------------------------------------------------------------------ layout */
@@ -49,11 +157,11 @@ body {
 .panel {
   position: relative;
   border-radius: 18px;
-  border: 1px solid rgba(255, 255, 255, 0.07);
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.045), rgba(255, 255, 255, 0.012));
+  border: 1px solid var(--panel-border);
+  background: linear-gradient(180deg, var(--panel-top), var(--panel-bottom));
   box-shadow:
-    0 1px 0 rgba(255, 255, 255, 0.04) inset,
-    0 18px 40px -28px rgba(0, 0, 0, 0.9);
+    0 1px 0 var(--panel-edge) inset,
+    var(--panel-shadow);
   backdrop-filter: blur(14px);
 }
 
@@ -66,10 +174,10 @@ body {
 
 .panel-hover:hover {
   transform: translateY(-2px);
-  border-color: rgba(129, 140, 248, 0.4);
+  border-color: var(--panel-hover-border);
   box-shadow:
-    0 1px 0 rgba(255, 255, 255, 0.05) inset,
-    0 26px 50px -30px rgba(79, 70, 229, 0.65);
+    0 1px 0 var(--panel-edge) inset,
+    var(--panel-hover-shadow);
 }
 
 .hairline {
@@ -77,9 +185,26 @@ body {
   background: linear-gradient(
     90deg,
     transparent,
-    rgba(255, 255, 255, 0.12) 20%,
-    rgba(255, 255, 255, 0.12) 80%,
+    var(--hairline) 20%,
+    var(--hairline) 80%,
     transparent
+  );
+}
+
+/* Modal backdrop: dims the page in both themes. */
+.scrim {
+  background: var(--scrim);
+}
+
+/*
+ * Label chips keep the raw repository hue as text colour. On light surfaces
+ * that hue is too pale, so it is mixed towards ink (100% = unchanged).
+ */
+.label-tint {
+  color: color-mix(
+    in oklab,
+    var(--label-color, currentcolor) var(--label-tint-keep, 100%),
+    #0f172a
   );
 }
 
@@ -90,12 +215,12 @@ body {
   align-items: center;
   gap: 0.45rem;
   border-radius: 11px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--control-border);
+  background: var(--control-bg);
   padding: 0.5rem 0.85rem;
   font-size: 0.82rem;
   font-weight: 500;
-  color: rgb(226 232 240);
+  color: var(--fg-default);
   cursor: pointer;
   transition:
     background 160ms ease,
@@ -106,8 +231,8 @@ body {
 }
 
 .btn:hover:not(:disabled) {
-  background: rgba(255, 255, 255, 0.08);
-  border-color: rgba(255, 255, 255, 0.18);
+  background: var(--control-bg-hover);
+  border-color: var(--control-border-strong);
 }
 
 .btn:active:not(:disabled) {
@@ -134,7 +259,7 @@ body {
 .btn-danger {
   border-color: rgba(239, 68, 68, 0.35);
   background: rgba(239, 68, 68, 0.12);
-  color: #fca5a5;
+  color: var(--danger-fg);
 }
 
 .btn-danger:hover:not(:disabled) {
@@ -145,12 +270,12 @@ body {
 .btn-ghost {
   border-color: transparent;
   background: transparent;
-  color: rgb(148 163 184);
+  color: var(--muted-fg);
 }
 
 .btn-ghost:hover:not(:disabled) {
-  background: rgba(255, 255, 255, 0.06);
-  color: rgb(226 232 240);
+  background: var(--control-bg);
+  color: var(--fg-default);
 }
 
 .input,
@@ -158,11 +283,11 @@ body {
 .textarea {
   width: 100%;
   border-radius: 11px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  background: rgba(6, 8, 12, 0.65);
+  border: 1px solid var(--control-border);
+  background: var(--field-bg);
   padding: 0.55rem 0.75rem;
   font-size: 0.85rem;
-  color: rgb(226 232 240);
+  color: var(--fg-default);
   outline: none;
   transition:
     border-color 160ms ease,
@@ -171,7 +296,7 @@ body {
 
 .input::placeholder,
 .textarea::placeholder {
-  color: rgb(100 116 139);
+  color: var(--placeholder-fg);
 }
 
 .input:focus,
@@ -191,8 +316,8 @@ body {
 
 .select {
   appearance: none;
-  background-image: linear-gradient(45deg, transparent 50%, rgb(148 163 184) 50%),
-    linear-gradient(135deg, rgb(148 163 184) 50%, transparent 50%);
+  background-image: linear-gradient(45deg, transparent 50%, var(--muted-fg) 50%),
+    linear-gradient(135deg, var(--muted-fg) 50%, transparent 50%);
   background-position:
     calc(100% - 16px) calc(50% - 2px),
     calc(100% - 11px) calc(50% - 2px);
@@ -208,8 +333,8 @@ body {
   align-items: center;
   gap: 0.32rem;
   border-radius: 999px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--control-border);
+  background: var(--control-bg);
   padding: 0.14rem 0.55rem;
   font-size: 0.7rem;
   font-weight: 500;
@@ -219,7 +344,7 @@ body {
 
 .scroll-thin {
   scrollbar-width: thin;
-  scrollbar-color: rgba(148, 163, 184, 0.35) transparent;
+  scrollbar-color: var(--scrollbar-thumb) transparent;
 }
 
 .scroll-thin::-webkit-scrollbar {
@@ -228,7 +353,7 @@ body {
 }
 
 .scroll-thin::-webkit-scrollbar-thumb {
-  background: rgba(148, 163, 184, 0.28);
+  background: var(--scrollbar-thumb);
   border-radius: 999px;
 }
 
@@ -290,8 +415,7 @@ body {
 .skeleton {
   border-radius: 10px;
   background:
-    linear-gradient(90deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.1), rgba(255, 255, 255, 0.04))
-      no-repeat;
+    linear-gradient(90deg, var(--skeleton-a), var(--skeleton-b), var(--skeleton-a)) no-repeat;
   background-size: 560px 100%;
   animation: shimmer 1.5s linear infinite;
 }
@@ -306,7 +430,7 @@ body {
 
 .grid-lines {
   background-image:
-    linear-gradient(rgba(255, 255, 255, 0.035) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(255, 255, 255, 0.035) 1px, transparent 1px);
+    linear-gradient(var(--grid-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
   background-size: 46px 46px;
 }

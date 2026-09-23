@@ -14,6 +14,8 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 import type {
+  CodexModelProbe,
+  CodexStatus,
   Comment,
   ProviderKind,
   RemoteIssue,
@@ -22,16 +24,22 @@ import type {
   RemoteRepositorySummary,
   RemoteUser,
 } from '@autogit/shared';
+import websocket from '@fastify/websocket';
+import Fastify from 'fastify';
 
 import { ensureRuntimeDirectories, loadRuntimeConfig } from '../config.js';
+import { createContext, type AppContext } from '../context.js';
 import { Db } from '../db/database.js';
 import { migrate } from '../db/migrations.js';
 import { Store } from '../db/store.js';
 import type { GitProvider, RepoRef } from '../providers/index.js';
+import { registerCodexRoutes } from '../routes/codex.js';
+import { registerSystemRoutes } from '../routes/system.js';
+import { registerTaskRoutes, withRetryState } from '../routes/tasks.js';
 import { CodexService } from '../services/codex.js';
 import { EventBus } from '../services/events.js';
 import { LabelService } from '../services/labels.js';
-import { Orchestrator } from '../services/orchestrator.js';
+import { buildPullRequestBody, Orchestrator } from '../services/orchestrator.js';
 import { ProviderFactory } from '../services/providers.js';
 import { ProxyService } from '../services/proxy.js';
 import type { EngineRunInput, EngineRunResult } from '../services/runner.js';
@@ -371,7 +379,59 @@ class SimulationRunner extends EngineRunner {
     }
     writeFileSync(path.join(input.cwd, 'src', 'feature.txt'), 'feature work in progress\n', 'utf8');
     input.log('agent', '已实现 Issue 描述的功能');
-    return success('新增 src/feature.txt，实现 Issue 要求。', started);
+    return success(
+      `新增 src/feature.txt，实现 Issue 要求。
+
+## 实现假设清单
+- 假设 src/feature.txt 的首行作为标题使用。
+
+## 代码逻辑图
+\`\`\`mermaid
+flowchart LR
+    A[领取 Issue] --> B[写入 src/feature.txt]
+    B --> C[提交并推送分支]
+\`\`\``,
+      started,
+    );
+  }
+}
+
+/**
+ * Fake agent with the two hooks the regression checks need: a run can be held
+ * open (so a task can be observed while it is `running`) or made to fail once.
+ */
+class GatedSimulationRunner extends SimulationRunner {
+  private nextRunGate: Promise<void> | null = null;
+  private pendingFailure: string | null = null;
+
+  /**
+   * Holds the next agent run until `gate` resolves, so a task can be observed
+   * while it is genuinely running.
+   */
+  holdNextRun(gate: Promise<void>): void {
+    this.nextRunGate = gate;
+  }
+
+  /** Makes the next agent run fail with `message`. */
+  failNextRun(message: string): void {
+    this.pendingFailure = message;
+  }
+
+  override async run(input: EngineRunInput): Promise<EngineRunResult> {
+    const started = Date.now();
+    const gate = this.nextRunGate;
+    if (gate) {
+      this.nextRunGate = null;
+      await gate;
+    }
+    if (input.signal?.aborted) return cancelled(started);
+    if (this.pendingFailure) {
+      const message = this.pendingFailure;
+      this.pendingFailure = null;
+      input.log('stderr', `模拟：${message}`);
+      return failed(message, started);
+    }
+    return super.run(input);
   }
 }
 
@@ -387,6 +447,44 @@ function success(summary: string, started: number): EngineRunResult {
     error: null,
     usage: null,
   };
+}
+
+function failed(message: string, started: number): EngineRunResult {
+  return {
+    ok: false,
+    exitCode: 1,
+    summary: '',
+    output: '',
+    durationMs: Date.now() - started,
+    timedOut: false,
+    aborted: false,
+    error: message,
+    usage: null,
+  };
+}
+
+/** The runner reports an aborted run the same way the real engine does. */
+function cancelled(started: number): EngineRunResult {
+  return {
+    ok: false,
+    exitCode: null,
+    summary: '',
+    output: '',
+    durationMs: Date.now() - started,
+    timedOut: false,
+    aborted: true,
+    error: '任务已取消',
+    usage: null,
+  };
+}
+
+/** Promise the simulation resolves by hand to gate an async step. */
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve: (value: T) => void = () => undefined;
+  const promise = new Promise<T>((resolver) => {
+    resolve = resolver;
+  });
+  return { promise, resolve };
 }
 
 function mkdirSyncIfNeeded(dir: string): void {
@@ -456,7 +554,7 @@ async function main(): Promise<void> {
   Object.assign(providers, { forAccount: () => provider });
 
   const codex = new CodexService(config, settings, events);
-  const runner = new SimulationRunner(config, settings, codex);
+  const runner = new GatedSimulationRunner(config, settings, codex);
   const workspace = new WorkspaceManager(config, settings);
   const labels = new LabelService({ store, providers, events });
   const orchestrator = new Orchestrator({
@@ -470,6 +568,31 @@ async function main(): Promise<void> {
     providers,
     labels,
   });
+
+  // 回归检查走真实 HTTP 路由，上下文按 index.ts 的方式由 createContext 建好，
+  // 再把模拟自建的实例装进去：以后 AppContext 新增服务时这里不用跟着改，
+  // 这些路由也不会用到它们之外的接口。
+  const ctx: AppContext = createContext(config);
+  ctx.db.close(); // 模拟用自己的 db / store
+  Object.assign(ctx, {
+    db,
+    store,
+    settings,
+    events,
+    providers,
+    labels,
+    codex,
+    runner,
+    workspace,
+    orchestrator,
+    dispose: () => orchestrator.stop(),
+  });
+  const app = Fastify({ logger: false });
+  await app.register(websocket);
+  registerSystemRoutes(app, ctx);
+  registerTaskRoutes(app, ctx);
+  registerCodexRoutes(app, ctx);
+  await app.ready();
 
   const account = store.createAccount({
     id: 'acc_sim',
@@ -534,6 +657,31 @@ async function main(): Promise<void> {
   assert(pr.labels.includes('ai/approved'), 'PR 应当评审通过为 ai/approved');
   assert(runner.reviewRounds >= 2, '应当经历「评审 → 修复 → 复审」至少两轮');
   assert(runner.verdictRepairs === 1, '首次评审输出不可解析时，应当要求模型重新输出一次结论');
+
+  // PR 正文按仓库约定必须各出现一次「实现假设清单」与「代码逻辑图」，
+  // 内容优先取实现代理给出的两节，缺失时由 AutoGit 补全。
+  assert(
+    occurrences(pr.body, '## 实现假设清单') === 1 && occurrences(pr.body, '## 代码逻辑图') === 1,
+    'PR 正文应当各包含一次「实现假设清单」与「代码逻辑图」标题',
+  );
+  assert(
+    pr.body.includes('假设 src/feature.txt 的首行作为标题使用'),
+    'PR 正文应当带上实现代理给出的假设清单',
+  );
+  assert(pr.body.includes('flowchart LR'), 'PR 正文应当带上实现代理给出的代码逻辑图');
+  const fallbackBody = buildPullRequestBody(
+    issue,
+    '只改了 README，没有额外说明。',
+    ['README.md'],
+    repository.defaultBranch,
+  );
+  assert(
+    occurrences(fallbackBody, '## 实现假设清单') === 1 &&
+      occurrences(fallbackBody, '## 代码逻辑图') === 1 &&
+      fallbackBody.includes('```mermaid'),
+    '实现代理没给出两节时，PR 正文也必须补全且非空',
+  );
+  log.warn('PR 正文：实现假设清单 / 代码逻辑图两节齐全（含回落路径）✅');
 
   const branch = pr.headRef;
   const files = git(['ls-tree', '--name-only', '-r', `refs/heads/${branch}`], bareRepo)
@@ -888,6 +1036,136 @@ async function main(): Promise<void> {
   log.warn('基座抓取场景通过：同仓库并发任务串行抓取基座克隆，不再互抢 ref 锁 ✅');
 
   orchestrator.stop();
+
+  // ---------------------------------------------------------- 回归：评审意见
+
+  // ① 任务失败后，本地快照必须立刻带上 ai/stuck：重试按钮依赖它判断可用性，
+  //    而下一轮轮询（默认 45s）之前没人会刷新它。
+  const stuckIssue = provider.seedIssue({
+    number: 7,
+    title: '验证失败后的重试门禁',
+    body: '该 Issue 的实现任务会被模拟为失败，用于验证本地快照与 ai/stuck 同步。',
+    labels: ['ai/todo'],
+  });
+  runner.failNextRun('模拟：Codex 执行失败');
+  await orchestrator.tick('retry-gate');
+  await waitForIdle(orchestrator, store, 60_000);
+
+  const failedTask = store
+    .listTasks({ repositoryId: repository.id, limit: 50 })
+    .find(
+      (task) =>
+        task.kind === 'implement' &&
+        task.issueNumber === stuckIssue.number &&
+        task.status === 'failed',
+    );
+  if (!failedTask) throw new Error('断言失败：期望一个失败任务，但最近的任务都不是 failed');
+  const retrySnapshot = store
+    .listIssues(repository.id)
+    .find((row) => row.number === stuckIssue.number);
+  assert(retrySnapshot?.labels.includes('ai/stuck') === true, '失败后本地快照应立即包含 ai/stuck');
+  assert(
+    withRetryState(store, [failedTask])[0]?.retryable === true,
+    '失败后重试门禁应立即放行，无需等待下一轮轮询',
+  );
+  log.warn(`回归 ①：失败后 Issue #${stuckIssue.number} 的本地快照立即同步 ai/stuck ✅`);
+
+  // ② “重新检测”不得内联等待模型探测（最长 3 分钟）：请求立即返回并报告
+  //    探测进行中，结果由状态接口跟进，且并发请求复用同一次模型调用。
+  const probeGate = deferred<CodexModelProbe>();
+  let probeRuns = 0;
+  // 真实探测会启动 Codex CLI，模拟环境里没有；这里只替换探测本身，
+  // 缓存、并发合并与接口契约仍然走真实代码。
+  const probeSeam = codex as unknown as {
+    runModelProbe: () => Promise<CodexModelProbe>;
+    cacheProbe: (probe: CodexModelProbe) => CodexModelProbe;
+  };
+  probeSeam.runModelProbe = async () => {
+    probeRuns += 1;
+    return probeSeam.cacheProbe(await probeGate.promise);
+  };
+
+  const invalidate = await withTimeout(
+    app.inject({ method: 'POST', url: '/api/codex/invalidate' }),
+    5_000,
+    '“重新检测”不应内联等待模型探测',
+  );
+  assert(invalidate.statusCode === 200, `重新检测接口应返回 200，实际 ${invalidate.statusCode}`);
+  const invalidated = invalidate.json<{ status: CodexStatus; probing: boolean }>();
+  assert(probeRuns === 1, `重新检测应当触发一次模型探测，实际 ${probeRuns} 次`);
+  assert(invalidated.probing === true, '重新检测应立即返回并标记“探测进行中”');
+
+  const sharedProbe = codex.modelProbe(true);
+  assert(probeRuns === 1, '探测进行中再次请求应复用同一次模型调用');
+  const probingStatus = (await app.inject({ method: 'GET', url: '/api/codex/status' })).json<{
+    status: CodexStatus;
+  }>();
+  assert(probingStatus.status.probing === true, '探测进行中时状态接口应报告 probing');
+  assert(probingStatus.status.modelProbe === null, '探测未完成时不应伪造探测结果');
+
+  probeGate.resolve({
+    ready: true,
+    message: 'pong',
+    durationMs: 12,
+    checkedAt: new Date().toISOString(),
+  });
+  await sharedProbe;
+  const settledStatus = (await app.inject({ method: 'GET', url: '/api/codex/status' })).json<{
+    status: CodexStatus;
+  }>();
+  assert(settledStatus.status.probing === false, '探测结束后不应继续报告“进行中”');
+  assert(settledStatus.status.modelProbe?.ready === true, '探测结束后状态应带上探测结果');
+  assert(
+    store.listActivity(50).some((entry) => entry.message.includes('模型响应正常')),
+    '后台探测结束后应写入活动记录',
+  );
+  log.warn('回归 ②：“重新检测”立即返回，模型探测在后台完成且只调用一次 ✅');
+
+  // ③ 重启调度器不得把内存队列/运行中的任务当成“服务重启中断”：
+  //    它们随后照常执行，之前会被先标成 cancelled 并留下误导性活动。
+  // 关掉仓库轮询，让重启触发的 tick 不会另外调度新任务，这里只看任务状态。
+  store.updateRepository(repository.id, { enabled: false });
+  const runGate = deferred<void>();
+  runner.holdNextRun(runGate.promise);
+
+  const runningTask = await orchestrator.enqueueManual({
+    repositoryId: repository.id,
+    kind: 'implement',
+    issueNumber: 1,
+  });
+  assert(store.getTask(runningTask.id)?.status === 'running', '手动任务应立即进入运行状态');
+  const queuedTask = await orchestrator.enqueueManual({
+    repositoryId: repository.id,
+    kind: 'implement',
+    issueNumber: 2,
+  });
+  assert(store.getTask(queuedTask.id)?.status === 'queued', '同一仓库的第二个任务应留在队列里');
+
+  const restarted = await app.inject({ method: 'POST', url: '/api/orchestrator/restart' });
+  assert(restarted.statusCode === 200, `重启接口应返回 200，实际 ${restarted.statusCode}`);
+  assert(
+    store.getTask(queuedTask.id)?.status === 'queued',
+    '重启不应把仍在内存队列中的任务标成 cancelled',
+  );
+  assert(
+    !store.listActivity(200).some((entry) => entry.message.includes('因服务重启被中断')),
+    '重启不应为仍在处理中的任务写入“服务重启中断”活动',
+  );
+
+  runGate.resolve();
+  await waitForIdle(orchestrator, store, 60_000);
+  assert(
+    store.getTask(runningTask.id)?.status === 'cancelled',
+    '被重启中断的运行中任务应记录为 cancelled',
+  );
+  assert(
+    store.getTask(queuedTask.id)?.summary?.includes('Issue 已关闭') === true,
+    '重启后留在队列里的任务应照常执行',
+  );
+  log.warn('回归 ③：重启保留内存队列，不再误报“服务重启中断” ✅');
+
+  await app.close();
+  orchestrator.stop(); // 回归 ③ 用 restart() 拉起过调度器，这里停掉计时器
   db.close();
   rmSync(root, { recursive: true, force: true });
   log.warn('=== 模拟通过：Issue → PR → 评审 → 修复 → 复审 → 合并 ✅ ===');
@@ -895,6 +1173,26 @@ async function main(): Promise<void> {
 
 function assert(condition: unknown, message: string): void {
   if (!condition) throw new Error(`断言失败：${message}`);
+}
+
+/** How often `needle` appears in `text` (used to check PR section headings). */
+function occurrences(text: string, needle: string): number {
+  return text.split(needle).length - 1;
+}
+
+/** Fails fast instead of hanging when an endpoint waits on a step that never ends. */
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`断言失败：${message}`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 async function waitForIdle(
@@ -952,7 +1250,10 @@ async function runUntilQuiet(
   }
 }
 
-main().catch((error: unknown) => {
+main().catch(async (error: unknown) => {
   logger().error({ err: error }, '模拟失败');
-  process.exitCode = 1;
+  // The orchestrator keeps a poll timer alive, so a failed run must not wait
+  // for the event loop to drain: flush the log and exit with a failure code.
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  process.exit(1);
 });

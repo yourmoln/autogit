@@ -7,7 +7,7 @@ import {
   type TaskPriority,
   type TaskStatus,
 } from '@autogit/shared';
-import type { ReactNode } from 'react';
+import type { CSSProperties, ReactNode } from 'react';
 
 import { cn, colorWithAlpha } from '../lib/utils.js';
 
@@ -27,15 +27,17 @@ export function LabelChip({
   return (
     <span
       className={cn(
-        'inline-flex items-center gap-1 rounded-full border font-medium',
+        'label-tint inline-flex items-center gap-1 rounded-full border font-medium',
         size === 'sm' ? 'px-2 py-0.5 text-[10.5px]' : 'px-2.5 py-1 text-xs',
         className,
       )}
-      style={{
-        borderColor: colorWithAlpha(hex, 0.45),
-        background: colorWithAlpha(hex, 0.16),
-        color: hex,
-      }}
+      style={
+        {
+          borderColor: colorWithAlpha(hex, 0.45),
+          background: colorWithAlpha(hex, 0.16),
+          '--label-color': hex,
+        } as CSSProperties
+      }
       title={definition?.description ?? name}
     >
       <span

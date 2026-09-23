@@ -2,7 +2,7 @@ import { STUCK_LABEL, type Task, type TaskStatus } from '@autogit/shared';
 import type { FastifyInstance } from 'fastify';
 
 import type { AppContext } from '../context.js';
-import type { TaskRecord } from '../db/store.js';
+import type { Store, TaskRecord } from '../db/store.js';
 import { HttpError } from '../util/http.js';
 
 /**
@@ -11,16 +11,17 @@ import { HttpError } from '../util/http.js';
  * Retrying re-runs a failed/cancelled task, and it consumes the `ai/stuck`
  * label the failure parked on the Issue/PR — so the button is only offered
  * while that label is still present, which also makes it a one-shot action.
- * Labels come from the local snapshots the poller refreshes.
+ * Labels come from the local snapshots, which `markStuck()` writes back the
+ * moment it parks an item (and the poller refreshes afterwards).
  */
-function withRetryState(ctx: AppContext, tasks: TaskRecord[]): Task[] {
+export function withRetryState(store: Store, tasks: TaskRecord[]): Task[] {
   const labelCache = new Map<string, string[] | null>();
   const labelsOf = (repositoryId: string, number: number, isPullRequest: boolean): string[] => {
     const key = `${repositoryId}:${isPullRequest ? 'pr' : 'issue'}:${number}`;
     if (!labelCache.has(key)) {
       const snapshot = isPullRequest
-        ? ctx.store.listPullRequests(repositoryId).find((item) => item.number === number)
-        : ctx.store.listIssues(repositoryId).find((item) => item.number === number);
+        ? store.listPullRequests(repositoryId).find((item) => item.number === number)
+        : store.listIssues(repositoryId).find((item) => item.number === number);
       labelCache.set(key, snapshot?.labels ?? null);
     }
     return labelCache.get(key) ?? [];
@@ -44,7 +45,7 @@ export function registerTaskRoutes(app: FastifyInstance, ctx: AppContext): void 
     const limit = Number.parseInt(query.limit ?? '100', 10) || 100;
     return {
       items: withRetryState(
-        ctx,
+        ctx.store,
         ctx.store.listTasks({
           repositoryId: query.repositoryId,
           status,
@@ -59,7 +60,7 @@ export function registerTaskRoutes(app: FastifyInstance, ctx: AppContext): void 
     const { id } = request.params as { id: string };
     const task = ctx.store.getTask(id);
     if (!task) throw new HttpError(404, '任务不存在');
-    return { task: withRetryState(ctx, [task])[0], logs: ctx.store.listLogs(id, 2000) };
+    return { task: withRetryState(ctx.store, [task])[0], logs: ctx.store.listLogs(id, 2000) };
   });
 
   app.post('/api/tasks/:id/cancel', async (request) => {

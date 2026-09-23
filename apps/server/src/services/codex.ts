@@ -61,6 +61,8 @@ export class CodexService {
   private readonly log = childLogger('codex');
   private capabilityCache: CapabilityCache | null = null;
   private probeCache: ProbeCache | null = null;
+  /** In-flight model probe, shared by every caller that asks while it runs. */
+  private probePromise: Promise<CodexModelProbe> | null = null;
   private installState: CodexInstallState = {
     running: false,
     startedAt: null,
@@ -157,12 +159,29 @@ export class CodexService {
    * with a trivial prompt, run in a read-only sandbox against a scratch
    * directory. AutoGit never inspects or manages credentials — the CLI owns
    * them, this probe only looks at whether the model replied.
+   *
+   * A probe costs a real model call and can take minutes, so concurrent calls
+   * share one run instead of stacking up (the UI polls `/status` while a
+   * background probe started by `/api/codex/invalidate` is still in flight).
    */
-  async modelProbe(force = false): Promise<CodexModelProbe> {
+  modelProbe(force = false): Promise<CodexModelProbe> {
+    if (this.probePromise) return this.probePromise;
     if (!force && this.probeCache && Date.now() - this.probeCache.at < PROBE_TTL_MS) {
-      return this.probeCache.probe;
+      return Promise.resolve(this.probeCache.probe);
     }
 
+    this.probePromise = this.runModelProbe().finally(() => {
+      this.probePromise = null;
+    });
+    return this.probePromise;
+  }
+
+  /** Whether a model probe is currently running. */
+  isProbing(): boolean {
+    return this.probePromise !== null;
+  }
+
+  private async runModelProbe(): Promise<CodexModelProbe> {
     const { path: binary } = this.resolveBinary();
     const checkedAt = nowIso();
     if (!binary) {
@@ -262,6 +281,7 @@ export class CodexService {
     const configExists = existsSync(this.configPath);
     const checkedAt = nowIso();
     const modelProbe = this.probeCache?.probe ?? null;
+    const probing = this.isProbing();
 
     if (!binary) {
       return {
@@ -273,6 +293,7 @@ export class CodexService {
         configExists,
         capabilities: null,
         modelProbe,
+        probing,
         checkedAt,
         warning: null,
       };
@@ -298,6 +319,7 @@ export class CodexService {
       configExists,
       capabilities,
       modelProbe,
+      probing,
       checkedAt,
       warning,
     };

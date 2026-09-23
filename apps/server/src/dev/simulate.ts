@@ -42,7 +42,11 @@ import { registerTaskRoutes, withRetryState } from '../routes/tasks.js';
 import { CodexService } from '../services/codex.js';
 import { EventBus } from '../services/events.js';
 import { LabelService } from '../services/labels.js';
-import { buildPullRequestBody, Orchestrator } from '../services/orchestrator.js';
+import {
+  buildPullRequestBody,
+  mergeReviewDiscussion,
+  Orchestrator,
+} from '../services/orchestrator.js';
 import { buildFixPrompt } from '../services/prompts.js';
 import { ProviderFactory } from '../services/providers.js';
 import { ProxyService } from '../services/proxy.js';
@@ -72,6 +76,8 @@ class StubProvider implements GitProvider {
   readonly kind: ProviderKind = 'github';
   readonly baseUrl = 'http://stub.local';
   readonly proxyUrl = null;
+  /** Patch positions the orchestrator handed to `createReviewComment()`. */
+  readonly inlinePositions: number[][] = [];
   readonly state: StubState = {
     labels: new Set<string>(),
     issues: new Map(),
@@ -185,7 +191,7 @@ class StubProvider implements GitProvider {
   async createReviewComment(
     _ref: RepoRef,
     number: number,
-    input: { body: string; path: string; line: number },
+    input: { body: string; path: string; line: number; diffPositions: readonly number[] },
   ): Promise<Comment> {
     const comment: Comment = {
       id: String(this.state.nextCommentId++),
@@ -200,6 +206,7 @@ class StubProvider implements GitProvider {
       ...(this.state.reviewComments.get(number) ?? []),
       comment,
     ]);
+    this.inlinePositions.push([...input.diffPositions]);
     return comment;
   }
 
@@ -727,6 +734,10 @@ async function main(): Promise<void> {
     inlineComments[0]?.path === 'src/feature.txt' && inlineComments[0]?.line === 1,
     `行内评论应当锚定在 src/feature.txt:1，实际 ${inlineComments[0]?.path}:${inlineComments[0]?.line}`,
   );
+  assert(
+    JSON.stringify(provider.inlinePositions) === '[[1]]',
+    `行内评论应当带上 git patch 内的位置候选，实际 ${JSON.stringify(provider.inlinePositions)}`,
+  );
   const reviewSummary = (provider.state.comments.get(pr.number) ?? []).find((comment) =>
     comment.body.includes('AI 评审'),
   );
@@ -745,6 +756,31 @@ async function main(): Promise<void> {
     '修复任务的提示词应当带上行内评论正文',
   );
   log.warn('行内评论场景通过：评审问题贴在 src/feature.txt:1，修复任务读取到该评论 ✅');
+
+  // 提示词预览必须和真实修复流程取同一份上下文：汇总评论进「评审意见」，
+  // 行内评论走单独的小节。此前预览把行内评论追进评论摘要后再取最后一条，
+  // 「评审意见」的位置会被行内评论顶掉。
+  const latestSummary = [...(provider.state.comments.get(pr.number) ?? [])]
+    .reverse()
+    .find((comment) => comment.body.includes('AI 评审'));
+  const previewResponse = await app.inject({
+    method: 'GET',
+    url: `/api/codex/prompt-preview?repositoryId=${repository.id}&kind=fix&prNumber=${pr.number}`,
+  });
+  assert(
+    previewResponse.statusCode === 200,
+    `提示词预览接口应当返回 200，实际 ${previewResponse.statusCode}`,
+  );
+  const previewPrompt = (previewResponse.json() as { prompt: string }).prompt;
+  assert(
+    latestSummary !== undefined && previewPrompt.includes(latestSummary.body),
+    '提示词预览的「评审意见」应当取最新的汇总评论原文',
+  );
+  assert(
+    previewPrompt.includes('### 行内评论 1 · `src/feature.txt:1`'),
+    '提示词预览应当把行内评论放进独立小节',
+  );
+  log.warn('提示词预览场景通过：汇总评论与行内评论各就各位，与真实修复流程一致 ✅');
 
   const branch = pr.headRef;
   const files = git(['ls-tree', '--name-only', '-r', `refs/heads/${branch}`], bareRepo)
@@ -1117,7 +1153,7 @@ async function main(): Promise<void> {
   ].join('\n');
   const quotedAnchor = parseDiffAnchors(quotedUnicodePatch).find('docs/说明.md', 2);
   assert(
-    quotedAnchor?.line === 2 && quotedAnchor.position === 2,
+    quotedAnchor?.line === 2 && JSON.stringify(quotedAnchor.diffPositions) === '[2]',
     `quotePath 转义的中文路径应当解析出锚点，实际 ${JSON.stringify(quotedAnchor)}`,
   );
   const rawAnchor = parseDiffAnchors(
@@ -1132,7 +1168,7 @@ async function main(): Promise<void> {
     ].join('\n'),
   ).find('docs/说明.md', 2);
   assert(
-    rawAnchor?.line === 2 && rawAnchor.position === 2,
+    rawAnchor?.line === 2 && JSON.stringify(rawAnchor.diffPositions) === '[2]',
     `原始 UTF-8 路径应当解析出锚点，实际 ${JSON.stringify(rawAnchor)}`,
   );
 
@@ -1165,21 +1201,86 @@ async function main(): Promise<void> {
   ].join('\n');
   const tricky = parseDiffAnchors(trickyPatch);
   assert(
-    tricky.find('src/new.ts', 3)?.position === 3,
+    JSON.stringify(tricky.find('src/new.ts', 3)?.diffPositions) === '[3]',
     '以 `+++ ` 开头的新增行不应打乱后续行的 patch 位置',
   );
   assert(tricky.find('src/gone.ts', 1) === null, '删除的文件不应当解析出锚点');
   assert(tricky.find('assets/logo.png', 1) === null, '二进制文件不应当解析出锚点');
   assert(tricky.find('src/new.ts', 9) === null, 'diff 之外的行号不应当解析出锚点');
   assert(tricky.find('big.txt', 1)?.path === 'src/deep/big.txt', '唯一后缀匹配应当解析出锚点');
-  log.warn('锚点解析场景通过：中文路径、二进制/删除文件与后缀匹配均符合预期 ✅');
 
-  // ② Gitee：`position` 的两种口径必须各试一次。第一次请求被实例拒绝（4xx）
-  //    时也要继续试第二种语义，只有两种都失败才退回汇总评论。
+  // ①b 多 hunk 文件里的 position 口径：GitHub 文档写「从该文件第一个 @@ 起算、
+  //     它下面那一行是 1」，并「一直数到下一个文件为止」；核对真实 PR 的行内
+  //     评论可以确认后续 hunk 的 `@@` 头行同样占一个位置（第 N 个 hunk 差 N-1）。
+  //     不数头行的读法只在第二个 hunk 起才不同，两种都随锚点带出。
+  const multiHunkPatch = [
+    'diff --git a/src/multi.txt b/src/multi.txt',
+    '--- a/src/multi.txt',
+    '+++ b/src/multi.txt',
+    '@@ -1,3 +1,3 @@',
+    ' a',
+    '-b',
+    '+B',
+    ' c',
+    '@@ -10,3 +20,3 @@',
+    ' x',
+    '-y',
+    '+Y',
+    ' z',
+    '@@ -30 +40 @@',
+    '+Z',
+  ].join('\n');
+  const multi = parseDiffAnchors(multiHunkPatch);
+  assert(
+    JSON.stringify(multi.find('src/multi.txt', 2)?.diffPositions) === '[3]',
+    `第一个 hunk 里两种口径一致，只应带一个候选（删除行也占一位），实际 ${JSON.stringify(multi.find('src/multi.txt', 2))}`,
+  );
+  assert(
+    JSON.stringify(multi.find('src/multi.txt', 21)?.diffPositions) === '[8,7]',
+    `第二个 hunk 应当带上两种口径，实际 ${JSON.stringify(multi.find('src/multi.txt', 21))}`,
+  );
+  assert(
+    JSON.stringify(multi.find('src/multi.txt', 40)?.diffPositions) === '[11,9]',
+    `第三个 hunk 的口径差应当是 2，实际 ${JSON.stringify(multi.find('src/multi.txt', 40))}`,
+  );
+
+  // ④ 路径启发式：模型漏写目录（`src/x.ts` 之于 `apps/web/src/x.ts`）可以按
+  //    后缀补全，因为补出来的路径确实出现在 diff 里；反过来给相对路径**多加**
+  //    目录不再猜（那些目录无法用 diff 核对，宁可退回汇总评论）。绝对路径是
+  //    例外：仓库根之上那段目录本来就无从得知，只能按后缀匹配。
+  const pathPatch = [
+    'diff --git a/src/feature.txt b/src/feature.txt',
+    'new file mode 100644',
+    '--- /dev/null',
+    '+++ b/src/feature.txt',
+    '@@ -0,0 +1 @@',
+    '+content',
+  ].join('\n');
+  const paths = parseDiffAnchors(pathPatch);
+  assert(paths.find('./src/feature.txt', 1)?.path === 'src/feature.txt', '`./` 前缀应当解析出锚点');
+  assert(
+    paths.find('b/src/feature.txt', 1)?.path === 'src/feature.txt',
+    'diff 头路径应当解析出锚点',
+  );
+  assert(paths.find('feature.txt', 1)?.path === 'src/feature.txt', '漏写目录的后缀匹配应当保留');
+  assert(
+    paths.find('apps/server/src/feature.txt', 1) === null,
+    '相对路径多写目录时不得锚到同后缀的其它文件',
+  );
+  assert(
+    paths.find('/home/runner/work/demo/src/feature.txt', 1)?.path === 'src/feature.txt',
+    '绝对路径应当按后缀匹配到仓库内路径',
+  );
+  log.warn(
+    '锚点解析场景通过：中文路径、多 hunk position 口径、二进制/删除文件与路径启发式均符合预期 ✅',
+  );
+
+  // ② Gitee：`position` 的每个候选都必须试一次。第一次请求被实例拒绝（4xx）
+  //    时也要继续试下一种语义，只有全部失败才退回汇总评论。
   const giteeApi = await startFakeApi((call) => {
     if (call.method === 'POST' && call.path === '/api/v5/repos/sim/demo/pulls/1/comments') {
       const body = call.body as { path: string; position: number };
-      // 只认「新文件行号」的实例：patch 位置 5 被拒，行号 20 通过。
+      // 只认「新文件行号」的实例：两个 patch 位置都被拒，行号 20 通过。
       if (body.position !== 20) return { status: 400, json: { message: 'position 无效' } };
       return {
         status: 201,
@@ -1207,18 +1308,61 @@ async function main(): Promise<void> {
     body: '行内评论正文',
     path: 'src/feature.txt',
     line: 20,
-    diffPosition: 5,
+    diffPositions: [5, 4],
     commitId: null,
   });
   const giteePosts = giteeApi.calls
     .filter((call) => call.method === 'POST')
     .map((call) => (call.body as { position: number }).position);
   assert(
-    giteePosts.length === 2 && giteePosts[0] === 5 && giteePosts[1] === 20,
-    `Gitee 第一次 position 被拒后应当继续尝试第二种语义，实际 POST position=${giteePosts.join(',')}`,
+    giteePosts.join(',') === '5,4,20',
+    `Gitee 前一次 position 被拒后应当继续尝试剩余候选，实际 POST position=${giteePosts.join(',')}`,
   );
   assert(giteeComment.line === 20, `Gitee 行内评论应当锚定在第 20 行，实际 ${giteeComment.line}`);
   await giteeApi.close();
+
+  // ②b 只认「不数 hunk 头行」那种口径的实例：第二个候选（锚点里的备选口径）
+  //     就能成功，不必再退到新文件行号；与行号相同的候选只发一次。
+  const headerlessApi = await startFakeApi((call) => {
+    if (call.method === 'POST' && call.path === '/api/v5/repos/sim/demo/pulls/1/comments') {
+      const body = call.body as { path: string; position: number };
+      if (body.position !== 4) return { status: 400, json: { message: 'position 无效' } };
+      return {
+        status: 201,
+        json: { id: 78, path: body.path, position: 4, new_line: 20, body: 'body' },
+      };
+    }
+    if (call.method === 'GET' && call.path === '/api/v5/repos/sim/demo/pulls/comments/78') {
+      return {
+        status: 200,
+        // Gitee 的 OpenAPI 定义里 `position` / `new_line` 都是字符串。
+        json: { id: 78, path: 'src/feature.txt', position: '4', new_line: '20', body: 'body' },
+      };
+    }
+    return { status: 404, json: { message: 'not found' } };
+  });
+  const headerlessGitee = new GiteeProvider(
+    fakeAccount('gitee', `${headerlessApi.baseUrl}/api/v5`),
+  );
+  const headerlessComment = await headerlessGitee.createReviewComment(
+    { owner: 'sim', name: 'demo' },
+    1,
+    {
+      body: '行内评论正文',
+      path: 'src/feature.txt',
+      line: 20,
+      diffPositions: [20, 4],
+      commitId: null,
+    },
+  );
+  const headerlessPosts = headerlessApi.calls
+    .filter((call) => call.method === 'POST')
+    .map((call) => (call.body as { position: number }).position);
+  assert(
+    headerlessPosts.join(',') === '20,4' && headerlessComment.line === 20,
+    `Gitee 应当按顺序试到备选 patch 口径为止，实际 POST position=${headerlessPosts.join(',')}，行号 ${headerlessComment.line}`,
+  );
+  await headerlessApi.close();
 
   // ③ Gitee 读回里只有被原样回写的 `position`（没有 `new_line`）时不算验证通过：
   //    必须删除这条评论并抛错，让调用方把它退回汇总评论。
@@ -1251,7 +1395,7 @@ async function main(): Promise<void> {
         body: '行内评论正文',
         path: 'src/feature.txt',
         line: 20,
-        diffPosition: 5,
+        diffPositions: [5],
         commitId: null,
       }),
     'Gitee 无法读回 new_line 时应当判定锚定失败',
@@ -1296,7 +1440,7 @@ async function main(): Promise<void> {
         body: '行内评论正文',
         path: 'src/feature.txt',
         line: 20,
-        diffPosition: 5,
+        diffPositions: [5],
         commitId: null,
       }),
     'Gitea 读回的行号与目标不一致时应当判定锚定失败',
@@ -1335,7 +1479,7 @@ async function main(): Promise<void> {
     body: '行内评论正文',
     path: 'src/feature.txt',
     line: 20,
-    diffPosition: 5,
+    diffPositions: [5],
     commitId: null,
   });
   assert(giteaComment.line === 20, `Gitea 行内评论应当锚定在第 20 行，实际 ${giteaComment.line}`);
@@ -1362,6 +1506,29 @@ async function main(): Promise<void> {
       '### 行内评论 1 · `src/feature.txt:1`',
     ),
     '带上行内评论时提示词应当出现行内小节',
+  );
+
+  // ⑥ 合并讨论（复审提示词的「已有讨论」、提示词预览）必须与会话评论去重：
+  //    Gitee 的代码行评论同时出现在两个读取端点里，同一条意见不能被喂两次。
+  const duplicateComment = {
+    id: '9',
+    author: 'autogit-bot',
+    body: '同一条意见',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    url: null,
+  };
+  const deduped = mergeReviewDiscussion(
+    [duplicateComment],
+    [{ ...duplicateComment, path: 'src/feature.txt', line: 1 }],
+  );
+  assert(deduped.length === 1, `重复的行内评论应当被去掉，实际 ${deduped.length} 条`);
+  const anchoredOnly = mergeReviewDiscussion(
+    [],
+    [{ ...duplicateComment, id: '10', path: 'src/feature.txt', line: 3, body: '行内正文' }],
+  );
+  assert(
+    anchoredOnly[0]?.body === '`src/feature.txt:3`\n行内正文',
+    `行内评论正文应当带上锚点，实际 ${JSON.stringify(anchoredOnly[0]?.body)}`,
   );
   log.warn('行内评论回退场景通过：中文路径可锚定，Gitee/Gitea 均会读回核对并退回汇总评论 ✅');
 

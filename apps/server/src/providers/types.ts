@@ -75,9 +75,9 @@ export interface LabelTargetInput {
  *
  * Platforms disagree on how a line is addressed: GitHub takes the line number
  * of the new file version, Gitea the same number under a misleading
- * `new_position` field, and Gitee a position inside the patch. `diffPosition`
- * therefore travels next to `line` so a provider can use whichever one it
- * needs without re-parsing the diff.
+ * `new_position` field, and Gitee a position inside the patch. `diffPositions`
+ * therefore travels next to `line` so a provider can use whichever one it needs
+ * without re-parsing the diff.
  */
 export interface CreateReviewCommentInput {
   body: string;
@@ -85,8 +85,12 @@ export interface CreateReviewCommentInput {
   path: string;
   /** Line number in the new version of the file. */
   line: number;
-  /** 1-based index of that line in the raw diff of the file. */
-  diffPosition: number;
+  /**
+   * Candidate indexes of that line inside the raw diff of the file, most likely
+   * reading first (see `util/diff-anchors.ts`); providers that do not address
+   * lines by patch position ignore them.
+   */
+  diffPositions: readonly number[];
   /** Head commit the comment should be anchored to, when the platform wants it. */
   commitId: string | null;
 }

@@ -107,6 +107,8 @@ PR 正文由 `buildPullRequestBody()` 生成，按仓库约定固定包含 `## �
 6. 结论解析先做 JSON 提取、再做 `VERDICT:` 文本启发式（容忍 `approve` / `needs-fix` / 中文“通过”等写法）；仍然解析不出结论时，把模型上一次的输出回灌给它，要求只重新序列化结论（最多 2 次），全部失败才判定评审任务失败。
 7. 结论里带 `file` / `line` 的 issue 会在 `git diff --no-color base...HEAD` 的原始 patch 上解析成锚点（行号一律取**新文件**版本，重复出现在 hunk 头里的行号不算），能锚定的逐条发成行内评论（单次上限 20 条），其余留在汇总评论；写入成功后还会读回核对锚点的真实行号（Gitea 按 review id 读回 `reviews/{id}/comments`、Gitee 按评论 id 读回 `pulls/comments/{id}`），对不上就删掉刚写入的那条（Gitea 删除这个 review）并退回汇总评论；写行内评论失败只记日志、不影响评审任务本身，所以三个平台都不会因为某条评论被拒而丢失结论。diff 一律带 `-c core.quotePath=false` 读取，中文等非 ASCII 路径不会被 git 转义成八进制。
 
+   锚点里的「patch 位置」按 GitHub 文档的口径算：该文件第一个 `@@` 下面那一行是 1，后续 hunk 的头行各占一位（GitHub 的行内评论就是这么编号的）；同时带上「不数头行」的备选口径，两者只在第二个 hunk 起不同，Gitee 会按顺序试。路径只接受精确匹配、漏写前导目录的唯一后缀匹配（`src/x.ts` 之于 `apps/web/src/x.ts`），以及绝对路径按仓库内路径取尾段；给相对路径**多加**目录不再猜测，直接退回汇总评论。
+
 行内评论与会话评论在两个资源里：GitHub 的 `issues/{n}/comments` 根本不返回它们，Gitea 要按 review 逐个查询。因此把评审意见回灌给模型时（复审的「已有讨论」、修复任务的提示词）统一走 `listComments()` + `listReviewComments()` 合并后的讨论列表，否则修复代理看不到贴在代码行上的意见。
 
 `WorkspaceManager` 负责所有 git 操作：克隆（首次）、`fetch --prune`、`checkout -B`、`reset --hard`、`clean -fd`、`commit`、`push`。提交身份、`commit.gpgsign=false`、`core.longpaths=true` 都在工作区内单独配置，不污染用户全局 git 配置。

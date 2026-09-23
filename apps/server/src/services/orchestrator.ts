@@ -1368,7 +1368,7 @@ export class Orchestrator {
           body: renderInlineReviewComment(issue),
           path: anchor.path,
           line: anchor.line,
-          diffPosition: anchor.position,
+          diffPositions: anchor.diffPositions,
           commitId: input.commitId,
         });
         posted.set(index, { path: anchor.path, line: anchor.line });
@@ -1387,12 +1387,8 @@ export class Orchestrator {
   }
 
   /**
-   * Merges conversation comments with inline review comments.
-   *
-   * Inline comments are a separate resource on every platform (GitHub even
-   * serves them from another endpoint), so a model that only receives
-   * `listComments()` never sees them. Gitee returns both kinds from one
-   * endpoint, hence the de-duplication.
+   * The discussion a review sees: conversation comments plus the inline
+   * comments, merged by `mergeReviewDiscussion()`.
    */
   private async reviewDiscussion(
     provider: GitProvider,
@@ -1402,16 +1398,7 @@ export class Orchestrator {
   ): Promise<Comment[]> {
     const comments = await provider.listComments(ref, prNumber);
     const inline = await this.listInlineReviewComments(provider, ref, prNumber, taskId);
-
-    const merged = [...comments];
-    const seen = new Set(comments.map((comment) => `${comment.id}:${comment.body}`));
-    for (const comment of inline) {
-      const key = `${comment.id}:${comment.body}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      merged.push({ ...comment, body: inlineCommentBody(comment) });
-    }
-    return merged.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    return mergeReviewDiscussion(comments, inline);
   }
 
   /**
@@ -2109,6 +2096,30 @@ function inlineCommentBody(comment: Comment): string {
   return `${anchor}\n${comment.body}`;
 }
 
+/**
+ * Merges conversation comments with inline review comments.
+ *
+ * Inline comments are a separate resource on every platform (GitHub even serves
+ * them from another endpoint), so a model that only receives `listComments()`
+ * never sees them. Gitee returns both kinds from one endpoint, so equal
+ * `id` + body pairs are dropped, and every inline body is prefixed with its
+ * anchor because the line it belongs to is not part of the text.
+ *
+ * Exported so the prompt preview (`/api/codex/prompt-preview`) builds exactly
+ * the same discussion as the real review run.
+ */
+export function mergeReviewDiscussion(comments: Comment[], inline: Comment[]): Comment[] {
+  const merged = [...comments];
+  const seen = new Set(comments.map((comment) => `${comment.id}:${comment.body}`));
+  for (const comment of inline) {
+    const key = `${comment.id}:${comment.body}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push({ ...comment, body: inlineCommentBody(comment) });
+  }
+  return merged.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+}
+
 function severityLabel(severity: ReviewVerdict['issues'][number]['severity']): string {
   switch (severity) {
     case 'blocker':
@@ -2120,7 +2131,11 @@ function severityLabel(severity: ReviewVerdict['issues'][number]['severity']): s
   }
 }
 
-function findLatestReviewComment(
+/**
+ * The summary comment of the latest review, or the newest comment as a last
+ * resort. Exported so the prompt preview resolves it exactly like `runFix()`.
+ */
+export function findLatestReviewComment(
   comments: Array<{ author: string; body: string; createdAt: string }>,
 ): { author: string; body: string; createdAt: string } | null {
   const reviews = comments.filter((comment) => comment.body.includes('AI 评审'));

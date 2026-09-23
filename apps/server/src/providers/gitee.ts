@@ -391,13 +391,14 @@ export class GiteeProvider implements GitProvider {
   }
 
   /**
-   * Gitee documents `position` as a line count inside the diff, but deployments
-   * disagree and some treat it as the line number of the new file. Both
-   * readings are tried - a request the instance rejects moves on to the next
-   * reading instead of aborting the loop - and the created comment is read back:
-   * only a returned `new_line` equal to the intended line counts as success.
-   * Anything else deletes the comment again, so the caller keeps that finding in
-   * the summary comment instead of leaving a misleading anchor behind.
+   * Gitee documents `position` as a line count inside the diff ("PR代码评论diff
+   * 中的行数"), but deployments disagree on the exact numbering and some treat
+   * it as the line number of the new file. Every candidate is tried - a request
+   * the instance rejects moves on to the next one instead of aborting the loop -
+   * and the created comment is read back: only a returned `new_line` equal to
+   * the intended line counts as success. Anything else deletes the comment
+   * again, so the caller keeps that finding in the summary comment instead of
+   * leaving a misleading anchor behind.
    */
   async createReviewComment(
     ref: RepoRef,
@@ -405,8 +406,12 @@ export class GiteeProvider implements GitProvider {
     input: CreateReviewCommentInput,
   ): Promise<Comment> {
     const path = `/repos/${ref.owner}/${ref.name}/pulls/${number}/comments`;
-    const positions =
-      input.diffPosition === input.line ? [input.diffPosition] : [input.diffPosition, input.line];
+    // The patch positions of the anchor come first (most likely reading first),
+    // the new file line is the last resort for instances that read `position`
+    // that way. Duplicates would only cost an extra request.
+    const positions = [...new Set([...input.diffPositions, input.line])].filter(
+      (position) => Number.isInteger(position) && position > 0,
+    );
     const rejected: string[] = [];
 
     for (const position of positions) {
@@ -454,7 +459,11 @@ export class GiteeProvider implements GitProvider {
       rejected.push(`position=${position} 落在${line === null ? '无法确认的行' : `第 ${line} 行`}`);
     }
 
-    throw new Error(`Gitee 未接受这条行内评论，该条已退回汇总评论：${rejected.join('；')}`);
+    throw new Error(
+      `Gitee 未接受这条行内评论，该条已退回汇总评论：${
+        rejected.length > 0 ? rejected.join('；') : '没有可用的位置候选'
+      }`,
+    );
   }
 
   private async readPullComment(ref: RepoRef, id: number): Promise<GiteePullComment | null> {
